@@ -1,1 +1,50 @@
+# Unity
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+MemoryCaptures/
+Recordings/
 
+# Visual Studio / Rider
+.vs/
+.idea/
+*.csproj
+*.sln
+*.user
+*.pidb
+*.booproj
+*.svd
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Secrets
+.env
+config.py
+api_key.txt
+secrets.json
+
+# Data / model weights
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+*.mp4
+*.avi
+*.mov
+
+# OS
+.DS_Store
+Thumbs.db
