@@ -48,3 +48,9 @@ secrets.json
 # OS
 .DS_Store
 Thumbs.db
+
+csharp_server/bin/
+csharp_server/obj/
+csharp_server/yolo_env/
+csharp_server/outputs/
+csharp_server/open_vocab_env/
