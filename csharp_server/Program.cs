@@ -115,12 +115,22 @@ foreach (var obj in objects)
     );
 }
 
+var coordinateMapper = new CoordinateMapper();
+var mappedObjects = coordinateMapper.MapObjectsToWorkspace(objects, qrcodes);
+
 var output = new
 {
     image_width = image.Width,
     image_height = image.Height,
-    objects = objects,
-    qrcodes = qrcodes
+    objects = mappedObjects,
+    qrcodes = qrcodes,
+    workspace = new
+    {
+        origin = "QR1",
+        x_axis = "QR1_to_QR2",
+        z_axis = "QR1_to_QR3",
+        unit = "metres"
+    }
 };
 
 string json = JsonSerializer.Serialize(output, new JsonSerializerOptions

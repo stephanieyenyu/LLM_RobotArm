@@ -113,16 +113,17 @@ public class YoloDetectorService
             confidence = Math.Round(d.Confidence, 3),
             bbox = new double[]
             {
-                Math.Round(d.X1, 2),
-                Math.Round(d.Y1, 2),
-                Math.Round(d.X2, 2),
-                Math.Round(d.Y2, 2)
+        Math.Round(d.X1, 2),
+        Math.Round(d.Y1, 2),
+        Math.Round(d.X2, 2),
+        Math.Round(d.Y2, 2)
             },
             center_pixel = new double[]
             {
-                Math.Round((d.X1 + d.X2) / 2.0, 2),
-                Math.Round((d.Y1 + d.Y2) / 2.0, 2)
-            }
+        Math.Round((d.X1 + d.X2) / 2.0, 2),
+        Math.Round((d.Y1 + d.Y2) / 2.0, 2)
+            },
+            source = "yolo_coco"
         }).ToList();
     }
 
