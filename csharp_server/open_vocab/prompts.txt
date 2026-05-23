@@ -1,0 +1,12 @@
+cup
+bottle
+book
+cell phone
+red cube
+blue cube
+green cube
+screwdriver
+metal part
+robot part
+tool
+object

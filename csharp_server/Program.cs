@@ -18,8 +18,22 @@ if (image.Empty())
 var qrDetector = new QrCodeDetectorService();
 var qrcodes = qrDetector.Detect(image);
 
-var yoloDetector = new YoloDetectorService();
-var objects = yoloDetector.Detect(image);
+var openVocabDetector = new OpenVocabDetectorService();
+var openVocabObjects = openVocabDetector.Detect();
+
+List<ObjectDetectionResult> objects;
+
+if (openVocabObjects.Count > 0)
+{
+    objects = openVocabObjects;
+    Console.WriteLine("Using open-vocabulary detection results.");
+}
+else
+{
+    var yoloDetector = new YoloDetectorService();
+    objects = yoloDetector.Detect(image);
+    Console.WriteLine("Using YOLO fallback detection results.");
+}
 
 Console.WriteLine($"Objects detected: {objects.Count}");
 
