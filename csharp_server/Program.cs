@@ -1,13 +1,44 @@
 ﻿using OpenCvSharp;
 using System.Text.Json;
 
+
 string imagePath = "images/test_scene.jpg";
+
+// Change this to false if you want to test using the existing image file.
+bool useWebcam = false;
+
+// If your laptop has multiple cameras, try 0, 1, or 2.
+int cameraIndex = 0;
 
 Console.WriteLine("Current folder: " + Directory.GetCurrentDirectory());
 Console.WriteLine("Image path: " + Path.GetFullPath(imagePath));
+
+if (useWebcam)
+{
+    var webcam = new WebcamCapture();
+
+    bool captured = webcam.CaptureImage(
+        outputPath: imagePath,
+        cameraIndex: cameraIndex,
+        width: 1280,
+        height: 720
+    );
+
+    if (!captured)
+    {
+        Console.WriteLine("Webcam capture failed. Falling back to existing images/test_scene.jpg.");
+    }
+}
+
 Console.WriteLine("Image exists: " + File.Exists(imagePath));
 
 Mat image = Cv2.ImRead(imagePath);
+
+if (image.Empty())
+{
+    Console.WriteLine("Cannot read image. Put test_scene.jpg inside the images folder or check webcam capture.");
+    return;
+}
 
 if (image.Empty())
 {
