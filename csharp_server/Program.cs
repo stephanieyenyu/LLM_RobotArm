@@ -1,218 +1,46 @@
-﻿using OpenCvSharp;
-using System.Text.Json;
+﻿using System.Text.Json;
 
+Console.WriteLine("請輸入機械手臂指令：");
+string? userCommand = Console.ReadLine();
 
-string imagePath = "images/test_scene.jpg";
-
-// Change this to false if you want to test using the existing image file.
-bool useWebcam = false;
-
-// If your laptop has multiple cameras, try 0, 1, or 2.
-int cameraIndex = 0;
-
-Console.WriteLine("Current folder: " + Directory.GetCurrentDirectory());
-Console.WriteLine("Image path: " + Path.GetFullPath(imagePath));
-
-if (useWebcam)
+if (string.IsNullOrWhiteSpace(userCommand))
 {
-    var webcam = new WebcamCapture();
-
-    bool captured = webcam.CaptureImage(
-        outputPath: imagePath,
-        cameraIndex: cameraIndex,
-        width: 1280,
-        height: 720
-    );
-
-    if (!captured)
-    {
-        Console.WriteLine("Webcam capture failed. Falling back to existing images/test_scene.jpg.");
-    }
-}
-
-Console.WriteLine("Image exists: " + File.Exists(imagePath));
-
-Mat image = Cv2.ImRead(imagePath);
-
-if (image.Empty())
-{
-    Console.WriteLine("Cannot read image. Put test_scene.jpg inside the images folder or check webcam capture.");
+    Console.WriteLine("指令不可為空。");
     return;
 }
 
-if (image.Empty())
+// 測試階段先模擬 Part B 的輸出。
+// 未來這裡改成接收 Part B 根據 YOLO + 三個 QR code 算出的物件名稱與座標。
+
+//string sceneJson = File.ReadAllText("scene_objects.json");
+//List<SceneObject>? sceneObjects =
+//    JsonSerializer.Deserialize<List<SceneObject>>(sceneJson);
+
+//if (sceneObjects == null || sceneObjects.Count == 0)
+//{
+//    Console.WriteLine("Part B 沒有提供有效的物件座標資料。");
+//    return;
+//}
+
+//假資料(之後用上面代換)
+List<SceneObject> sceneObjects = new()
 {
-    Console.WriteLine("Cannot read image. Put test_scene.jpg inside the images folder.");
-    return;
-}
-
-var qrDetector = new QrCodeDetectorService();
-var qrcodes = qrDetector.Detect(image);
-
-List<ObjectDetectionResult> objects;
-
-var openVocabDetector = new OpenVocabDetectorService();
-var openVocabObjects = openVocabDetector.Detect();
-
-if (openVocabObjects.Count > 0)
-{
-    objects = openVocabObjects;
-    Console.WriteLine("Using open-vocabulary detection results.");
-}
-else
-{
-    var yoloDetector = new YoloDetectorService();
-    objects = yoloDetector.Detect(image);
-    Console.WriteLine("Using YOLO fallback detection results.");
-}
-
-var coordinateMapper = new CoordinateMapper();
-var mappedObjects = coordinateMapper.MapObjectsToWorkspace(objects, qrcodes);
-
-Console.WriteLine($"QR codes detected: {qrcodes.Count}");
-Console.WriteLine($"Objects detected: {objects.Count}");
-
-if (!coordinateMapper.HasRequiredQrCodes(qrcodes))
-{
-    Console.WriteLine("Warning: QR1, QR2, QR3, QR4 are not all detected.");
-}
-else
-{
-    double qrArea = coordinateMapper.CalculateQrArea(qrcodes);
-
-    Console.WriteLine($"QR workspace area in image pixels: {qrArea}");
-
-    if (qrArea < 1000)
-    {
-        Console.WriteLine("Warning: QR codes are too close together or nearly collinear.");
-    }
-}
-
-if (objects.Count == 0)
-{
-    Console.WriteLine("Warning: no objects detected.");
-}
-
-Mat visual = image.Clone();
-
-foreach (var qr in qrcodes)
-{
-    if (qr.center_pixel.Length < 2)
-    {
-        continue;
-    }
-
-    int cx = (int)qr.center_pixel[0];
-    int cy = (int)qr.center_pixel[1];
-
-    Cv2.Circle(
-        visual,
-        new Point(cx, cy),
-        8,
-        new Scalar(0, 0, 255),
-        -1
-    );
-
-    Cv2.PutText(
-        visual,
-        qr.id,
-        new Point(cx + 10, cy),
-        HersheyFonts.HersheySimplex,
-        0.8,
-        new Scalar(0, 0, 255),
-        2
-    );
-
-    foreach (var corner in qr.corners)
-    {
-        if (corner.Length < 2)
-        {
-            continue;
-        }
-
-        int x = (int)corner[0];
-        int y = (int)corner[1];
-
-        Cv2.Circle(
-            visual,
-            new Point(x, y),
-            5,
-            new Scalar(255, 0, 0),
-            -1
-        );
-    }
-}
-
-foreach (var obj in mappedObjects)
-{
-    if (obj.bbox.Length < 4)
-    {
-        continue;
-    }
-
-    int x1 = (int)obj.bbox[0];
-    int y1 = (int)obj.bbox[1];
-    int x2 = (int)obj.bbox[2];
-    int y2 = (int)obj.bbox[3];
-
-    Cv2.Rectangle(
-        visual,
-        new Point(x1, y1),
-        new Point(x2, y2),
-        new Scalar(0, 255, 0),
-        4
-    );
-
-    Cv2.PutText(
-        visual,
-        $"{obj.name} {obj.confidence}",
-        new Point(x1, Math.Max(y1 - 10, 20)),
-        HersheyFonts.HersheySimplex,
-        1.0,
-        new Scalar(0, 255, 0),
-        3
-    );
-
-    Cv2.PutText(
-        visual,
-        $"x:{obj.world_position.x} z:{obj.world_position.z}",
-        new Point(x1, Math.Min(y2 + 30, image.Height - 10)),
-        HersheyFonts.HersheySimplex,
-        0.8,
-        new Scalar(0, 255, 0),
-        2
-    );
-}
-
-var output = new
-{
-    image_width = image.Width,
-    image_height = image.Height,
-    objects = mappedObjects,
-    qrcodes = qrcodes,
-    workspace = new
-    {
-        origin = "QR1",
-        x_axis = "QR1_to_QR2",
-        z_axis = "QR1_to_QR3",
-        top_right = "QR4",
-        unit = "metres",
-        width_m = 0.60,
-        depth_m = 0.40,
-        mapping = "four_point_homography"
-    }
+    new SceneObject { Name = "bottle", X = 120.5, Y = 45.2, Z = 30.0 },
+    new SceneObject { Name = "cup", X = 80.0, Y = 20.0, Z = 30.0 },
+    new SceneObject { Name = "scissors", X = 140.0, Y = 50.0, Z = 25.0 },
+    new SceneObject { Name = "box", X = 220.0, Y = 90.0, Z = 20.0 }
 };
 
-string json = JsonSerializer.Serialize(output, new JsonSerializerOptions
-{
-    WriteIndented = true
-});
+LlmPlanner planner = new();
 
-Directory.CreateDirectory("outputs");
+RobotPlan plan = await planner.GeneratePlanAsync(userCommand, sceneObjects);
 
-File.WriteAllText("outputs/detection_result.json", json);
-Cv2.ImWrite("outputs/visual_result.jpg", visual);
+string outputJson = JsonSerializer.Serialize(
+    plan,
+    new JsonSerializerOptions
+    {
+        WriteIndented = true
+    }
+);
 
-Console.WriteLine(json);
-Console.WriteLine("Saved to outputs/detection_result.json");
-Console.WriteLine("Saved to outputs/visual_result.jpg");
+Console.WriteLine(outputJson);
