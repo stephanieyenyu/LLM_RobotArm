@@ -1,6 +1,6 @@
 {
   "task": "move_object",
-  "target_object": "cup",
+  "target_object": "Cup",
   "action_sequence": [
     {
       "action": "move_to",

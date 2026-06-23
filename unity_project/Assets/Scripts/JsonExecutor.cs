@@ -65,6 +65,7 @@ public class JsonExecutor : MonoBehaviour
 
     IEnumerator ExecutePlan()
     {
+        robotMover.SetTarget(plan.target_object);
         Debug.Log($"=== 開始任務：{plan.task} | 目標：{plan.target_object} ===");
 
         for (int i = 0; i < plan.action_sequence.Count; i++)
