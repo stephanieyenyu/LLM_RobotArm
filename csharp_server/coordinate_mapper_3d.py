@@ -8,8 +8,8 @@ import cv2
 # Part B: QRCode 3D Coordinate Mapping
 # ============================================================
 
-INPUT_JSON = "outputs/detection_result.json"
-OUTPUT_JSON = "outputs/objects_world_3d.json"
+INPUT_JSON = "../sample_json/detected_objects.json"
+OUTPUT_JSON = "../sample_json/objects_world.json"
 
 
 # QRCode 實際邊長，單位：meter
