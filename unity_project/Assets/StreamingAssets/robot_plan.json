@@ -7,9 +7,20 @@
       "joints": {
         "pan": 0,
         "lift": -90,
-        "elbow": 90,
+        "elbow": 0,
         "wrist1": -90,
-        "wrist2": -90,
+        "wrist2": 0,
+        "wrist3": 0
+      }
+    },
+    {
+      "action": "move_to",
+      "joints": {
+        "pan": 0,
+        "lift": -120,
+        "elbow": 60,
+        "wrist1": -90,
+        "wrist2": 0,
         "wrist3": 0
       }
     },
@@ -20,10 +31,10 @@
       "action": "move_to",
       "joints": {
         "pan": 90,
-        "lift": -90,
-        "elbow": 90,
+        "lift": -120,
+        "elbow": 60,
         "wrist1": -90,
-        "wrist2": -90,
+        "wrist2": 0,
         "wrist3": 0
       }
     },

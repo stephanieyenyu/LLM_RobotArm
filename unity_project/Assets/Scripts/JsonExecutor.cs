@@ -81,6 +81,12 @@ public class JsonExecutor : MonoBehaviour
 
             if (act.action == "move_to" && act.joints != null)
             {
+                if (ur3Controller == null)
+                {
+                    Debug.LogWarning("ur3Controller 未設定，跳過移動");
+                    yield return new WaitForSeconds(1f);
+                    continue;
+                }
                 yield return StartCoroutine(ur3Controller.MoveToJointAngles(
                     act.joints.pan,
                     act.joints.lift,
@@ -92,12 +98,12 @@ public class JsonExecutor : MonoBehaviour
             }
             else if (act.action == "grasp")
             {
-                ur3Controller.Grasp();
+                if (ur3Controller != null) ur3Controller.Grasp();
                 yield return new WaitForSeconds(0.5f);
             }
             else if (act.action == "release")
             {
-                ur3Controller.Release();
+                if (ur3Controller != null) ur3Controller.Release();
                 yield return new WaitForSeconds(0.5f);
             }
         }

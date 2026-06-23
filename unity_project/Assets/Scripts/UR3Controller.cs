@@ -16,6 +16,27 @@ public class UR3Controller : MonoBehaviour
     [Header("移動速度")]
     public float jointSpeed = 1.0f;
 
+    void Start()
+    {
+        SetAllJointsDrive(shoulder_pan);
+        SetAllJointsDrive(shoulder_lift);
+        SetAllJointsDrive(elbow);
+        SetAllJointsDrive(wrist_1);
+        SetAllJointsDrive(wrist_2);
+        SetAllJointsDrive(wrist_3);
+        SetAllJointsDrive(finger);
+    }
+
+    void SetAllJointsDrive(ArticulationBody joint)
+    {
+        if (joint == null) return;
+        var drive = joint.xDrive;
+        drive.stiffness = 100000f;
+        drive.damping = 10000f;
+        drive.forceLimit = 10000f;
+        joint.xDrive = drive;
+    }
+
     public void SetJointTarget(ArticulationBody joint, float targetDegree)
     {
         var drive = joint.xDrive;

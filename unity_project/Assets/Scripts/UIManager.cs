@@ -8,40 +8,40 @@ public class UIManager : MonoBehaviour
 
     private TextField inputField;
     private Button sendButton;
-    private Label statusLabel;
 
     void OnEnable()
     {
         var root = uiDocument.rootVisualElement;
 
-        // 建立容器
+        // 底部橫向容器
         var container = new VisualElement();
         container.style.position = UnityEngine.UIElements.Position.Absolute;
-        container.style.bottom = 20;
-        container.style.left = 20;
-        container.style.width = 400;
+        container.style.bottom = 10;
+        container.style.left = 10;
+        container.style.right = 10;
+        container.style.flexDirection = FlexDirection.Row;
         container.style.backgroundColor = new Color(0, 0, 0, 0.7f);
-        container.style.paddingTop = 10;
-        container.style.paddingBottom = 10;
-        container.style.paddingLeft = 10;
-        container.style.paddingRight = 10;
+        container.style.paddingTop = 5;
+        container.style.paddingBottom = 5;
+        container.style.paddingLeft = 5;
+        container.style.paddingRight = 5;
+        container.style.height = 50;
 
         // 輸入框
-        inputField = new TextField("指令：");
-        inputField.style.marginBottom = 8;
+        inputField = new TextField("");
+        inputField.style.flexGrow = 1;
+        inputField.style.marginRight = 5;
+        inputField.style.height = 40;
+        inputField.focusable = true;
 
         // 送出按鈕
         sendButton = new Button(() => OnSendCommand());
         sendButton.text = "執行";
-        sendButton.style.marginBottom = 8;
-
-        // 狀態顯示
-        statusLabel = new Label("待機中...");
-        statusLabel.style.color = Color.white;
+        sendButton.style.height = 40;
+        sendButton.style.width = 80;
 
         container.Add(inputField);
         container.Add(sendButton);
-        container.Add(statusLabel);
         root.Add(container);
     }
 
@@ -50,13 +50,11 @@ public class UIManager : MonoBehaviour
         string command = inputField.value;
         if (string.IsNullOrEmpty(command)) return;
 
-        statusLabel.text = $"執行中：{command}";
         executor.LoadAndExecute();
     }
 
     public void UpdateStatus(string status)
     {
-        if (statusLabel != null)
-            statusLabel.text = status;
+        Debug.Log("狀態：" + status);
     }
 }
