@@ -37,6 +37,15 @@ public class JsonExecutor : MonoBehaviour
         LoadAndExecute();
     }
 
+    void Update()
+    {
+        if (Input.GetKeyDown(KeyCode.Space))
+        {
+            StopAllCoroutines();
+            LoadAndExecute();
+        }
+    }
+
     public void LoadAndExecute()
     {
         string path = Path.Combine(Application.streamingAssetsPath, jsonFileName);
@@ -56,9 +65,12 @@ public class JsonExecutor : MonoBehaviour
 
     IEnumerator ExecutePlan()
     {
-        foreach (var act in plan.action_sequence)
+        Debug.Log($"=== 開始任務：{plan.task} | 目標：{plan.target_object} ===");
+
+        for (int i = 0; i < plan.action_sequence.Count; i++)
         {
-            Debug.Log("執行動作：" + act.action);
+            var act = plan.action_sequence[i];
+            Debug.Log($"[{i + 1}/{plan.action_sequence.Count}] 執行：{act.action}");
 
             if (act.action == "move_to")
             {
@@ -77,6 +89,6 @@ public class JsonExecutor : MonoBehaviour
             }
         }
 
-        Debug.Log("任務完成！");
+        Debug.Log("=== 任務完成！===");
     }
 }
