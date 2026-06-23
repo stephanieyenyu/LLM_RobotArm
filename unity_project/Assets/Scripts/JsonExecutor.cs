@@ -10,10 +10,17 @@ public class Position
 }
 
 [System.Serializable]
+public class JointAngles
+{
+    public float pan, lift, elbow, wrist1, wrist2, wrist3;
+}
+
+[System.Serializable]
 public class RobotAction
 {
     public string action;
     public Position position;
+    public JointAngles joints;
 }
 
 [System.Serializable]
@@ -27,8 +34,8 @@ public class RobotPlan
 public class JsonExecutor : MonoBehaviour
 {
     [Header("設定")]
-    public string jsonFileName = "robot_plan.json";  // 放在 StreamingAssets/
-    public RobotMover robotMover;
+    public string jsonFileName = "robot_plan.json";
+    public UR3Controller ur3Controller;
 
     private RobotPlan plan;
 
@@ -65,7 +72,6 @@ public class JsonExecutor : MonoBehaviour
 
     IEnumerator ExecutePlan()
     {
-        robotMover.SetTarget(plan.target_object);
         Debug.Log($"=== 開始任務：{plan.task} | 目標：{plan.target_object} ===");
 
         for (int i = 0; i < plan.action_sequence.Count; i++)
@@ -73,19 +79,25 @@ public class JsonExecutor : MonoBehaviour
             var act = plan.action_sequence[i];
             Debug.Log($"[{i + 1}/{plan.action_sequence.Count}] 執行：{act.action}");
 
-            if (act.action == "move_to")
+            if (act.action == "move_to" && act.joints != null)
             {
-                Vector3 target = new Vector3(act.position.x, act.position.y, act.position.z);
-                yield return StartCoroutine(robotMover.MoveTo(target));
+                yield return StartCoroutine(ur3Controller.MoveToJointAngles(
+                    act.joints.pan,
+                    act.joints.lift,
+                    act.joints.elbow,
+                    act.joints.wrist1,
+                    act.joints.wrist2,
+                    act.joints.wrist3
+                ));
             }
             else if (act.action == "grasp")
             {
-                robotMover.Grasp();
+                ur3Controller.Grasp();
                 yield return new WaitForSeconds(0.5f);
             }
             else if (act.action == "release")
             {
-                robotMover.Release();
+                ur3Controller.Release();
                 yield return new WaitForSeconds(0.5f);
             }
         }

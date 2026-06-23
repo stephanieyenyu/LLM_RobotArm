@@ -4,10 +4,13 @@
   "action_sequence": [
     {
       "action": "move_to",
-      "position": {
-        "x": 0.0,
-        "y": 0.0,
-        "z": 0.0
+      "joints": {
+        "pan": 0,
+        "lift": -90,
+        "elbow": 90,
+        "wrist1": -90,
+        "wrist2": -90,
+        "wrist3": 0
       }
     },
     {
@@ -15,10 +18,13 @@
     },
     {
       "action": "move_to",
-      "position": {
-        "x": 1.0,
-        "y": 1.0,
-        "z": 0.0
+      "joints": {
+        "pan": 90,
+        "lift": -90,
+        "elbow": 90,
+        "wrist1": -90,
+        "wrist2": -90,
+        "wrist3": 0
       }
     },
     {
