@@ -67,12 +67,12 @@ public class JsonExecutor : MonoBehaviour
             }
             else if (act.action == "grasp")
             {
-                Debug.Log("Grasp");
+                robotMover.Grasp();
                 yield return new WaitForSeconds(0.5f);
             }
             else if (act.action == "release")
             {
-                Debug.Log("Release");
+                robotMover.Release();
                 yield return new WaitForSeconds(0.5f);
             }
         }
