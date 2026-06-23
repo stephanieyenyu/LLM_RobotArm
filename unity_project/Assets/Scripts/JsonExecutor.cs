@@ -83,7 +83,7 @@ public class JsonExecutor : MonoBehaviour
             {
                 if (ur3Controller == null)
                 {
-                    Debug.LogWarning("ur3Controller 未設定，跳過移動");
+                    Debug.LogWarning("ur3Controller 未設定");
                     yield return new WaitForSeconds(1f);
                     continue;
                 }
