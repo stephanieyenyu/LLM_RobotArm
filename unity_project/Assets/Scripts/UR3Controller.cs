@@ -4,6 +4,34 @@ using UnityEngine;
 
 public class UR3Controller : MonoBehaviour
 {
+    [Header("夾取設定")]
+    public string targetObjectName = "Cup";
+    private Transform graspTarget;
+
+    public void Grasp()
+    {
+        SetJointTarget(finger, 40f);
+
+        GameObject obj = GameObject.Find(targetObjectName);
+        if (obj != null)
+        {
+            graspTarget = obj.transform;
+            graspTarget.SetParent(transform);
+            Debug.Log("夾取：" + targetObjectName);
+        }
+    }
+
+    public void Release()
+    {
+        SetJointTarget(finger, 0f);
+        if (graspTarget != null)
+        {
+            graspTarget.SetParent(null);
+            graspTarget = null;
+        }
+        Debug.Log("放開");
+    }
+
     [Header("關節設定")]
     public ArticulationBody shoulder_pan;
     public ArticulationBody shoulder_lift;
@@ -25,6 +53,10 @@ public class UR3Controller : MonoBehaviour
         SetAllJointsDrive(wrist_2);
         SetAllJointsDrive(wrist_3);
         SetAllJointsDrive(finger);
+        foreach (var joint in GetComponentsInChildren<ArticulationBody>())
+        {
+            SetAllJointsDrive(joint);
+        }
     }
 
     void SetAllJointsDrive(ArticulationBody joint)
@@ -55,17 +87,5 @@ public class UR3Controller : MonoBehaviour
 
         yield return new WaitForSeconds(2.0f);
         Debug.Log("關節移動完成");
-    }
-
-    public void Grasp()
-    {
-        SetJointTarget(finger, 40f);
-        Debug.Log("夾取");
-    }
-
-    public void Release()
-    {
-        SetJointTarget(finger, 0f);
-        Debug.Log("放開");
     }
 }

@@ -47,9 +47,6 @@ public class UIManager : MonoBehaviour
 
     void OnSendCommand()
     {
-        string command = inputField.value;
-        if (string.IsNullOrEmpty(command)) return;
-
         executor.LoadAndExecute();
     }
 

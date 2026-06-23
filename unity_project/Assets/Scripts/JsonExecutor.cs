@@ -41,7 +41,7 @@ public class JsonExecutor : MonoBehaviour
 
     void Start()
     {
-        LoadAndExecute();
+        //LoadAndExecute();
     }
 
     void Update()
