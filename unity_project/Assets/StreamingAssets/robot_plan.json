@@ -1,34 +1,17 @@
 {
-  "task": "move_object",
-  "target_object": "Cup",
+  "task": "test",
+  "target_object": "test",
   "action_sequence": [
     {
       "action": "move_to",
       "joints": {
-        "pan": 90,
-        "lift": -60,
-        "elbow": 60,
+        "pan": 0,
+        "lift": -90,
+        "elbow": 0,
         "wrist1": -90,
         "wrist2": 0,
         "wrist3": 0
       }
-    },
-    {
-      "action": "grasp"
-    },
-    {
-      "action": "move_to",
-      "joints": {
-        "pan": -90,
-        "lift": -60,
-        "elbow": 60,
-        "wrist1": -90,
-        "wrist2": 0,
-        "wrist3": 0
-      }
-    },
-    {
-      "action": "release"
     }
   ]
 }

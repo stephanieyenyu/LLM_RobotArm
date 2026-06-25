@@ -2,6 +2,9 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using System.IO;
+using System;
+using System.Linq;
+using Assets.Scripts;
 
 [System.Serializable]
 public class Position
@@ -35,20 +38,27 @@ public class JsonExecutor : MonoBehaviour
 {
     [Header("設定")]
     public string jsonFileName = "robot_plan.json";
-    public UR3Controller ur3Controller;
+    public string urIP = "192.168.56.101";
 
+    private URPackageListener urListener;
     private RobotPlan plan;
 
     void Start()
     {
-        //LoadAndExecute();
+        urListener = new URPackageListener();
+        urListener.Connect(urIP);
+        Debug.Log("嘗試連線到 " + urIP);
+    }
+
+    void OnDestroy()
+    {
+        urListener?.Close();
     }
 
     void Update()
     {
         if (Input.GetKeyDown(KeyCode.Space))
         {
-            StopAllCoroutines();
             LoadAndExecute();
         }
     }
@@ -59,7 +69,7 @@ public class JsonExecutor : MonoBehaviour
 
         if (!File.Exists(path))
         {
-            Debug.LogError("找不到 JSON 檔案：" + path);
+            Debug.LogError("找不到 JSON：" + path);
             return;
         }
 
@@ -67,47 +77,64 @@ public class JsonExecutor : MonoBehaviour
         plan = JsonUtility.FromJson<RobotPlan>(json);
 
         Debug.Log($"載入任務：{plan.task}，目標：{plan.target_object}");
+
+        if (!urListener.Connected)
+        {
+            Debug.LogWarning("尚未連線到 UR，嘗試重新連線");
+            urListener.Connect(urIP);
+        }
+
         StartCoroutine(ExecutePlan());
     }
 
     IEnumerator ExecutePlan()
     {
-        Debug.Log($"=== 開始任務：{plan.task} | 目標：{plan.target_object} ===");
+        Debug.Log($"=== 開始任務：{plan.task} ===");
 
         for (int i = 0; i < plan.action_sequence.Count; i++)
         {
             var act = plan.action_sequence[i];
-            Debug.Log($"[{i + 1}/{plan.action_sequence.Count}] 執行：{act.action}");
+            Debug.Log($"[{i + 1}/{plan.action_sequence.Count}] {act.action}");
 
-            if (act.action == "move_to" && act.joints != null)
+            if (act.action == "move_to")
             {
-                if (ur3Controller == null)
+                bool hasJoints = act.joints != null &&
+                                 (act.joints.pan != 0 || act.joints.lift != 0 || act.joints.elbow != 0 ||
+                                  act.joints.wrist1 != 0 || act.joints.wrist2 != 0 || act.joints.wrist3 != 0);
+
+                if (hasJoints)
                 {
-                    Debug.LogWarning("ur3Controller 未設定");
-                    yield return new WaitForSeconds(1f);
-                    continue;
+                    var angles = new[] {
+            act.joints.pan, act.joints.lift, act.joints.elbow,
+            act.joints.wrist1, act.joints.wrist2, act.joints.wrist3
+        };
+                    var rad = angles.Select(a => a * Mathf.Deg2Rad);
+                    string cmd = $"movej([{string.Join(", ", rad)}], a=1.2, v=1.05)";
+                    urListener.SendCommand(cmd);
+                    Debug.Log("SEND: " + cmd);
                 }
-                yield return StartCoroutine(ur3Controller.MoveToJointAngles(
-                    act.joints.pan,
-                    act.joints.lift,
-                    act.joints.elbow,
-                    act.joints.wrist1,
-                    act.joints.wrist2,
-                    act.joints.wrist3
-                ));
+                else if (act.position != null)
+                {
+                    string cmd = $"movel(p[{act.position.x.ToString("F4")}, {act.position.y.ToString("F4")}, {act.position.z.ToString("F4")}, 3.14, 0, 0], a=1.2, v=0.5)";
+                    urListener.SendCommand(cmd);
+                    Debug.Log("SEND: " + cmd);
+                }
+                yield return new WaitForSeconds(3f);
             }
             else if (act.action == "grasp")
             {
-                if (ur3Controller != null) ur3Controller.Grasp();
-                yield return new WaitForSeconds(0.5f);
+                urListener.SendCommand("set_standard_digital_out(4, True)");
+                Debug.Log("SEND: grasp");
+                yield return new WaitForSeconds(1f);
             }
             else if (act.action == "release")
             {
-                if (ur3Controller != null) ur3Controller.Release();
-                yield return new WaitForSeconds(0.5f);
+                urListener.SendCommand("set_standard_digital_out(4, False)");
+                Debug.Log("SEND: release");
+                yield return new WaitForSeconds(1f);
             }
         }
 
-        Debug.Log("=== 任務完成！===");
+        Debug.Log("=== 任務完成 ===");
     }
 }
