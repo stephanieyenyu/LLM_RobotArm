@@ -259,3 +259,222 @@ git push
 ````
 
 如果你還沒有加 README 檔，就在 Visual Studio 右鍵 `csharp_server`，新增 `README.md`，再貼上這份。
+
+# Part D：Unity Execute 與 UR3e 指令發送
+
+Part D 的目標是讀取 Part C 產生的 `robot_plan.json`，將動作序列轉換成 URScript 指令，並透過 TCP 連線發送到 URSim（或真實 UR3e），讓機械手臂依照規劃執行動作。
+
+目前系統會讀取：
+
+```text
+unity_project/Assets/StreamingAssets/robot_plan.json
+```
+
+並透過 TCP 將 URScript 指令發送到：
+
+```text
+URSim 虛擬機 IP（例如 192.168.31.225）
+```
+
+---
+
+## 目前功能
+
+目前版本已完成以下功能：
+
+1. 讀取 `Assets/StreamingAssets/robot_plan.json`
+2. 解析 `action_sequence` 中的每個動作
+3. 將 `move_to` 轉換成 URScript 的 `movel` 或 `movej`
+4. 將 `grasp` 與 `release` 轉換成數位輸出指令（digital_out 4）
+5. 透過 `URPackageListener` 用 TCP 將 URScript 字串發送到 URSim
+6. 提供 Unity UI 對話框，使用者可輸入指令後按執行按鈕觸發
+7. 即時 Console Log 顯示載入任務、執行進度、發送的 URScript 內容
+
+`robot_plan.json` 由 Part C 產生，Part D 只負責讀取與轉送指令，不做逆運動學或路徑規劃，這些都由 URSim 內建處理。
+
+---
+
+## 系統環境需求
+
+* Unity 2022.3 LTS
+* Oracle VirtualBox
+* URSim VIRTUAL-5.9.4.1031232（虛擬機）
+* 虛擬機網路設定為 橋接介面卡（Bridged Adapter）
+
+虛擬機與主機需在同一網域，URSim 啟動後請至 About 確認 IP（例如 `192.168.31.225`），並在 Unity 的 `JsonExecutor` 元件 Inspector 中填入該 IP。
+
+---
+
+## 場景物件
+
+Unity 場景僅保留以下物件：
+
+```text
+Main Camera
+Directional Light
+Executor       掛載 JsonExecutor 腳本
+UIDocument     掛載 UI Document 與 UIManager 腳本
+```
+
+機械手臂模型不在 Unity 場景中，手臂視覺呈現於 URSim 視窗。Unity 在此架構中僅作為遙控端。
+
+---
+
+## 輸入格式
+
+Part C 提供的 `robot_plan.json` 格式如下：
+
+```json
+{
+  "task": "move_object",
+  "target_object": "cup",
+  "action_sequence": [
+    {
+      "action": "move_to",
+      "position": { "x": -0.12, "y": 0.20, "z": 0.18 }
+    },
+    {
+      "action": "move_to",
+      "joints": {
+        "pan": 0,
+        "lift": -90,
+        "elbow": 0,
+        "wrist1": -90,
+        "wrist2": 0,
+        "wrist3": 0
+      }
+    },
+    { "action": "grasp" },
+    { "action": "release" }
+  ]
+}
+```
+
+欄位說明：
+
+```text
+task                任務描述
+target_object       目標物件名稱
+action_sequence     依序執行的動作清單
+
+action              動作類型，目前支援 move_to / grasp / release
+position            move_to 的 TCP 目標座標，單位是公尺
+position.x          機械手臂座標系 X
+position.y          機械手臂座標系 Y
+position.z          機械手臂座標系 Z
+joints              move_to 改用關節角度時的角度設定，單位是度
+joints.pan          shoulder_pan 角度
+joints.lift         shoulder_lift 角度
+joints.elbow        elbow 角度
+joints.wrist1       wrist_1 角度
+joints.wrist2       wrist_2 角度
+joints.wrist3       wrist_3 角度
+```
+
+`move_to` 同一動作中 `position` 與 `joints` 二擇一即可。`joints` 全為 0 時視為未設定，會改走 `position`。
+
+---
+
+## 轉換對照
+
+Part D 將 `action_sequence` 轉成下列 URScript 指令：
+
+```text
+move_to + position
+    movel(p[x, y, z, 3.14, 0, 0], a=1.2, v=0.5)
+
+move_to + joints
+    movej([pan, lift, elbow, wrist1, wrist2, wrist3], a=1.2, v=1.05)
+    （所有角度會由度轉成弧度）
+
+grasp
+    set_standard_digital_out(4, True)
+
+release
+    set_standard_digital_out(4, False)
+```
+
+URScript 參考來源：Universal Robots Script Manual e-Series SW 5.11
+
+---
+
+## URScript 限制
+
+* `movel` 的 TCP 座標需為機械手臂座標系，單位是公尺，姿態以軸角弧度表示
+* `movel` 在工作範圍邊界或奇異點會觸發 Protective Stop
+* 接近奇異點時建議改用 `movej`（關節角度）
+* digital_out 4 對應夾爪訊號，需在 URSim Installation 中將 TCP Z 設為 170mm 才會對應到正確的夾爪行為
+
+---
+
+## 如何執行
+
+從 Unity Hub 開啟專案：
+
+```text
+LLM_RobotArm/unity_project
+```
+
+開啟前請確認：
+
+1. Oracle VirtualBox 已啟動 URSim 虛擬機
+2. URSim 已 Initialize Robot 並按下 START，左下角狀態顯示 Normal
+3. URSim 右上角 About 確認 IP
+
+進入 Unity 後：
+
+1. 點選 `Executor` 物件
+2. Inspector 中將 `JsonExecutor` 的 `Ur IP` 改成 URSim 顯示的 IP
+3. 按 Play
+4. 在畫面下方對話框輸入指令，按執行按鈕（或鍵盤空白鍵）
+
+執行後 Unity Console 會顯示：
+
+```text
+載入任務：move_object，目標：cup
+=== 開始任務：move_object ===
+[1/4] move_to
+SEND: movel(p[-0.1200, 0.2000, 0.1800, 3.14, 0, 0], a=1.2, v=0.5)
+[2/4] grasp
+SEND: set_standard_digital_out(4, True)
+...
+=== 任務完成 ===
+```
+
+URSim 視窗會看到手臂依照指令移動，I/O 頁面可以看到 digital_out 4 燈號隨夾爪指令亮滅。
+
+---
+
+## 測試方式
+
+執行後請檢查：
+
+URSim 視窗
+
+* 手臂依序移動到 JSON 指定的位置
+* I/O 頁面中 digital_out 4 隨 grasp 與 release 改變亮滅
+* 左下角狀態維持 Normal，未進入 Protective Stop
+
+Unity Console
+
+* 顯示每個動作的 SEND 內容
+* 顯示「任務完成」字樣
+
+如果出現 Protective Stop，通常是目標位置超出工作範圍或落在奇異點，請改用 `movej` 並調整關節角度。
+
+---
+
+## 目前完成狀態
+
+Part D 基本版已完成。
+
+目前版本可以穩定讀取 `robot_plan.json`，將動作序列轉成 URScript 並透過 TCP 發送到 URSim，手臂可依照 Part C 規劃的動作執行移動、夾取與放下。
+
+尚未支援：
+
+1. 與真實 UR3e 的同步連線測試（預計 7/3 整合）
+2. URScript 執行失敗時的錯誤回報機制
+3. 多任務排程與中斷指令
+4. URSim 中加入工作物件視覺化（如目標方塊）
+
+這些會作為後續擴充。
