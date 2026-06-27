@@ -5,6 +5,7 @@ public class UIManager : MonoBehaviour
 {
     public UIDocument uiDocument;
     public JsonExecutor executor;
+    public LlmPlannerUnity planner;
 
     private TextField inputField;
     private Button sendButton;
@@ -44,9 +45,31 @@ public class UIManager : MonoBehaviour
         container.Add(sendButton);
         root.Add(container);
     }
-
+    
     void OnSendCommand()
     {
+        string command = inputField.value;
+        if (string.IsNullOrEmpty(command)) return;
+
+        Debug.Log("使用者輸入：" + command);
+        StartCoroutine(planner.GeneratePlan(command, OnPlanReady));
+    }
+
+    void OnPlanReady(string planJson)
+    {
+        Debug.Log("LLM 產生 plan：\n" + planJson);
+
+        // 寫入 robot_plan.json
+        string path = System.IO.Path.Combine(Application.streamingAssetsPath, "robot_plan.json");
+        System.IO.File.WriteAllText(path, planJson);
+
+        // 觸發 Unity 執行
+        executor.LoadAndExecute();
+    }
+
+    System.Collections.IEnumerator WaitAndExecute()
+    {
+        yield return new UnityEngine.WaitForSeconds(3f);
         executor.LoadAndExecute();
     }
 
