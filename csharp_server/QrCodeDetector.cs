@@ -69,30 +69,41 @@ public class QrCodeDetectorService
         {
             var result = decodedResults[i];
 
-            if (result.ResultPoints == null || result.ResultPoints.Length == 0)
+            if (result.ResultPoints == null || result.ResultPoints.Length < 3)
             {
                 continue;
             }
 
-            double cx = result.ResultPoints.Average(p => p.X);
-            double cy = result.ResultPoints.Average(p => p.Y);
+            // ZXing QR ResultPoints 固定順序：
+            //   [0] 左下 finder pattern 中心 (bottom-left)
+            //   [1] 左上 finder pattern 中心 (top-left)
+            //   [2] 右上 finder pattern 中心 (top-right)
+            // 右下角沒有 finder pattern，用向量補出來：
+            //   右下 = 左下 + 右上 - 左上
+            var p0 = result.ResultPoints[0]; // bottom-left
+            var p1 = result.ResultPoints[1]; // top-left
+            var p2 = result.ResultPoints[2]; // top-right
 
-            double[][] corners = result.ResultPoints
-                .Select(p => new[]
-                {
-                    Math.Round((double)p.X, 2),
-                    Math.Round((double)p.Y, 2)
-                })
-                .ToArray();
+            double brX = Math.Round(p0.X + p2.X - p1.X, 2); // bottom-right X
+            double brY = Math.Round(p0.Y + p2.Y - p1.Y, 2); // bottom-right Y
+
+            // 四個角點，順序對應 coordinate_mapper_3d.py 的 solvePnP object_points：
+            // top-left, top-right, bottom-right, bottom-left
+            double[][] corners = new double[][]
+            {
+                new[] { Math.Round((double)p1.X, 2), Math.Round((double)p1.Y, 2) }, // top-left
+                new[] { Math.Round((double)p2.X, 2), Math.Round((double)p2.Y, 2) }, // top-right
+                new[] { brX, brY },                                                   // bottom-right (補算)
+                new[] { Math.Round((double)p0.X, 2), Math.Round((double)p0.Y, 2) }  // bottom-left
+            };
+
+            double cx = Math.Round((p0.X + p1.X + p2.X + brX) / 4.0, 2);
+            double cy = Math.Round((p0.Y + p1.Y + p2.Y + brY) / 4.0, 2);
 
             results.Add(new QrCodeResult
             {
                 id = string.IsNullOrWhiteSpace(result.Text) ? $"QR{i + 1}" : result.Text,
-                center_pixel = new[]
-                {
-                    Math.Round(cx, 2),
-                    Math.Round(cy, 2)
-                },
+                center_pixel = new[] { cx, cy },
                 corners = corners
             });
         }
