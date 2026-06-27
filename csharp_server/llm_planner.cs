@@ -65,6 +65,9 @@ public class LlmPlanner
 
                 規則：
                 - action 只能是 "pick_and_place" 或 "move_relative"。
+                - 判斷 action 的原則：
+                - 指令含有方向詞（左、右、前、後、上、下、left、right）或距離（公分、cm）→ 一定是 move_relative，target 必須是 null
+                - 指令是把物件放到另一個物件位置 → 才是 pick_and_place
                 - object 必須從 Part B 提供的物件名稱清單中選擇。
                 - pick_and_place 的 target 也必須從 Part B 提供的物件名稱清單中選擇。
                 - move_relative 的 direction 只能是 left、right、forward、backward、up、down。
