@@ -327,7 +327,7 @@ def main():
                 frame
             )
 
-            inside_workspace = (0.0 <= u <= 1.0) and (0.0 <= v <= 1.0)
+            inside_workspace = bool((0.0 <= u <= 1.0) and (0.0 <= v <= 1.0))
 
             # 給 Unity / 機械手臂使用的工作座標
             # x：QR1 → QR2 方向距離
