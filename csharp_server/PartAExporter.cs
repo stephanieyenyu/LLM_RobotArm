@@ -145,8 +145,11 @@ public static class PartAExporter
         Directory.CreateDirectory("../sample_json");
 
         File.WriteAllText("outputs/detection_result.json", json);
-        File.WriteAllText("../sample_json/objects_world.json", json);  // Program.cs 直接讀這個
+        Directory.CreateDirectory("../sample_json");
+        File.WriteAllText("../sample_json/detected_objects.json", json);
+        File.WriteAllText("../sample_json/objects_world.json", json);
         Cv2.ImWrite("outputs/visual_result.jpg", visual);
+
 
         Console.WriteLine(json);
         Console.WriteLine("Saved to outputs/detection_result.json");
