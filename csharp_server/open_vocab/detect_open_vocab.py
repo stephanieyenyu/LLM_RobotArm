@@ -60,7 +60,7 @@ def main():
 
     target_sizes = torch.tensor([[height, width]], device=device)
 
-    results = processor.post_process_object_detection(
+    results = processor.post_process_grounded_object_detection(
         outputs=outputs,
         target_sizes=target_sizes,
         threshold=SCORE_THRESHOLD

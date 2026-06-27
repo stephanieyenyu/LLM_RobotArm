@@ -1,0 +1,35 @@
+{
+  "image_width": 1280,
+  "image_height": 720,
+  "objects": [
+    {
+      "name": "cup",
+      "confidence": 0.093,
+      "bbox": [
+        526.17,
+        261.41,
+        794.44,
+        445.3
+      ],
+      "center_pixel": [
+        660.31,
+        353.35
+      ],
+      "source": "open_vocab"
+    }
+  ],
+  "prompts": [
+    "cup",
+    "bottle",
+    "book",
+    "cell phone",
+    "red cube",
+    "blue cube",
+    "green cube",
+    "screwdriver",
+    "metal part",
+    "robot part",
+    "tool",
+    "object"
+  ]
+}

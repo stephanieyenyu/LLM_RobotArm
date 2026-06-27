@@ -4,23 +4,23 @@
   "objects": [
     {
       "world_position": {
-        "x": 0.322,
+        "x": 0.328,
         "y": 0,
-        "z": 0.207
+        "z": 0.204
       },
       "name": "cup",
-      "confidence": 0.918,
+      "confidence": 0.093,
       "bbox": [
-        524.6,
-        257.03,
-        784.35,
-        444.44
+        526.17,
+        261.41,
+        794.44,
+        445.3
       ],
       "center_pixel": [
-        654.48,
-        350.73
+        660.31,
+        353.35
       ],
-      "source": "yolo_coco"
+      "source": "open_vocab"
     }
   ],
   "qrcodes": [
