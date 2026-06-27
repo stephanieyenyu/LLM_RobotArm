@@ -1,218 +1,131 @@
-﻿using OpenCvSharp;
+using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
+// ==========================================
+// Step 1: Part A — YOLO + QRCode + 座標對應
+// ==========================================
+PartAExporter.Run();
 
-string imagePath = "images/test_scene.jpg";
+// ==========================================
+// Step 2: Part C — LLM 指令規劃
+// 讀 Part A 直接輸出的 detection_result.json
+// ==========================================
+string sceneJsonPath = "outputs/detection_result.json";
 
-// Change this to false if you want to test using the existing image file.
-bool useWebcam = false;
-
-// If your laptop has multiple cameras, try 0, 1, or 2.
-int cameraIndex = 0;
-
-Console.WriteLine("Current folder: " + Directory.GetCurrentDirectory());
-Console.WriteLine("Image path: " + Path.GetFullPath(imagePath));
-
-if (useWebcam)
+if (!File.Exists(sceneJsonPath))
 {
-    var webcam = new WebcamCapture();
-
-    bool captured = webcam.CaptureImage(
-        outputPath: imagePath,
-        cameraIndex: cameraIndex,
-        width: 1280,
-        height: 720
-    );
-
-    if (!captured)
-    {
-        Console.WriteLine("Webcam capture failed. Falling back to existing images/test_scene.jpg.");
-    }
-}
-
-Console.WriteLine("Image exists: " + File.Exists(imagePath));
-
-Mat image = Cv2.ImRead(imagePath);
-
-if (image.Empty())
-{
-    Console.WriteLine("Cannot read image. Put test_scene.jpg inside the images folder or check webcam capture.");
+    Console.WriteLine($"找不到 Part A 輸出：{sceneJsonPath}");
     return;
 }
 
-if (image.Empty())
+string sceneJson = File.ReadAllText(sceneJsonPath);
+
+DetectionOutput? detectionOutput = JsonSerializer.Deserialize<DetectionOutput>(
+    sceneJson,
+    new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+);
+
+if (detectionOutput?.Objects == null || detectionOutput.Objects.Count == 0)
 {
-    Console.WriteLine("Cannot read image. Put test_scene.jpg inside the images folder.");
+    Console.WriteLine("Part A 沒有偵測到任何物件，無法繼續。");
     return;
 }
 
-var qrDetector = new QrCodeDetectorService();
-var qrcodes = qrDetector.Detect(image);
-
-List<ObjectDetectionResult> objects;
-
-var openVocabDetector = new OpenVocabDetectorService();
-var openVocabObjects = openVocabDetector.Detect();
-
-if (openVocabObjects.Count > 0)
-{
-    objects = openVocabObjects;
-    Console.WriteLine("Using open-vocabulary detection results.");
-}
-else
-{
-    var yoloDetector = new YoloDetectorService();
-    objects = yoloDetector.Detect(image);
-    Console.WriteLine("Using YOLO fallback detection results.");
-}
-
-var coordinateMapper = new CoordinateMapper();
-var mappedObjects = coordinateMapper.MapObjectsToWorkspace(objects, qrcodes);
-
-Console.WriteLine($"QR codes detected: {qrcodes.Count}");
-Console.WriteLine($"Objects detected: {objects.Count}");
-
-if (!coordinateMapper.HasRequiredQrCodes(qrcodes))
-{
-    Console.WriteLine("Warning: QR1, QR2, QR3, QR4 are not all detected.");
-}
-else
-{
-    double qrArea = coordinateMapper.CalculateQrArea(qrcodes);
-
-    Console.WriteLine($"QR workspace area in image pixels: {qrArea}");
-
-    if (qrArea < 1000)
+// 轉成 LlmPlanner 需要的 SceneObject 格式
+List<SceneObject> sceneObjects = detectionOutput.Objects
+    .Where(obj => obj.WorldPosition != null)
+    .Select(obj => new SceneObject
     {
-        Console.WriteLine("Warning: QR codes are too close together or nearly collinear.");
-    }
+        Name = obj.Name,
+        X    = obj.WorldPosition!.X,
+        Y    = obj.WorldPosition!.Y,
+        Z    = obj.WorldPosition!.Z
+    })
+    .ToList();
+
+Console.WriteLine($"\n載入 {sceneObjects.Count} 個物件（世界座標，單位 m）：");
+foreach (var o in sceneObjects)
+    Console.WriteLine($"  {o.Name}  x={o.X:F3}  y={o.Y:F3}  z={o.Z:F3}");
+
+Console.WriteLine("\n請輸入機械手臂指令：");
+string? userCommand = Console.ReadLine();
+
+if (string.IsNullOrWhiteSpace(userCommand))
+{
+    Console.WriteLine("指令不可為空。");
+    return;
 }
 
-if (objects.Count == 0)
-{
-    Console.WriteLine("Warning: no objects detected.");
-}
+// ==========================================
+// Step 3: LLM → robot_plan.json
+// ==========================================
+LlmPlanner planner = new();
+RobotPlan plan = await planner.GeneratePlanAsync(userCommand, sceneObjects);
 
-Mat visual = image.Clone();
+string outputJson = JsonSerializer.Serialize(
+    plan,
+    new JsonSerializerOptions { WriteIndented = true }
+);
 
-foreach (var qr in qrcodes)
-{
-    if (qr.center_pixel.Length < 2)
-    {
-        continue;
-    }
+Console.WriteLine("\n=== robot_plan.json ===");
+Console.WriteLine(outputJson);
 
-    int cx = (int)qr.center_pixel[0];
-    int cy = (int)qr.center_pixel[1];
-
-    Cv2.Circle(
-        visual,
-        new Point(cx, cy),
-        8,
-        new Scalar(0, 0, 255),
-        -1
-    );
-
-    Cv2.PutText(
-        visual,
-        qr.id,
-        new Point(cx + 10, cy),
-        HersheyFonts.HersheySimplex,
-        0.8,
-        new Scalar(0, 0, 255),
-        2
-    );
-
-    foreach (var corner in qr.corners)
-    {
-        if (corner.Length < 2)
-        {
-            continue;
-        }
-
-        int x = (int)corner[0];
-        int y = (int)corner[1];
-
-        Cv2.Circle(
-            visual,
-            new Point(x, y),
-            5,
-            new Scalar(255, 0, 0),
-            -1
-        );
-    }
-}
-
-foreach (var obj in mappedObjects)
-{
-    if (obj.bbox.Length < 4)
-    {
-        continue;
-    }
-
-    int x1 = (int)obj.bbox[0];
-    int y1 = (int)obj.bbox[1];
-    int x2 = (int)obj.bbox[2];
-    int y2 = (int)obj.bbox[3];
-
-    Cv2.Rectangle(
-        visual,
-        new Point(x1, y1),
-        new Point(x2, y2),
-        new Scalar(0, 255, 0),
-        4
-    );
-
-    Cv2.PutText(
-        visual,
-        $"{obj.name} {obj.confidence}",
-        new Point(x1, Math.Max(y1 - 10, 20)),
-        HersheyFonts.HersheySimplex,
-        1.0,
-        new Scalar(0, 255, 0),
-        3
-    );
-
-    Cv2.PutText(
-        visual,
-        $"x:{obj.world_position.x} z:{obj.world_position.z}",
-        new Point(x1, Math.Min(y2 + 30, image.Height - 10)),
-        HersheyFonts.HersheySimplex,
-        0.8,
-        new Scalar(0, 255, 0),
-        2
-    );
-}
-
-var output = new
-{
-    image_width = image.Width,
-    image_height = image.Height,
-    objects = mappedObjects,
-    qrcodes = qrcodes,
-    workspace = new
-    {
-        origin = "QR1",
-        x_axis = "QR1_to_QR2",
-        z_axis = "QR1_to_QR3",
-        top_right = "QR4",
-        unit = "metres",
-        width_m = 0.60,
-        depth_m = 0.40,
-        mapping = "four_point_homography"
-    }
-};
-
-string json = JsonSerializer.Serialize(output, new JsonSerializerOptions
-{
-    WriteIndented = true
-});
-
+// 同時存到兩個地方：本機 outputs/ 和 Unity 讀取的 StreamingAssets/
 Directory.CreateDirectory("outputs");
+File.WriteAllText("outputs/robot_plan.json", outputJson);
+Console.WriteLine("Saved to outputs/robot_plan.json");
 
-File.WriteAllText("outputs/detection_result.json", json);
-Cv2.ImWrite("outputs/visual_result.jpg", visual);
+string unityPath = "../unity_project/Assets/StreamingAssets/robot_plan.json";
+if (Directory.Exists(Path.GetDirectoryName(Path.GetFullPath(unityPath))!))
+{
+    File.WriteAllText(unityPath, outputJson);
+    Console.WriteLine($"Saved to {unityPath}");
+}
 
-Console.WriteLine(json);
-Console.WriteLine("Saved to outputs/detection_result.json");
-Console.WriteLine("Saved to outputs/visual_result.jpg");
+// ==========================================
+// 輔助 class：對應 Part A 輸出的 JSON 格式
+// ==========================================
+public class DetectionOutput
+{
+    public int ImageWidth  { get; set; }
+    public int ImageHeight { get; set; }
+
+    [JsonPropertyName("objects")]
+    public List<DetectedObject> Objects { get; set; } = new();
+}
+
+public class DetectedObject
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("confidence")]
+    public double Confidence { get; set; }
+
+    [JsonPropertyName("world_position")]
+    public WorldPos? WorldPosition { get; set; }
+
+    [JsonPropertyName("bbox")]
+    public double[] Bbox { get; set; } = Array.Empty<double>();
+
+    [JsonPropertyName("center_pixel")]
+    public double[] CenterPixel { get; set; } = Array.Empty<double>();
+
+    [JsonPropertyName("source")]
+    public string Source { get; set; } = "";
+}
+
+public class WorldPos
+{
+    [JsonPropertyName("x")]
+    public double X { get; set; }
+
+    [JsonPropertyName("y")]
+    public double Y { get; set; }
+
+    [JsonPropertyName("z")]
+    public double Z { get; set; }
+}

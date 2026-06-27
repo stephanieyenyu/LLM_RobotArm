@@ -1,4 +1,4 @@
-﻿using OpenCvSharp;
+using OpenCvSharp;
 using ZXing;
 using ZXing.Common;
 using System.Runtime.InteropServices;

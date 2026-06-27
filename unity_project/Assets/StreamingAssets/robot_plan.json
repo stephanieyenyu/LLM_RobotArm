@@ -1,0 +1,17 @@
+{
+  "task": "test",
+  "target_object": "test",
+  "action_sequence": [
+    {
+      "action": "move_to",
+      "joints": {
+        "pan": 0,
+        "lift": -90,
+        "elbow": 0,
+        "wrist1": -90,
+        "wrist2": 0,
+        "wrist3": 0
+      }
+    }
+  ]
+}
