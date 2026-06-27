@@ -355,7 +355,7 @@ def main():
                     "u": round(float(u), 6),
                     "v": round(float(v), 6)
                 },
-                "inside_workspace": inside_workspace,
+                "inside_workspace": bool(inside_workspace),
                 "position": to_vec3_dict(position)
             }
 
