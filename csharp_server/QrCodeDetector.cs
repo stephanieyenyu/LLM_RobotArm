@@ -1,4 +1,4 @@
-﻿using OpenCvSharp;
+using OpenCvSharp;
 using ZXing;
 using ZXing.Common;
 using System.Runtime.InteropServices;
@@ -69,30 +69,42 @@ public class QrCodeDetectorService
         {
             var result = decodedResults[i];
 
-            if (result.ResultPoints == null || result.ResultPoints.Length == 0)
+            if (result.ResultPoints == null || result.ResultPoints.Length < 3)
             {
                 continue;
             }
 
-            double cx = result.ResultPoints.Average(p => p.X);
-            double cy = result.ResultPoints.Average(p => p.Y);
+            // ZXing QR ResultPoints 固定順序：
+            //   [0] bottom-left finder pattern
+            //   [1] top-left finder pattern
+            //   [2] top-right finder pattern
+            // 右下角沒有 finder pattern，用平行四邊形法則補出來：
+            //   bottom-right = bottom-left + top-right - top-left
+            var bl = result.ResultPoints[0]; // bottom-left
+            var tl = result.ResultPoints[1]; // top-left
+            var tr = result.ResultPoints[2]; // top-right
 
-            double[][] corners = result.ResultPoints
-                .Select(p => new[]
-                {
-                    Math.Round((double)p.X, 2),
-                    Math.Round((double)p.Y, 2)
-                })
-                .ToArray();
+            double brX = Math.Round(bl.X + tr.X - tl.X, 2);
+            double brY = Math.Round(bl.Y + tr.Y - tl.Y, 2);
+
+            // 角點順序對應 coordinate_mapper_3d.py 的 get_qr_object_points()：
+            // top-left, top-right, bottom-right, bottom-left
+            double[][] corners = new double[][]
+            {
+                new[] { Math.Round((double)tl.X, 2), Math.Round((double)tl.Y, 2) }, // top-left
+                new[] { Math.Round((double)tr.X, 2), Math.Round((double)tr.Y, 2) }, // top-right
+                new[] { brX, brY },                                                   // bottom-right（補算）
+                new[] { Math.Round((double)bl.X, 2), Math.Round((double)bl.Y, 2) }  // bottom-left
+            };
+
+            // center = 四角點平均
+            double cx = Math.Round((tl.X + tr.X + brX + bl.X) / 4.0, 2);
+            double cy = Math.Round((tl.Y + tr.Y + brY + bl.Y) / 4.0, 2);
 
             results.Add(new QrCodeResult
             {
                 id = string.IsNullOrWhiteSpace(result.Text) ? $"QR{i + 1}" : result.Text,
-                center_pixel = new[]
-                {
-                    Math.Round(cx, 2),
-                    Math.Round(cy, 2)
-                },
+                center_pixel = new[] { cx, cy },
                 corners = corners
             });
         }
