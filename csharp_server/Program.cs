@@ -2,6 +2,8 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
+PartAExporter.Run();
+return;
 await PartABPipeline.RunAsync();
 Console.WriteLine("請輸入機械手臂指令：");
 string? userCommand = Console.ReadLine();
