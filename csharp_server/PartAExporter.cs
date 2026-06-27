@@ -145,10 +145,10 @@ public static class PartAExporter
         Directory.CreateDirectory("../sample_json");
 
         File.WriteAllText("outputs/detection_result.json", json);
+        Cv2.ImWrite("outputs/visual_result.jpg", visual);
         Directory.CreateDirectory("../sample_json");
         File.WriteAllText("../sample_json/detected_objects.json", json);
         File.WriteAllText("../sample_json/objects_world.json", json);
-        Cv2.ImWrite("outputs/visual_result.jpg", visual);
 
 
         Console.WriteLine(json);
