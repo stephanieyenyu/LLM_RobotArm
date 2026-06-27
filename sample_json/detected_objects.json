@@ -3,11 +3,6 @@
   "image_height": 720,
   "objects": [
     {
-      "world_position": {
-        "x": 0.328,
-        "y": 0,
-        "z": 0.204
-      },
       "name": "cup",
       "confidence": 0.093,
       "bbox": [
@@ -124,15 +119,5 @@
         ]
       ]
     }
-  ],
-  "workspace": {
-    "origin": "QR1",
-    "x_axis": "QR1_to_QR2",
-    "z_axis": "QR1_to_QR3",
-    "top_right": "QR4",
-    "unit": "metres",
-    "width_m": 0.6,
-    "depth_m": 0.4,
-    "mapping": "four_point_homography"
-  }
+  ]
 }
