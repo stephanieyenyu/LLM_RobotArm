@@ -3,46 +3,99 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Diagnostics;
 
 // ==========================================
-// Step 1: Part A — YOLO + QRCode + 座標對應
+// Step 1: Part A — YOLO + QRCode detection
+// 輸出 ../sample_json/detected_objects.json
 // ==========================================
-PartAExporter.Run();
+bool partASuccess = PartAExporter.Run();
+
+if (!partASuccess)
+{
+    Console.WriteLine("Part A failed.");
+    return;
+}
 
 // ==========================================
-// Step 2: Part C — LLM 指令規劃
-// 讀 Part A 直接輸出的 detection_result.json
+// Step 2: Part B — Python 3D coordinate mapping
+// 讀 ../sample_json/detected_objects.json
+// 輸出 ../sample_json/objects_world.json
 // ==========================================
-string sceneJsonPath = "outputs/detection_result.json";
+Console.WriteLine("Running Part B Python coordinate mapper...");
+
+var processInfo = new ProcessStartInfo
+{
+    FileName = "python",
+    Arguments = "coordinate_mapper_3d.py",
+    WorkingDirectory = Directory.GetCurrentDirectory(),
+    RedirectStandardOutput = true,
+    RedirectStandardError = true,
+    UseShellExecute = false,
+    CreateNoWindow = true
+};
+
+using var process = Process.Start(processInfo);
+
+if (process == null)
+{
+    Console.WriteLine("Failed to start Part B Python process.");
+    return;
+}
+
+string partBOutput = process.StandardOutput.ReadToEnd();
+string partBError = process.StandardError.ReadToEnd();
+
+process.WaitForExit();
+
+Console.WriteLine(partBOutput);
+
+if (!string.IsNullOrWhiteSpace(partBError))
+{
+    Console.WriteLine("Part B error:");
+    Console.WriteLine(partBError);
+}
+
+if (process.ExitCode != 0)
+{
+    Console.WriteLine("Part B failed.");
+    return;
+}
+
+// ==========================================
+// Step 3: Part C — LLM 指令規劃
+// 讀 Part B 輸出的 objects_world.json
+// ==========================================
+string sceneJsonPath = "../sample_json/objects_world.json";
 
 if (!File.Exists(sceneJsonPath))
 {
-    Console.WriteLine($"找不到 Part A 輸出：{sceneJsonPath}");
+    Console.WriteLine($"找不到 Part B 輸出：{sceneJsonPath}");
     return;
 }
 
 string sceneJson = File.ReadAllText(sceneJsonPath);
 
-DetectionOutput? detectionOutput = JsonSerializer.Deserialize<DetectionOutput>(
+ObjectsWorld? objectsWorld = JsonSerializer.Deserialize<ObjectsWorld>(
     sceneJson,
     new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
 );
 
-if (detectionOutput?.Objects == null || detectionOutput.Objects.Count == 0)
+if (objectsWorld?.Objects == null || objectsWorld.Objects.Count == 0)
 {
-    Console.WriteLine("Part A 沒有偵測到任何物件，無法繼續。");
+    Console.WriteLine("Part B 沒有輸出任何有效物件，無法繼續。");
     return;
 }
 
 // 轉成 LlmPlanner 需要的 SceneObject 格式
-List<SceneObject> sceneObjects = detectionOutput.Objects
-    .Where(obj => obj.WorldPosition != null)
+List<SceneObject> sceneObjects = objectsWorld.Objects
+    .Where(obj => obj.Position != null)
     .Select(obj => new SceneObject
     {
         Name = obj.Name,
-        X    = obj.WorldPosition!.X,
-        Y    = obj.WorldPosition!.Y,
-        Z    = obj.WorldPosition!.Z
+        X = obj.Position!.X,
+        Y = obj.Position!.Y,
+        Z = obj.Position!.Z
     })
     .ToList();
 
@@ -88,16 +141,16 @@ if (Directory.Exists(Path.GetDirectoryName(Path.GetFullPath(unityPath))!))
 // ==========================================
 // 輔助 class：對應 Part A 輸出的 JSON 格式
 // ==========================================
-public class DetectionOutput
+// ==========================================
+// 輔助 class：對應 Part B 輸出的 objects_world.json 格式
+// ==========================================
+public class ObjectsWorld
 {
-    public int ImageWidth  { get; set; }
-    public int ImageHeight { get; set; }
-
     [JsonPropertyName("objects")]
-    public List<DetectedObject> Objects { get; set; } = new();
+    public List<WorldObject> Objects { get; set; } = new();
 }
 
-public class DetectedObject
+public class WorldObject
 {
     [JsonPropertyName("name")]
     public string Name { get; set; } = "";
@@ -105,17 +158,8 @@ public class DetectedObject
     [JsonPropertyName("confidence")]
     public double Confidence { get; set; }
 
-    [JsonPropertyName("world_position")]
-    public WorldPos? WorldPosition { get; set; }
-
-    [JsonPropertyName("bbox")]
-    public double[] Bbox { get; set; } = Array.Empty<double>();
-
-    [JsonPropertyName("center_pixel")]
-    public double[] CenterPixel { get; set; } = Array.Empty<double>();
-
-    [JsonPropertyName("source")]
-    public string Source { get; set; } = "";
+    [JsonPropertyName("position")]
+    public WorldPos? Position { get; set; }
 }
 
 public class WorldPos

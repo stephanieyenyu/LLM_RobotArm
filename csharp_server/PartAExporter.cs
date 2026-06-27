@@ -1,9 +1,10 @@
 using OpenCvSharp;
+using System;
 using System.Text.Json;
 
 public static class PartAExporter
 {
-    public static void Run()
+    public static bool Run()
     {
         string imagePath = "images/test_scene.jpg";
 
@@ -35,7 +36,7 @@ public static class PartAExporter
         if (image.Empty())
         {
             Console.WriteLine("Cannot read image. Put test_scene.jpg inside the images folder.");
-            return;
+            return false;
         }
 
         // --- QRCode 偵測 ---
@@ -119,25 +120,15 @@ public static class PartAExporter
         }
 
         // --- 組 JSON 輸出 ---
+        // 這份 JSON 是給 Part B 使用的，所以 objects 用原始 YOLO/open-vocab 偵測結果
+        // 不使用 mappedObjects，因為 3D 座標要交給 coordinate_mapper_3d.py 計算
         var output = new
         {
-            image_width  = image.Width,
+            image_width = image.Width,
             image_height = image.Height,
-            objects      = mappedObjects,
-            qrcodes      = qrcodes,
-            workspace    = new
-            {
-                origin   = "QR1",
-                x_axis   = "QR1_to_QR2",
-                z_axis   = "QR1_to_QR3",
-                top_right = "QR4",
-                unit     = "metres",
-                width_m  = 0.60,
-                depth_m  = 0.40,
-                mapping  = "four_point_homography"
-            }
+            objects = objects,
+            qrcodes = qrcodes
         };
-
         string json = JsonSerializer.Serialize(output,
             new JsonSerializerOptions { WriteIndented = true });
 
@@ -145,18 +136,19 @@ public static class PartAExporter
         Directory.CreateDirectory("../sample_json");
 
         File.WriteAllText("outputs/detection_result.json", json);
-        Cv2.ImWrite("outputs/visual_result.jpg", visual);
-        Directory.CreateDirectory("../sample_json");
         File.WriteAllText("../sample_json/detected_objects.json", json);
-        File.WriteAllText("../sample_json/objects_world.json", json);
+
+        Cv2.ImWrite("outputs/visual_result.jpg", visual);
+        Cv2.ImWrite("../sample_json/visual_result.jpg", visual);
 
 
         Console.WriteLine(json);
         Console.WriteLine("Saved to outputs/detection_result.json");
-        Console.WriteLine("Saved to ../sample_json/objects_world.json");
+        Console.WriteLine("Saved to ../sample_json/detected_objects.json");
         Console.WriteLine("Saved to outputs/visual_result.jpg");
-
+        Console.WriteLine("Saved to ../sample_json/visual_result.jpg");
         image.Dispose();
         visual.Dispose();
+        return true;
     }
 }
