@@ -21,12 +21,12 @@ public class LlmPlannerUnity : MonoBehaviour
 
     [Header("場景物件（測試用）")]
     public List<SceneObjectData> sceneObjects = new()
-    {
-        new SceneObjectData { name = "bottle", x = 30, y = 20, z = 15 },
-        new SceneObjectData { name = "cup", x = 25, y = 10, z = 15 },
-        new SceneObjectData { name = "scissors", x = 35, y = 25, z = 12 },
-        new SceneObjectData { name = "box", x = 40, y = -20, z = 10 }
-    };
+{
+    new SceneObjectData { name = "bottle", x = 0, y = 30, z = 10 },
+    new SceneObjectData { name = "cup", x = 20, y = 10, z = 10 },
+    new SceneObjectData { name = "scissors", x = -30, y = 0, z = 10 },
+    new SceneObjectData { name = "box", x = -20, y = -10, z = 10 }
+};
 
     private string apiKey;
 
