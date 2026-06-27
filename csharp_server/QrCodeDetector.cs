@@ -75,30 +75,31 @@ public class QrCodeDetectorService
             }
 
             // ZXing QR ResultPoints 固定順序：
-            //   [0] 左下 finder pattern 中心 (bottom-left)
-            //   [1] 左上 finder pattern 中心 (top-left)
-            //   [2] 右上 finder pattern 中心 (top-right)
-            // 右下角沒有 finder pattern，用向量補出來：
-            //   右下 = 左下 + 右上 - 左上
-            var p0 = result.ResultPoints[0]; // bottom-left
-            var p1 = result.ResultPoints[1]; // top-left
-            var p2 = result.ResultPoints[2]; // top-right
+            //   [0] bottom-left finder pattern
+            //   [1] top-left finder pattern
+            //   [2] top-right finder pattern
+            // 右下角沒有 finder pattern，用平行四邊形法則補出來：
+            //   bottom-right = bottom-left + top-right - top-left
+            var bl = result.ResultPoints[0]; // bottom-left
+            var tl = result.ResultPoints[1]; // top-left
+            var tr = result.ResultPoints[2]; // top-right
 
-            double brX = Math.Round(p0.X + p2.X - p1.X, 2); // bottom-right X
-            double brY = Math.Round(p0.Y + p2.Y - p1.Y, 2); // bottom-right Y
+            double brX = Math.Round(bl.X + tr.X - tl.X, 2);
+            double brY = Math.Round(bl.Y + tr.Y - tl.Y, 2);
 
-            // 四個角點，順序對應 coordinate_mapper_3d.py 的 solvePnP object_points：
+            // 角點順序對應 coordinate_mapper_3d.py 的 get_qr_object_points()：
             // top-left, top-right, bottom-right, bottom-left
             double[][] corners = new double[][]
             {
-                new[] { Math.Round((double)p1.X, 2), Math.Round((double)p1.Y, 2) }, // top-left
-                new[] { Math.Round((double)p2.X, 2), Math.Round((double)p2.Y, 2) }, // top-right
-                new[] { brX, brY },                                                   // bottom-right (補算)
-                new[] { Math.Round((double)p0.X, 2), Math.Round((double)p0.Y, 2) }  // bottom-left
+                new[] { Math.Round((double)tl.X, 2), Math.Round((double)tl.Y, 2) }, // top-left
+                new[] { Math.Round((double)tr.X, 2), Math.Round((double)tr.Y, 2) }, // top-right
+                new[] { brX, brY },                                                   // bottom-right（補算）
+                new[] { Math.Round((double)bl.X, 2), Math.Round((double)bl.Y, 2) }  // bottom-left
             };
 
-            double cx = Math.Round((p0.X + p1.X + p2.X + brX) / 4.0, 2);
-            double cy = Math.Round((p0.Y + p1.Y + p2.Y + brY) / 4.0, 2);
+            // center = 四角點平均
+            double cx = Math.Round((tl.X + tr.X + brX + bl.X) / 4.0, 2);
+            double cy = Math.Round((tl.Y + tr.Y + brY + bl.Y) / 4.0, 2);
 
             results.Add(new QrCodeResult
             {
