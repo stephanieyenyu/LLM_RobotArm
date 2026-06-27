@@ -73,11 +73,15 @@ public class LlmPlanner
                 - 不可以輸出或編造座標。
                 - 物件原始位置與新位置會由 C# 程式根據 Part B 座標計算。
                 - 如果中文名稱和英文物件名稱語意相近，請選擇最符合的英文物件名稱。
-                - 判斷 action 的原則：
-                - 指令含有「往...方向移動」、「移到左/右/前/後」、「往左/右移」等方向詞 → 用 move_relative
-                - 指令含有「放到...旁邊」、「放到...上面」、「拿去放到另一個物件」→ 用 pick_and_place
-                - 有明確距離（公分、cm）→ 一定是 move_relative
-                - move_relative 時 target 必須是 null，不可以填物件名稱
+                - 判斷 action 的強制規則：
+                - 「往右移動」、「右移」、「移到右邊」→ action=move_relative, direction=right
+                - 「往左移動」、「左移」、「移到左邊」→ action=move_relative, direction=left
+                - 「往前」→ action=move_relative, direction=forward
+                - 「往後」→ action=move_relative, direction=backward
+                - 「往上」→ action=move_relative, direction=up
+                - 「往下」→ action=move_relative, direction=down
+                - 有公分/cm/距離數字 → 一定是 move_relative，distance_cm 填數字，target 填 null
+                - 只有在把物件放到另一個不同物件旁邊時才用 pick_and_place
                 - 最後只能輸出符合 JSON schema 的 JSON，不要加任何解釋文字。
                 """
             ),
