@@ -60,11 +60,19 @@ def main():
 
     target_sizes = torch.tensor([[height, width]], device=device)
 
-    results = processor.post_process_grounded_object_detection(
-        outputs=outputs,
-        target_sizes=target_sizes,
-        threshold=SCORE_THRESHOLD
-    )[0]
+    # post_process_object_detection renamed in newer transformers versions
+    try:
+        results = processor.post_process_grounded_object_detection(
+            outputs=outputs,
+            target_sizes=target_sizes,
+            threshold=SCORE_THRESHOLD
+        )[0]
+    except AttributeError:
+        results = processor.post_process_object_detection(
+            outputs=outputs,
+            target_sizes=target_sizes,
+            threshold=SCORE_THRESHOLD
+        )[0]
 
     objects = []
 
