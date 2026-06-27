@@ -1,101 +1,159 @@
-﻿using OpenCvSharp;
-using System;
-using System.Collections.Generic;
-using System.IO;
+using OpenCvSharp;
 using System.Text.Json;
 
 public static class PartAExporter
 {
-    public static bool Run()
+    public static void Run()
     {
-        Console.WriteLine("=== Running Part A Detection ===");
-
-        Directory.CreateDirectory("images");
-        Directory.CreateDirectory("outputs");
-        Directory.CreateDirectory("../sample_json");
-
         string imagePath = "images/test_scene.jpg";
 
-        // 1. 先嘗試用 webcam 拍照
-        WebcamCapture webcam = new WebcamCapture();
-        bool captured = webcam.CaptureImage(imagePath);
+        // useWebcam = true 會從攝影機拍；false 用現有圖片
+        bool useWebcam = false;
+        int cameraIndex = 0;
 
-        if (!captured)
+        Console.WriteLine("Current folder: " + Directory.GetCurrentDirectory());
+        Console.WriteLine("Image path: " + Path.GetFullPath(imagePath));
+
+        if (useWebcam)
         {
-            Console.WriteLine("Webcam capture failed. Use existing images/test_scene.jpg if available.");
+            var webcam = new WebcamCapture();
+            bool captured = webcam.CaptureImage(
+                outputPath: imagePath,
+                cameraIndex: cameraIndex,
+                width: 1280,
+                height: 720
+            );
+
+            if (!captured)
+                Console.WriteLine("Webcam capture failed. Falling back to existing images/test_scene.jpg.");
         }
 
-        // 2. 如果 webcam 失敗，就用原本的 test_scene.jpg
-        if (!File.Exists(imagePath))
-        {
-            Console.WriteLine($"Image not found: {imagePath}");
-            return false;
-        }
+        Console.WriteLine("Image exists: " + File.Exists(imagePath));
 
-        using Mat image = Cv2.ImRead(imagePath);
+        Mat image = Cv2.ImRead(imagePath);
 
         if (image.Empty())
         {
-            Console.WriteLine("Failed to read image.");
-            return false;
+            Console.WriteLine("Cannot read image. Put test_scene.jpg inside the images folder.");
+            return;
         }
 
-        Console.WriteLine($"Image loaded: {image.Width} x {image.Height}");
+        // --- QRCode 偵測 ---
+        var qrDetector = new QrCodeDetectorService();
+        var qrcodes = qrDetector.Detect(image);
 
-        // 3. 偵測 QRCode
-        QrCodeDetectorService qrDetector = new QrCodeDetectorService();
-        List<QrCodeResult> qrcodes = qrDetector.Detect(image);
+        // --- 物件偵測：優先用 open-vocab，fallback 用 YOLO ---
+        List<ObjectDetectionResult> objects;
+        var openVocabDetector = new OpenVocabDetectorService();
+        var openVocabObjects = openVocabDetector.Detect();
 
-        Console.WriteLine($"Detected QRCodes: {qrcodes.Count}");
+        if (openVocabObjects.Count > 0)
+        {
+            objects = openVocabObjects;
+            Console.WriteLine("Using open-vocabulary detection results.");
+        }
+        else
+        {
+            var yoloDetector = new YoloDetectorService();
+            objects = yoloDetector.Detect(image);
+            Console.WriteLine("Using YOLO fallback detection results.");
+        }
+
+        // --- 座標對應（四點 homography，需要 QR1~QR4）---
+        var coordinateMapper = new CoordinateMapper();
+        var mappedObjects = coordinateMapper.MapObjectsToWorkspace(objects, qrcodes);
+
+        Console.WriteLine($"QR codes detected: {qrcodes.Count}");
+        Console.WriteLine($"Objects detected: {objects.Count}");
+
+        if (!coordinateMapper.HasRequiredQrCodes(qrcodes))
+            Console.WriteLine("Warning: QR1, QR2, QR3, QR4 are not all detected.");
+        else
+        {
+            double qrArea = coordinateMapper.CalculateQrArea(qrcodes);
+            Console.WriteLine($"QR workspace area in image pixels: {qrArea}");
+            if (qrArea < 1000)
+                Console.WriteLine("Warning: QR codes are too close together or nearly collinear.");
+        }
+
+        if (objects.Count == 0)
+            Console.WriteLine("Warning: no objects detected.");
+
+        // --- 畫視覺化圖 ---
+        Mat visual = image.Clone();
 
         foreach (var qr in qrcodes)
         {
-            Console.WriteLine($"{qr.id}: center=({qr.center_pixel[0]}, {qr.center_pixel[1]}), corners={qr.corners.Length}");
+            if (qr.center_pixel.Length < 2) continue;
+
+            int cx = (int)qr.center_pixel[0];
+            int cy = (int)qr.center_pixel[1];
+
+            Cv2.Circle(visual, new Point(cx, cy), 8, new Scalar(0, 0, 255), -1);
+            Cv2.PutText(visual, qr.id, new Point(cx + 10, cy),
+                HersheyFonts.HersheySimplex, 0.8, new Scalar(0, 0, 255), 2);
+
+            foreach (var corner in qr.corners)
+            {
+                if (corner.Length < 2) continue;
+                Cv2.Circle(visual, new Point((int)corner[0], (int)corner[1]),
+                    5, new Scalar(255, 0, 0), -1);
+            }
         }
 
-        // 4. 偵測 YOLO 物件
-        YoloDetectorService yoloDetector = new YoloDetectorService();
-        List<ObjectDetectionResult> objects = yoloDetector.Detect(image);
-
-        Console.WriteLine($"Detected objects: {objects.Count}");
-
-        foreach (var obj in objects)
+        foreach (var obj in mappedObjects)
         {
-            Console.WriteLine($"{obj.name}: confidence={obj.confidence}, center=({obj.center_pixel[0]}, {obj.center_pixel[1]})");
+            if (obj.bbox.Length < 4) continue;
+
+            int x1 = (int)obj.bbox[0], y1 = (int)obj.bbox[1];
+            int x2 = (int)obj.bbox[2], y2 = (int)obj.bbox[3];
+
+            Cv2.Rectangle(visual, new Point(x1, y1), new Point(x2, y2),
+                new Scalar(0, 255, 0), 4);
+            Cv2.PutText(visual, $"{obj.name} {obj.confidence}",
+                new Point(x1, Math.Max(y1 - 10, 20)),
+                HersheyFonts.HersheySimplex, 1.0, new Scalar(0, 255, 0), 3);
+            Cv2.PutText(visual, $"x:{obj.world_position.x:F3} z:{obj.world_position.z:F3}",
+                new Point(x1, Math.Min(y2 + 30, image.Height - 10)),
+                HersheyFonts.HersheySimplex, 0.8, new Scalar(0, 255, 0), 2);
         }
 
-        // 5. 組成 Part B 要讀的 JSON
-        var detectionOutput = new
+        // --- 組 JSON 輸出 ---
+        var output = new
         {
-            image_width = image.Width,
+            image_width  = image.Width,
             image_height = image.Height,
-            objects = objects,
-            qrcodes = qrcodes
+            objects      = mappedObjects,
+            qrcodes      = qrcodes,
+            workspace    = new
+            {
+                origin   = "QR1",
+                x_axis   = "QR1_to_QR2",
+                z_axis   = "QR1_to_QR3",
+                top_right = "QR4",
+                unit     = "metres",
+                width_m  = 0.60,
+                depth_m  = 0.40,
+                mapping  = "four_point_homography"
+            }
         };
 
-        string json = JsonSerializer.Serialize(
-            detectionOutput,
-            new JsonSerializerOptions
-            {
-                WriteIndented = true
-            }
-        );
+        string json = JsonSerializer.Serialize(output,
+            new JsonSerializerOptions { WriteIndented = true });
 
-        // 6. 輸出 JSON
+        Directory.CreateDirectory("outputs");
+        Directory.CreateDirectory("../sample_json");
+
         File.WriteAllText("outputs/detection_result.json", json);
-        File.WriteAllText("../sample_json/detected_objects.json", json);
+        File.WriteAllText("../sample_json/objects_world.json", json);  // Program.cs 直接讀這個
+        Cv2.ImWrite("outputs/visual_result.jpg", visual);
 
-        // 7. 輸出圖片備份
-        Cv2.ImWrite("outputs/visual_result.jpg", image);
-        Cv2.ImWrite("../sample_json/visual_result.jpg", image);
-
+        Console.WriteLine(json);
         Console.WriteLine("Saved to outputs/detection_result.json");
-        Console.WriteLine("Saved to ../sample_json/detected_objects.json");
+        Console.WriteLine("Saved to ../sample_json/objects_world.json");
         Console.WriteLine("Saved to outputs/visual_result.jpg");
-        Console.WriteLine("Saved to ../sample_json/visual_result.jpg");
 
-        Console.WriteLine("=== Part A Detection finished ===");
-
-        return true;
+        image.Dispose();
+        visual.Dispose();
     }
 }
