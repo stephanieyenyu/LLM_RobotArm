@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 // ==========================================
 // Step 1: Part A — YOLO + QRCode + 座標對應
@@ -10,42 +11,44 @@ PartAExporter.Run();
 
 // ==========================================
 // Step 2: Part C — LLM 指令規劃
+// 讀 Part A 直接輸出的 detection_result.json
 // ==========================================
-string sceneJsonPath = "../sample_json/objects_world.json";
+string sceneJsonPath = "outputs/detection_result.json";
 
 if (!File.Exists(sceneJsonPath))
 {
-    Console.WriteLine($"找不到 Part B 輸出檔案：{sceneJsonPath}");
-    Console.WriteLine("請確認 Part A 是否成功偵測到 QR1, QR2, QR3, QR4。");
+    Console.WriteLine($"找不到 Part A 輸出：{sceneJsonPath}");
     return;
 }
 
 string sceneJson = File.ReadAllText(sceneJsonPath);
 
-ObjectsWorld? objectsWorld = JsonSerializer.Deserialize<ObjectsWorld>(
+DetectionOutput? detectionOutput = JsonSerializer.Deserialize<DetectionOutput>(
     sceneJson,
     new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
 );
 
-if (objectsWorld?.Objects == null || objectsWorld.Objects.Count == 0)
+if (detectionOutput?.Objects == null || detectionOutput.Objects.Count == 0)
 {
-    Console.WriteLine("Part A/B 沒有提供有效的物件座標資料。");
+    Console.WriteLine("Part A 沒有偵測到任何物件，無法繼續。");
     return;
 }
 
-List<SceneObject> sceneObjects = objectsWorld.Objects
+// 轉成 LlmPlanner 需要的 SceneObject 格式
+List<SceneObject> sceneObjects = detectionOutput.Objects
+    .Where(obj => obj.WorldPosition != null)
     .Select(obj => new SceneObject
     {
         Name = obj.Name,
-        X    = obj.Position.X,
-        Y    = obj.Position.Y,
-        Z    = obj.Position.Z
+        X    = obj.WorldPosition!.X,
+        Y    = obj.WorldPosition!.Y,
+        Z    = obj.WorldPosition!.Z
     })
     .ToList();
 
-Console.WriteLine($"載入 {sceneObjects.Count} 個物件：");
+Console.WriteLine($"\n載入 {sceneObjects.Count} 個物件（世界座標，單位 m）：");
 foreach (var o in sceneObjects)
-    Console.WriteLine($"  {o.Name}  x={o.X:F3} y={o.Y:F3} z={o.Z:F3}");
+    Console.WriteLine($"  {o.Name}  x={o.X:F3}  y={o.Y:F3}  z={o.Z:F3}");
 
 Console.WriteLine("\n請輸入機械手臂指令：");
 string? userCommand = Console.ReadLine();
@@ -70,34 +73,59 @@ string outputJson = JsonSerializer.Serialize(
 Console.WriteLine("\n=== robot_plan.json ===");
 Console.WriteLine(outputJson);
 
-Directory.CreateDirectory("../sample_json");
-File.WriteAllText("../sample_json/robot_plan.json", outputJson);
-Console.WriteLine("Saved to ../sample_json/robot_plan.json");
+// 同時存到兩個地方：本機 outputs/ 和 Unity 讀取的 StreamingAssets/
+Directory.CreateDirectory("outputs");
+File.WriteAllText("outputs/robot_plan.json", outputJson);
+Console.WriteLine("Saved to outputs/robot_plan.json");
 
-// ==========================================
-// 輔助 class（Program.cs 頂層宣告）
-// ==========================================
-public class ObjectsWorld
+string unityPath = "../unity_project/Assets/StreamingAssets/robot_plan.json";
+if (Directory.Exists(Path.GetDirectoryName(Path.GetFullPath(unityPath))!))
 {
-    public WorkspaceInfo? Workspace { get; set; }
-    public List<WorldObject> Objects { get; set; } = new();
+    File.WriteAllText(unityPath, outputJson);
+    Console.WriteLine($"Saved to {unityPath}");
 }
 
-public class WorkspaceInfo
+// ==========================================
+// 輔助 class：對應 Part A 輸出的 JSON 格式
+// ==========================================
+public class DetectionOutput
 {
-    public string? Type { get; set; }
+    public int ImageWidth  { get; set; }
+    public int ImageHeight { get; set; }
+
+    [JsonPropertyName("objects")]
+    public List<DetectedObject> Objects { get; set; } = new();
 }
 
-public class WorldObject
+public class DetectedObject
 {
-    public string Name     { get; set; } = "";
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("confidence")]
     public double Confidence { get; set; }
-    public Vec3   Position { get; set; } = new();
+
+    [JsonPropertyName("world_position")]
+    public WorldPos? WorldPosition { get; set; }
+
+    [JsonPropertyName("bbox")]
+    public double[] Bbox { get; set; } = Array.Empty<double>();
+
+    [JsonPropertyName("center_pixel")]
+    public double[] CenterPixel { get; set; } = Array.Empty<double>();
+
+    [JsonPropertyName("source")]
+    public string Source { get; set; } = "";
 }
 
-public class Vec3
+public class WorldPos
 {
+    [JsonPropertyName("x")]
     public double X { get; set; }
+
+    [JsonPropertyName("y")]
     public double Y { get; set; }
+
+    [JsonPropertyName("z")]
     public double Z { get; set; }
 }
