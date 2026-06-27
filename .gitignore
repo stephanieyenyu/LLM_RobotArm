@@ -12,7 +12,6 @@ Recordings/
 # Visual Studio / Rider
 .vs/
 .idea/
-*.csproj
 *.sln
 *.user
 *.pidb
