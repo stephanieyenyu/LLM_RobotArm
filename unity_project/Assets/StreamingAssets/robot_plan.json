@@ -1,17 +1,19 @@
 {
-  "task": "test",
-  "target_object": "test",
-  "action_sequence": [
-    {
-      "action": "move_to",
-      "joints": {
-        "pan": 0,
-        "lift": -90,
-        "elbow": 0,
-        "wrist1": -90,
-        "wrist2": 0,
-        "wrist3": 0
-      }
-    }
-  ]
+  "action": "pick_and_place",
+  "object": "cup",
+  "target": "cup",
+  "direction": null,
+  "distance_cm": null,
+  "object_position": {
+    "name": "cup",
+    "x": 0.328,
+    "y": 0,
+    "z": 0.204
+  },
+  "target_position": {
+    "name": "cup",
+    "x": 0.328,
+    "y": 0,
+    "z": 0.204
+  }
 }
