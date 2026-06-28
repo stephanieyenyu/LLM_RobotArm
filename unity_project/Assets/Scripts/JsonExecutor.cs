@@ -53,7 +53,7 @@ public class JsonExecutor : MonoBehaviour
 {
     [Header("設定")]
     public string jsonFileName = "robot_plan.json";
-    public string urIP = "192.168.50.123";
+    public string urIP = "192.168.50.204";
 
     private URPackageListener urListener;
     private RobotPlan plan;

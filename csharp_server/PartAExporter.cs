@@ -9,7 +9,7 @@ public static class PartAExporter
         string imagePath = "images/test_scene.jpg";
 
         // useWebcam = true 會從攝影機拍；false 用現有圖片
-        bool useWebcam = false;
+        bool useWebcam = true;
         int cameraIndex = 0;
 
         Console.WriteLine("Current folder: " + Directory.GetCurrentDirectory());
@@ -140,6 +140,9 @@ public static class PartAExporter
 
         Cv2.ImWrite("outputs/visual_result.jpg", visual);
         Cv2.ImWrite("../sample_json/visual_result.jpg", visual);
+        Cv2.ImShow("Detection Result", visual);
+        Cv2.WaitKey(0);
+        Cv2.DestroyAllWindows();
 
 
         Console.WriteLine(json);
