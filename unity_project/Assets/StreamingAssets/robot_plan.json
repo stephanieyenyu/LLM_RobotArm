@@ -1,9 +1,9 @@
 {
-  "action": "pick_and_place",
+  "action": "move_relative",
   "object": "cup",
-  "target": "box",
-  "direction": null,
-  "distance_cm": null,
+  "target": "",
+  "direction": "right",
+  "distance_cm": 10.0,
   "object_position": {
     "name": "cup",
     "x": 25.0,
@@ -11,9 +11,9 @@
     "z": 15.0
   },
   "target_position": {
-    "name": "box",
-    "x": 40.0,
-    "y": -20.0,
-    "z": 10.0
+    "name": "cup_target",
+    "x": 35.0,
+    "y": 10.0,
+    "z": 15.0
   }
 }
