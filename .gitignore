@@ -37,7 +37,6 @@ secrets.json
 # Data / model weights
 *.pt
 *.pth
-*.onnx
 *.engine
 *.weights
 *.mp4
