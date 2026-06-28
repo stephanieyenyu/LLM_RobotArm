@@ -158,7 +158,7 @@ public class WorldObject
     [JsonPropertyName("confidence")]
     public double Confidence { get; set; }
 
-    [JsonPropertyName("world_position")]  
+    [JsonPropertyName("position")]
     public WorldPos? Position { get; set; }
 }
 
