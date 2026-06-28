@@ -5,7 +5,7 @@ public class LlmPlanner
 {
     private readonly ChatClient _client;
 
-    public LlmPlanner(string model = "gpt-4.1-mini")
+    public LlmPlanner(string model = "gpt-5")
     {
         string? apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 

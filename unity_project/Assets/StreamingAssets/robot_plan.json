@@ -1,7 +1,7 @@
 {
   "action": "pick_and_place",
   "object": "cup",
-  "target": "box",
+  "target": "cup",
   "direction": null,
   "distance_cm": null,
   "object_position": {
