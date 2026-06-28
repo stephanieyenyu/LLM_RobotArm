@@ -3,24 +3,19 @@
   "image_height": 720,
   "objects": [
     {
-      "world_position": {
-        "x": 0.328,
-        "y": 0,
-        "z": 0.204
-      },
       "name": "cup",
-      "confidence": 0.093,
+      "confidence": 0.918,
       "bbox": [
-        526.17,
-        261.41,
-        794.44,
-        445.3
+        524.6,
+        257.03,
+        784.35,
+        444.44
       ],
       "center_pixel": [
-        660.31,
-        353.35
+        654.48,
+        350.73
       ],
-      "source": "open_vocab"
+      "source": "yolo_coco"
     }
   ],
   "qrcodes": [
@@ -124,15 +119,5 @@
         ]
       ]
     }
-  ],
-  "workspace": {
-    "origin": "QR1",
-    "x_axis": "QR1_to_QR2",
-    "z_axis": "QR1_to_QR3",
-    "top_right": "QR4",
-    "unit": "metres",
-    "width_m": 0.6,
-    "depth_m": 0.4,
-    "mapping": "four_point_homography"
-  }
+  ]
 }

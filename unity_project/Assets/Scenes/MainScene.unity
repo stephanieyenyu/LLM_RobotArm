@@ -167,7 +167,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   jsonFileName: robot_plan.json
-  urIP: 192.168.31.225
+  urIP: 192.168.50.123
 --- !u!1 &1454780649
 GameObject:
   m_ObjectHideFlags: 0
@@ -291,7 +291,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: f4d0c43d10734794cbcf48cdd7e9ad0c, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  model: gpt-4o-mini
+  model: gpt-5
   sceneObjects:
   - name: bottle
     x: 30
@@ -463,7 +463,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   uiDocument: {fileID: 1993866154}
   executor: {fileID: 1353763073}
-  planner: {fileID: 1627998714}
 --- !u!114 &1993866154
 MonoBehaviour:
   m_ObjectHideFlags: 0

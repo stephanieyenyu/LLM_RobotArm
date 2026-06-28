@@ -1,19 +1,19 @@
 {
   "action": "move_relative",
   "object": "cup",
-  "target": "",
+  "target": null,
   "direction": "right",
-  "distance_cm": 10.0,
+  "distance_cm": 10,
   "object_position": {
     "name": "cup",
-    "x": 25.0,
-    "y": 10.0,
-    "z": 15.0
+    "x": 0.115108,
+    "y": 0.03,
+    "z": 0.063378
   },
   "target_position": {
     "name": "cup_target",
-    "x": 35.0,
-    "y": 10.0,
-    "z": 15.0
+    "x": 0.21510800000000002,
+    "y": 0.03,
+    "z": 0.063378
   }
 }

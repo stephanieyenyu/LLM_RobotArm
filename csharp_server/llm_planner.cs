@@ -182,32 +182,28 @@ public class LlmPlanner
         // forward/backward -> Y axis
         // up/down -> Z axis
         // If Part B uses a different coordinate system, only modify this mapping.
+        double distanceM = distanceCm / 100.0;
+
         switch (direction)
-        {
+        {         
             case "left":
-                x -= distanceCm;
+                x -= distanceM;
                 break;
-
             case "right":
-                x += distanceCm;
+                x += distanceM;
                 break;
-
             case "forward":
-                y += distanceCm;
+                y += distanceM;
                 break;
-
             case "backward":
-                y -= distanceCm;
+                y -= distanceM;
                 break;
-
             case "up":
-                z += distanceCm;
+                z += distanceM;
                 break;
-
             case "down":
-                z -= distanceCm;
+                z -= distanceM;
                 break;
-
             default:
                 throw new InvalidOperationException($"Unsupported direction: {direction}");
         }

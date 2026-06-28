@@ -127,10 +127,9 @@ public class JsonExecutor : MonoBehaviour
             urListener.Connect(urIP);
         }
 
-        // 先回到 home 位置
-        urListener.SendCommand("movej([0, -1.5708, 0, -1.5708, 0, 0], a=1.2, v=1.05)");
+        urListener.SendCommand("movej([1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0], a=1.2, v=1.05)");
         Debug.Log("回到 home");
-
+        System.Threading.Thread.Sleep(3000);
         StartCoroutine(ExecutePlan());
     }
 
@@ -139,13 +138,13 @@ public class JsonExecutor : MonoBehaviour
         var seq = new List<RobotAction>();
 
         // 公分轉公尺
-        float ox = p.object_position != null ? p.object_position.x / 1000f + 0.2f : 0;
-        float oy = p.object_position != null ? p.object_position.y / 1000f : 0;
-        float oz = p.object_position != null ? p.object_position.z / 100f + 0.2f : 0.2f;
+        float ox = p.object_position != null ? p.object_position.x : 0;
+        float oy = p.object_position != null ? p.object_position.y : 0;
+        float oz = p.object_position != null ? p.object_position.z + 0.2f : 0.2f;
 
-        float tx = p.target_position != null ? p.target_position.x / 1000f + 0.2f : 0;
-        float ty = p.target_position != null ? p.target_position.y / 1000f : 0;
-        float tz = p.target_position != null ? p.target_position.z / 100f + 0.2f : 0.2f;
+        float tx = p.target_position != null ? p.target_position.x : 0;
+        float ty = p.target_position != null ? p.target_position.y : 0;
+        float tz = p.target_position != null ? p.target_position.z + 0.2f : 0.2f;
 
         if (p.action == "pick_and_place")
         {
@@ -169,10 +168,24 @@ public class JsonExecutor : MonoBehaviour
             seq.Add(MakeMove(tx, ty, tz + 0.1f));
         }
         else if (p.action == "move_relative")
-        {
-            // 簡化版本，先不支援
-            Debug.LogWarning("move_relative 尚未支援");
-        }
+{
+    // 物件上方
+    seq.Add(MakeMove(ox, oy, oz + 0.1f));
+    // 物件位置
+    seq.Add(MakeMove(ox, oy, oz));
+    // 夾取
+    seq.Add(new RobotAction { action = "grasp" });
+    // 物件上方
+    seq.Add(MakeMove(ox, oy, oz + 0.1f));
+    // 目標上方
+    seq.Add(MakeMove(tx, ty, tz + 0.1f));
+    // 目標位置
+    seq.Add(MakeMove(tx, ty, tz));
+    // 放開
+    seq.Add(new RobotAction { action = "release" });
+    // 目標上方
+    seq.Add(MakeMove(tx, ty, tz + 0.1f));
+}
 
         return seq;
     }
@@ -214,23 +227,23 @@ public class JsonExecutor : MonoBehaviour
                 }
                 else if (act.position != null)
                 {
-                    string cmd = $"movej(get_inverse_kin(p[{act.position.x.ToString("F4")}, {act.position.y.ToString("F4")}, {act.position.z.ToString("F4")}, 3.14, 0, 0]), a=1.2, v=1.05)";
+                    string cmd = $"movej(get_inverse_kin(p[{act.position.x.ToString("F4")}, {act.position.y.ToString("F4")}, {act.position.z.ToString("F4")}, 0, 3.14, 0], qnear=[1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=1.2, v=1.05)";
                     urListener.SendCommand(cmd);
                     Debug.Log("SEND: " + cmd);
                 }
-                yield return new WaitForSeconds(3f);
+                yield return new WaitForSeconds(5f);
             }
             else if (act.action == "grasp")
             {
                 urListener.SendCommand("set_standard_digital_out(4, True)");
                 Debug.Log("SEND: grasp");
-                yield return new WaitForSeconds(1f);
+                yield return new WaitForSeconds(3f);
             }
             else if (act.action == "release")
             {
                 urListener.SendCommand("set_standard_digital_out(4, False)");
                 Debug.Log("SEND: release");
-                yield return new WaitForSeconds(1f);
+                yield return new WaitForSeconds(3f);
             }
             else if (act.action == "home")
             {
