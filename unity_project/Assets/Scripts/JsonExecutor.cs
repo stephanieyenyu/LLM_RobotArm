@@ -73,7 +73,7 @@ public class JsonExecutor : MonoBehaviour
             {
                 FileName = "dotnet",
                 Arguments = "run",
-                WorkingDirectory = @"C:\Users\ASUS\LLM_RobotArm\csharp_server",
+                WorkingDirectory = @"C:\Users\steph\source\repos\stephanieyenyu\LLM_RobotArm\csharp_server",
                 UseShellExecute = true,
                 CreateNoWindow = false
             };
