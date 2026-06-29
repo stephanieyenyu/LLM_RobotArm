@@ -1,7 +1,5 @@
 using OpenCvSharp;
-using ZXing;
-using ZXing.Common;
-using System.Runtime.InteropServices;
+using OpenCvSharp.Aruco;
 
 public class QrCodeResult
 {
@@ -12,116 +10,110 @@ public class QrCodeResult
 
 public class QrCodeDetectorService
 {
+    private readonly Dictionary<int, string> arucoIdToQrName = new()
+    {
+        { 1, "QR1" },
+        { 2, "QR2" },
+        { 3, "QR3" },
+        { 4, "QR4" }
+    };
+
     public List<QrCodeResult> Detect(Mat image)
     {
         var results = new List<QrCodeResult>();
-        Mat gray = new Mat();
-        Cv2.CvtColor(image, gray, ColorConversionCodes.BGR2GRAY);
 
-        Mat enhanced = new Mat();
+        if (image == null || image.Empty())
+        {
+            return results;
+        }
+
+        using Mat gray = new Mat();
+
+        if (image.Channels() == 1)
+        {
+            image.CopyTo(gray);
+        }
+        else
+        {
+            Cv2.CvtColor(image, gray, ColorConversionCodes.BGR2GRAY);
+        }
+
+        using Mat enhanced = new Mat();
         Cv2.EqualizeHist(gray, enhanced);
 
-        Mat processed = new Mat();
-        Cv2.CvtColor(enhanced, processed, ColorConversionCodes.GRAY2BGR);
-
-        Mat rgb = new Mat();
-        Cv2.CvtColor(processed, rgb, ColorConversionCodes.BGR2RGB);
-
-        gray.Dispose();
-        enhanced.Dispose();
-        processed.Dispose();
-
-        if (!rgb.IsContinuous())
-        {
-            rgb = rgb.Clone();
-        }
-
-        int width = rgb.Width;
-        int height = rgb.Height;
-        int channels = rgb.Channels();
-
-        if (channels != 3)
-        {
-            Console.WriteLine($"Unexpected channel count: {channels}");
-            return results;
-        }
-
-        byte[] pixels = new byte[width * height * channels];
-        Marshal.Copy(rgb.Data, pixels, 0, pixels.Length);
-
-        var source = new RGBLuminanceSource(
-            pixels,
-            width,
-            height,
-            RGBLuminanceSource.BitmapFormat.RGB24
+        var dictionary = CvAruco.GetPredefinedDictionary(
+            PredefinedDictionaryName.Dict4X4_50
         );
 
-        var reader = new BarcodeReaderGeneric
-        {
-            AutoRotate = true,
-            Options = new DecodingOptions
-            {
-                TryHarder = true,
-                PossibleFormats = new List<BarcodeFormat>
-                {
-                    BarcodeFormat.QR_CODE
-                }
-            }
-        };
+        var parameters = DetectorParameters.Create();
 
-        var decodedResults = reader.DecodeMultiple(source);
+        CvAruco.DetectMarkers(
+            enhanced,
+            dictionary,
+            out Point2f[][] markerCorners,
+            out int[] markerIds,
+            parameters,
+            out _
+        );
 
-        if (decodedResults == null)
+        if (markerIds == null || markerIds.Length == 0)
         {
-            rgb.Dispose();
             return results;
         }
 
-        for (int i = 0; i < decodedResults.Length; i++)
+        for (int i = 0; i < markerIds.Length; i++)
         {
-            var result = decodedResults[i];
+            int arucoId = markerIds[i];
 
-            if (result.ResultPoints == null || result.ResultPoints.Length < 3)
+            if (!arucoIdToQrName.ContainsKey(arucoId))
             {
                 continue;
             }
 
-            // ZXing QR ResultPoints 固定順序：
-            //   [0] bottom-left finder pattern
-            //   [1] top-left finder pattern
-            //   [2] top-right finder pattern
-            // 右下角沒有 finder pattern，用平行四邊形法則補出來：
-            //   bottom-right = bottom-left + top-right - top-left
-            var bl = result.ResultPoints[0]; // bottom-left
-            var tl = result.ResultPoints[1]; // top-left
-            var tr = result.ResultPoints[2]; // top-right
+            string qrName = arucoIdToQrName[arucoId];
 
-            double brX = Math.Round(bl.X + tr.X - tl.X, 2);
-            double brY = Math.Round(bl.Y + tr.Y - tl.Y, 2);
+            Point2f[] pts = markerCorners[i];
 
-            // 角點順序對應 coordinate_mapper_3d.py 的 get_qr_object_points()：
+            if (pts == null || pts.Length < 4)
+            {
+                continue;
+            }
+
+            // ArUco corners order:
             // top-left, top-right, bottom-right, bottom-left
+            double tlX = Math.Round(pts[0].X, 2);
+            double tlY = Math.Round(pts[0].Y, 2);
+
+            double trX = Math.Round(pts[1].X, 2);
+            double trY = Math.Round(pts[1].Y, 2);
+
+            double brX = Math.Round(pts[2].X, 2);
+            double brY = Math.Round(pts[2].Y, 2);
+
+            double blX = Math.Round(pts[3].X, 2);
+            double blY = Math.Round(pts[3].Y, 2);
+
             double[][] corners = new double[][]
             {
-                new[] { Math.Round((double)tl.X, 2), Math.Round((double)tl.Y, 2) }, // top-left
-                new[] { Math.Round((double)tr.X, 2), Math.Round((double)tr.Y, 2) }, // top-right
-                new[] { brX, brY },                                                   // bottom-right（補算）
-                new[] { Math.Round((double)bl.X, 2), Math.Round((double)bl.Y, 2) }  // bottom-left
+                new[] { tlX, tlY },
+                new[] { trX, trY },
+                new[] { brX, brY },
+                new[] { blX, blY }
             };
 
-            // center = 四角點平均
-            double cx = Math.Round((tl.X + tr.X + brX + bl.X) / 4.0, 2);
-            double cy = Math.Round((tl.Y + tr.Y + brY + bl.Y) / 4.0, 2);
+            double cx = Math.Round((tlX + trX + brX + blX) / 4.0, 2);
+            double cy = Math.Round((tlY + trY + brY + blY) / 4.0, 2);
 
             results.Add(new QrCodeResult
             {
-                id = string.IsNullOrWhiteSpace(result.Text) ? $"QR{i + 1}" : result.Text,
+                id = qrName,
                 center_pixel = new[] { cx, cy },
                 corners = corners
             });
+
+            Console.WriteLine($"Detected ArUco ID {arucoId} as {qrName}, center=({cx}, {cy})");
         }
 
-        rgb.Dispose();
         return results;
     }
 }
