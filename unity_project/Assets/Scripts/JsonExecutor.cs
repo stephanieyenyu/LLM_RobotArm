@@ -36,7 +36,6 @@ public class RobotAction
 [System.Serializable]
 public class RobotPlan
 {
-    // C 給的高階格式
     public string action;
     public string @object;
     public string target;
@@ -44,8 +43,6 @@ public class RobotPlan
     public float? distance_cm;
     public NamedPosition object_position;
     public NamedPosition target_position;
-
-    // 展開後的低階格式
     public List<RobotAction> action_sequence;
 }
 
@@ -55,6 +52,15 @@ public class JsonExecutor : MonoBehaviour
     public string jsonFileName = "robot_plan.json";
     public string urIP = "192.168.50.204";
 
+    // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
+    // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
+    private const float QR1_X = -0.13449f;
+    private const float QR1_Y = -0.12163f;
+    private const float QR1_Z = -0.29325f;
+
+    // 工作時的安全高度（在物件上方多少公尺）
+    private const float SAFE_Z_OFFSET = 0.08f;
+
     private URPackageListener urListener;
     private RobotPlan plan;
 
@@ -63,27 +69,6 @@ public class JsonExecutor : MonoBehaviour
         urListener = new URPackageListener();
         urListener.Connect(urIP);
         Debug.Log("嘗試連線到 " + urIP);
-    }
-
-    void StartLLMPlanner()
-    {
-        try
-        {
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "dotnet",
-                Arguments = "run",
-                WorkingDirectory = @"C:\Users\ASUS\LLM_RobotArm\csharp_server",
-                UseShellExecute = true,
-                CreateNoWindow = false
-            };
-            System.Diagnostics.Process.Start(psi);
-            Debug.Log("LLM Planner 已啟動");
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError("啟動 LLM Planner 失敗: " + e.Message);
-        }
     }
 
     void OnDestroy()
@@ -112,14 +97,14 @@ public class JsonExecutor : MonoBehaviour
         string json = File.ReadAllText(path);
         plan = JsonUtility.FromJson<RobotPlan>(json);
 
-        // 如果是 C 的高階格式，展開成 action_sequence
-        if ((plan.action_sequence == null || plan.action_sequence.Count == 0) && !string.IsNullOrEmpty(plan.action))
+        if ((plan.action_sequence == null || plan.action_sequence.Count == 0)
+            && !string.IsNullOrEmpty(plan.action))
         {
             plan.action_sequence = ExpandAction(plan);
             Debug.Log($"展開動作：{plan.action} → {plan.action_sequence.Count} 步");
         }
 
-        Debug.Log($"載入任務");
+        Debug.Log("載入任務");
 
         if (!urListener.Connected)
         {
@@ -127,9 +112,6 @@ public class JsonExecutor : MonoBehaviour
             urListener.Connect(urIP);
         }
 
-        urListener.SendCommand("movej([1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0], a=1.2, v=1.05)");
-        Debug.Log("回到 home");
-        System.Threading.Thread.Sleep(3000);
         StartCoroutine(ExecutePlan());
     }
 
@@ -137,55 +119,47 @@ public class JsonExecutor : MonoBehaviour
     {
         var seq = new List<RobotAction>();
 
-        // 公分轉公尺
-        float ox = p.object_position != null ? p.object_position.x : 0;
-        float oy = p.object_position != null ? p.object_position.y : 0;
-        float oz = p.object_position != null ? p.object_position.z + 0.2f : 0.2f;
+        // LlmPlannerUnity 的 object_position / target_position 單位是公分
+        // 工作平面座標：
+        //   x = QR1 → QR2 方向（對應 UR3 X 軸）
+        //   z = QR1 → QR3 方向（對應 UR3 Y 軸）
+        //   y = 高度（固定用 QR1_Z）
+        //
+        // UR3 座標 = QR1 座標 + 工作平面偏移（公分 → 公尺）
 
-        float tx = p.target_position != null ? p.target_position.x : 0;
-        float ty = p.target_position != null ? p.target_position.y : 0;
-        float tz = p.target_position != null ? p.target_position.z + 0.2f : 0.2f;
+        float obj_x = p.object_position != null ? p.object_position.x / 100f : 0f;
+        float obj_y = p.object_position != null ? p.object_position.z / 100f : 0f;
 
-        if (p.action == "pick_and_place")
+        float tgt_x = p.target_position != null ? p.target_position.x / 100f : obj_x;
+        float tgt_y = p.target_position != null ? p.target_position.z / 100f : obj_y;
+
+        // UR3 世界座標
+        float ox = QR1_X + obj_x;
+        float oy = QR1_Y + obj_y;
+        float oz = QR1_Z;                    // 工作平面高度
+
+        float tx = QR1_X + tgt_x;
+        float ty = QR1_Y + tgt_y;
+        float tz = QR1_Z;
+
+        Debug.Log($"物件 UR3 座標：({ox:F4}, {oy:F4}, {oz:F4})");
+        Debug.Log($"目標 UR3 座標：({tx:F4}, {ty:F4}, {tz:F4})");
+
+        if (p.action == "pick_and_place" || p.action == "move_relative")
         {
-            // 物件上方
-            seq.Add(MakeMove(ox, oy, oz + 0.1f));
-            // 物件位置
-            seq.Add(MakeMove(ox, oy, oz));
-            // 夾取
-            seq.Add(new RobotAction { action = "grasp" });
-            // 物件上方
-            seq.Add(MakeMove(ox, oy, oz + 0.1f));
-            // 中間 home（強制走長路徑）
-            seq.Add(new RobotAction { action = "home" });
-            // 目標上方
-            seq.Add(MakeMove(tx, ty, tz + 0.1f));
-            // 目標位置
-            seq.Add(MakeMove(tx, ty, tz));
-            // 放開
-            seq.Add(new RobotAction { action = "release" });
-            // 目標上方
-            seq.Add(MakeMove(tx, ty, tz + 0.1f));
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 物件上方
+            seq.Add(MakeMove(ox, oy, oz));                   // 物件位置
+            seq.Add(new RobotAction { action = "grasp" });   // 夾取
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 拿起
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET));  // 目標上方
+            seq.Add(MakeMove(tx, ty, tz));                   // 目標位置
+            seq.Add(new RobotAction { action = "release" }); // 放開
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET));  // 完成上方
         }
-        else if (p.action == "move_relative")
-{
-    // 物件上方
-    seq.Add(MakeMove(ox, oy, oz + 0.1f));
-    // 物件位置
-    seq.Add(MakeMove(ox, oy, oz));
-    // 夾取
-    seq.Add(new RobotAction { action = "grasp" });
-    // 物件上方
-    seq.Add(MakeMove(ox, oy, oz + 0.1f));
-    // 目標上方
-    seq.Add(MakeMove(tx, ty, tz + 0.1f));
-    // 目標位置
-    seq.Add(MakeMove(tx, ty, tz));
-    // 放開
-    seq.Add(new RobotAction { action = "release" });
-    // 目標上方
-    seq.Add(MakeMove(tx, ty, tz + 0.1f));
-}
+        else
+        {
+            Debug.LogWarning($"未知 action：{p.action}");
+        }
 
         return seq;
     }
@@ -201,6 +175,20 @@ public class JsonExecutor : MonoBehaviour
 
     IEnumerator ExecutePlan()
     {
+        // 等待連線建立（最多 3 秒）
+        float waited = 0f;
+        while (!urListener.Connected && waited < 3f)
+        {
+            yield return new WaitForSeconds(0.1f);
+            waited += 0.1f;
+        }
+
+        if (!urListener.Connected)
+        {
+            Debug.LogError("無法連線到 UR，請確認 IP 和網路設定");
+            yield break;
+        }
+
         Debug.Log($"=== 開始執行，共 {plan.action_sequence.Count} 步 ===");
 
         for (int i = 0; i < plan.action_sequence.Count; i++)
@@ -208,48 +196,24 @@ public class JsonExecutor : MonoBehaviour
             var act = plan.action_sequence[i];
             Debug.Log($"[{i + 1}/{plan.action_sequence.Count}] {act.action}");
 
-            if (act.action == "move_to")
+            if (act.action == "move_to" && act.position != null)
             {
-                bool hasJoints = act.joints != null &&
-                    (act.joints.pan != 0 || act.joints.lift != 0 || act.joints.elbow != 0 ||
-                     act.joints.wrist1 != 0 || act.joints.wrist2 != 0 || act.joints.wrist3 != 0);
-
-                if (hasJoints)
-                {
-                    var angles = new[] {
-                        act.joints.pan, act.joints.lift, act.joints.elbow,
-                        act.joints.wrist1, act.joints.wrist2, act.joints.wrist3
-                    };
-                    var rad = angles.Select(a => a * Mathf.Deg2Rad);
-                    string cmd = $"movej([{string.Join(", ", rad)}], a=1.2, v=1.05)";
-                    urListener.SendCommand(cmd);
-                    Debug.Log("SEND: " + cmd);
-                }
-                else if (act.position != null)
-                {
-                    string cmd = $"movej(get_inverse_kin(p[{act.position.x.ToString("F4")}, {act.position.y.ToString("F4")}, {act.position.z.ToString("F4")}, 0, 3.14, 0], qnear=[1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=1.2, v=1.05)";
-                    urListener.SendCommand(cmd);
-                    Debug.Log("SEND: " + cmd);
-                }
+                string cmd = $"movej(get_inverse_kin(p[{act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}, 0, 3.14, 0], qnear=[1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=0.5, v=0.3)";
+                urListener.SendCommand(cmd);
+                Debug.Log("SEND: " + cmd);
                 yield return new WaitForSeconds(5f);
             }
             else if (act.action == "grasp")
             {
                 urListener.SendCommand("set_standard_digital_out(4, True)");
                 Debug.Log("SEND: grasp");
-                yield return new WaitForSeconds(3f);
+                yield return new WaitForSeconds(2f);
             }
             else if (act.action == "release")
             {
                 urListener.SendCommand("set_standard_digital_out(4, False)");
                 Debug.Log("SEND: release");
-                yield return new WaitForSeconds(3f);
-            }
-            else if (act.action == "home")
-            {
-                urListener.SendCommand("movej([0, -1.5708, 0, -1.5708, 0, 0], a=1.2, v=1.05)");
-                Debug.Log("SEND: home");
-                yield return new WaitForSeconds(3f);
+                yield return new WaitForSeconds(2f);
             }
         }
 
