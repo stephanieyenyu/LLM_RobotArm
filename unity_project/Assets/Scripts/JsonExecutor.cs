@@ -54,9 +54,9 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
-    private const float QR1_X = -0.13449f;
-    private const float QR1_Y = -0.12163f;
-    private const float QR1_Z = -0.29325f;
+    private const float QR1_X = -0.27766f;
+    private const float QR1_Y = -0.34521f;
+    private const float QR1_Z = -0.31446f;
 
     // 工作時的安全高度（在物件上方多少公尺）
     private const float SAFE_Z_OFFSET = 0.08f;
