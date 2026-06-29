@@ -1,23 +1,7 @@
 {
   "image_width": 1280,
   "image_height": 720,
-  "objects": [
-    {
-      "name": "tool",
-      "confidence": 0.151,
-      "bbox": [
-        691.33,
-        437.02,
-        865.27,
-        579.95
-      ],
-      "center_pixel": [
-        778.3,
-        508.48
-      ],
-      "source": "open_vocab"
-    }
-  ],
+  "objects": [],
   "prompts": [
     "cup",
     "bottle",
