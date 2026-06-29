@@ -15,7 +15,7 @@ OUTPUT_JSON = "../sample_json/objects_world.json"
 # QRCode 實際邊長，單位：meter
 # 如果 QRCode 是 5 cm，就填 0.05
 # 如果 QRCode 是 4 cm，就填 0.04
-QR_SIZE_M = 0.073
+QR_SIZE_M = 0.043
 
 
 # 物件高度，先假設物件在工作平面上方 3 cm
