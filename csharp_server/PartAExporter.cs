@@ -9,8 +9,8 @@ public static class PartAExporter
         string imagePath = "images/test_scene.jpg";
 
         // useWebcam = true 會從攝影機拍；false 用現有圖片
-        bool useWebcam = false;
-        int cameraIndex = 0;
+        bool useWebcam = true;
+        int cameraIndex = 1;
 
         Console.WriteLine("Current folder: " + Directory.GetCurrentDirectory());
         Console.WriteLine("Image path: " + Path.GetFullPath(imagePath));

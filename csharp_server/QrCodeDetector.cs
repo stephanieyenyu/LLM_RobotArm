@@ -45,7 +45,7 @@ public class QrCodeDetectorService
             PredefinedDictionaryName.Dict4X4_50
         );
 
-        var parameters = DetectorParameters.Create();
+        var parameters = new DetectorParameters();
 
         CvAruco.DetectMarkers(
             enhanced,
