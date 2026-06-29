@@ -52,3 +52,4 @@ csharp_server/obj/
 csharp_server/yolo_env/
 csharp_server/outputs/
 csharp_server/open_vocab_env/
+sample_json/visual_result/
