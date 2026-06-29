@@ -9,7 +9,7 @@ public class WebcamCapture
         int height = 720
     )
     {
-        using var capture = new VideoCapture(cameraIndex);
+        using var capture = new VideoCapture(cameraIndex, VideoCaptureAPIs.DSHOW);
 
         if (!capture.IsOpened())
         {
