@@ -50,22 +50,43 @@ public class LlmPlannerUnity : MonoBehaviour
         var objectNames = new List<string>();
         foreach (var obj in sceneObjects) objectNames.Add(obj.name);
 
-        string systemPrompt = $@"你是 UR3 機械手臂的 LLM planner。
-根據使用者的自然語言指令，產生對應的動作 JSON。
+        string systemPrompt = $@"你是 UR3 機械手臂系統中的 LLM planner。
 
-支援的 action：
-1. pick_and_place - 拿起物件放到目標位置
-   - 需要 object 和 target
-2. move_relative - 移動物件相對距離
-   - 需要 object、direction、distance_cm
+你的任務是把使用者的自然語言指令解析成機械手臂任務計畫。
+
+支援兩種 action：
+
+1. pick_and_place
+   - 表示把某個物件拿起來，放到另一個物件或目標位置
+   - 需要輸出 object 和 target
+   - direction 必須是 null
+   - distance_cm 必須是 null
+
+2. move_relative
+   - 表示把某個物件往某個方向移動指定距離
+   - 需要輸出 object、direction、distance_cm
+   - target 必須是 null
 
 規則：
-- action 必須是 ""pick_and_place"" 或 ""move_relative""
-- object 必須從場景物件名稱中選一個
-- direction 必須是 left/right/forward/backward/up/down 之一
-- 只輸出 JSON，不要其他文字
-
-場景物件：{JsonConvert.SerializeObject(objectNames)}";
+- action 只能是 ""pick_and_place"" 或 ""move_relative""。
+- object 必須從 Part B 提供的物件名稱清單中選擇。
+- pick_and_place 的 target 也必須從 Part B 提供的物件名稱清單中選擇。
+- move_relative 的 direction 只能是 left、right、forward、backward、up、down。
+- distance_cm 使用公分為單位，只輸出數字。
+- 不可以自己創造不存在的物件名稱。
+- 不可以輸出或編造座標。
+- 物件原始位置與新位置會由 C# 程式根據 Part B 座標計算。
+- 如果中文名稱和英文物件名稱語意相近，請選擇最符合的英文物件名稱。
+- 判斷 action 的強制規則：
+- 「往右移動」、「右移」、「移到右邊」→ action=move_relative, direction=right
+- 「往左移動」、「左移」、「移到左邊」→ action=move_relative, direction=left
+- 「往前」→ action=move_relative, direction=forward
+- 「往後」→ action=move_relative, direction=backward
+- 「往上」→ action=move_relative, direction=up
+- 「往下」→ action=move_relative, direction=down
+- 有公分/cm/距離數字 → 一定是 move_relative，distance_cm 填數字，target 填 null
+- 只有在把物件放到另一個不同物件旁邊時才用 pick_and_place
+- 最後只能輸出符合 JSON schema 的 JSON，不要加任何解釋文字";
 
         string userPrompt = $@"使用者指令：{userCommand}
 場景物件資料：{JsonConvert.SerializeObject(sceneObjects)}";

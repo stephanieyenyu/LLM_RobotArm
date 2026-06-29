@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Diagnostics;
+using System.Threading.Tasks;
 
 // ==========================================
 // Step 1: Part A — YOLO + QRCode detection
@@ -103,44 +105,69 @@ Console.WriteLine($"\n載入 {sceneObjects.Count} 個物件（世界座標，單
 foreach (var o in sceneObjects)
     Console.WriteLine($"  {o.Name}  x={o.X:F3}  y={o.Y:F3}  z={o.Z:F3}");
 
-Console.WriteLine("\n請輸入機械手臂指令：");
-string? userCommand = Console.ReadLine();
-
-if (string.IsNullOrWhiteSpace(userCommand))
-{
-    Console.WriteLine("指令不可為空。");
-    return;
-}
-
 // ==========================================
-// Step 3: LLM → robot_plan.json
+// Step 4: 監聽 user_input.txt，呼叫 LLM 寫 robot_plan.json
+// 不再從終端機讀，改成監聽 Unity 寫入的指令檔
 // ==========================================
+string unityStreamingAssets = "../unity_project/Assets/StreamingAssets";
+string inputPath = Path.Combine(unityStreamingAssets, "user_input.txt");
+string outputPath = Path.Combine(unityStreamingAssets, "robot_plan.json");
+string localOutputDir = "outputs";
+
+Directory.CreateDirectory(localOutputDir);
+
+Console.WriteLine($"\n=== LLM Planner 已啟動 ===");
+Console.WriteLine($"監聽：{Path.GetFullPath(inputPath)}");
+Console.WriteLine($"輸出：{Path.GetFullPath(outputPath)}");
+Console.WriteLine("等待 Unity 輸入指令...\n");
+
 LlmPlanner planner = new();
-RobotPlan plan = await planner.GeneratePlanAsync(userCommand, sceneObjects);
-
-string outputJson = JsonSerializer.Serialize(
-    plan,
-    new JsonSerializerOptions { WriteIndented = true }
-);
-
-Console.WriteLine("\n=== robot_plan.json ===");
-Console.WriteLine(outputJson);
-
-// 同時存到兩個地方：本機 outputs/ 和 Unity 讀取的 StreamingAssets/
-Directory.CreateDirectory("outputs");
-File.WriteAllText("outputs/robot_plan.json", outputJson);
-Console.WriteLine("Saved to outputs/robot_plan.json");
-
-string unityPath = "../unity_project/Assets/StreamingAssets/robot_plan.json";
-if (Directory.Exists(Path.GetDirectoryName(Path.GetFullPath(unityPath))!))
+string lastContent = "";
+// 啟動時清空 user_input.txt
+if (File.Exists(inputPath))
 {
-    File.WriteAllText(unityPath, outputJson);
-    Console.WriteLine($"Saved to {unityPath}");
+    File.WriteAllText(inputPath, "");
 }
 
-// ==========================================
-// 輔助 class：對應 Part A 輸出的 JSON 格式
-// ==========================================
+while (true)
+{
+    try
+    {
+        if (File.Exists(inputPath))
+        {
+            string userCommand = File.ReadAllText(inputPath).Trim();
+
+            if (!string.IsNullOrWhiteSpace(userCommand) && userCommand != lastContent)
+            {
+                lastContent = userCommand;
+                Console.WriteLine($"收到指令：{userCommand}");
+
+                RobotPlan plan = await planner.GeneratePlanAsync(userCommand, sceneObjects);
+
+                string outputJson = JsonSerializer.Serialize(
+                    plan,
+                    new JsonSerializerOptions { WriteIndented = true }
+                );
+
+                File.WriteAllText(Path.Combine(localOutputDir, "robot_plan.json"), outputJson);
+                File.WriteAllText(outputPath, outputJson);
+
+                Console.WriteLine($"已寫入 robot_plan.json");
+                File.WriteAllText(inputPath, "");
+                Console.WriteLine($"--- robot_plan.json ---");
+                Console.WriteLine(outputJson);
+                Console.WriteLine();
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"錯誤：{ex.Message}");
+    }
+
+    await Task.Delay(500);
+}
+
 // ==========================================
 // 輔助 class：對應 Part B 輸出的 objects_world.json 格式
 // ==========================================

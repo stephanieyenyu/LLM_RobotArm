@@ -5,6 +5,7 @@ cell phone
 red cube
 blue cube
 green cube
+black cube
 screwdriver
 metal part
 robot part

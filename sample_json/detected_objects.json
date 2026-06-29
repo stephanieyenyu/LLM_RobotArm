@@ -4,18 +4,18 @@
   "objects": [
     {
       "name": "cup",
-      "confidence": 0.093,
+      "confidence": 0.918,
       "bbox": [
-        526.17,
-        261.41,
-        794.44,
-        445.3
+        524.6,
+        257.03,
+        784.35,
+        444.44
       ],
       "center_pixel": [
-        660.31,
-        353.35
+        654.48,
+        350.73
       ],
-      "source": "open_vocab"
+      "source": "yolo_coco"
     }
   ],
   "qrcodes": [
