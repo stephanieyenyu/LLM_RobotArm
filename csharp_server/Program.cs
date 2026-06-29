@@ -31,8 +31,8 @@ var processInfo = new ProcessStartInfo
     FileName = "python",
     Arguments = "coordinate_mapper_3d.py",
     WorkingDirectory = Directory.GetCurrentDirectory(),
-    RedirectStandardOutput = true,
-    RedirectStandardError = true,
+    RedirectStandardOutput = false,
+    RedirectStandardError = false,
     UseShellExecute = false,
     CreateNoWindow = true
 };
@@ -45,24 +45,15 @@ if (process == null)
     return;
 }
 
-string partBOutput = process.StandardOutput.ReadToEnd();
-string partBError = process.StandardError.ReadToEnd();
-
 process.WaitForExit();
-
-Console.WriteLine(partBOutput);
-
-if (!string.IsNullOrWhiteSpace(partBError))
-{
-    Console.WriteLine("Part B error:");
-    Console.WriteLine(partBError);
-}
 
 if (process.ExitCode != 0)
 {
-    Console.WriteLine("Part B failed.");
+    Console.WriteLine($"Part B failed. ExitCode = {process.ExitCode}");
     return;
 }
+
+Console.WriteLine("=== Part B Finished ===");
 
 // ==========================================
 // Step 3: Part C — LLM 指令規劃
