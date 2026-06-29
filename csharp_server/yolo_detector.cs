@@ -9,7 +9,7 @@ public class YoloDetectorService
 
     private const int InputWidth = 640;
     private const int InputHeight = 640;
-    private const float ConfidenceThreshold = 0.35f;
+    private const float ConfidenceThreshold = 0.25f;
     private const float NmsThreshold = 0.45f;
 
     private readonly string[] classNames =

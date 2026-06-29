@@ -167,7 +167,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   jsonFileName: robot_plan.json
-  urIP: 192.168.50.123
+  urIP: 192.168.31.237
 --- !u!1 &1454780649
 GameObject:
   m_ObjectHideFlags: 0
