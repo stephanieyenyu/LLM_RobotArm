@@ -15,9 +15,21 @@ public class QrCodeDetectorService
     public List<QrCodeResult> Detect(Mat image)
     {
         var results = new List<QrCodeResult>();
+        Mat gray = new Mat();
+        Cv2.CvtColor(image, gray, ColorConversionCodes.BGR2GRAY);
+
+        Mat enhanced = new Mat();
+        Cv2.EqualizeHist(gray, enhanced);
+
+        Mat processed = new Mat();
+        Cv2.CvtColor(enhanced, processed, ColorConversionCodes.GRAY2BGR);
 
         Mat rgb = new Mat();
-        Cv2.CvtColor(image, rgb, ColorConversionCodes.BGR2RGB);
+        Cv2.CvtColor(processed, rgb, ColorConversionCodes.BGR2RGB);
+
+        gray.Dispose();
+        enhanced.Dispose();
+        processed.Dispose();
 
         if (!rgb.IsContinuous())
         {

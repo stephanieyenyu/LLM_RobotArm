@@ -140,6 +140,9 @@ public static class PartAExporter
 
         Cv2.ImWrite("outputs/visual_result.jpg", visual);
         Cv2.ImWrite("../sample_json/visual_result.jpg", visual);
+        Cv2.ImShow("Detection Result", visual);
+        Cv2.WaitKey(0);
+        Cv2.DestroyAllWindows();
 
 
         Console.WriteLine(json);
