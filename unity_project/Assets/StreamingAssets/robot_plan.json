@@ -2,18 +2,18 @@
   "action": "move_relative",
   "object": "tool",
   "target": null,
-  "direction": "left",
+  "direction": "right",
   "distance_cm": 10,
   "object_position": {
     "name": "tool",
-    "x": 0.199338,
-    "y": 0.014496,
-    "z": -0.196
+    "x": 0.110074,
+    "y": 0.028702,
+    "z": 0.05
   },
   "target_position": {
     "name": "tool_target",
-    "x": 0.09933799999999998,
-    "y": 0.014496,
-    "z": -0.196
+    "x": 0.110074,
+    "y": 0.128702,
+    "z": 0.05
   }
 }
