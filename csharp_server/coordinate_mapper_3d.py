@@ -15,11 +15,11 @@ OUTPUT_JSON = "../sample_json/objects_world.json"
 # QRCode 實際邊長，單位：meter
 # 如果 QRCode 是 5 cm，就填 0.05
 # 如果 QRCode 是 4 cm，就填 0.04
-QR_SIZE_M = 0.075
+QR_SIZE_M = 0.073
 
 
 # 物件高度，先假設物件在工作平面上方 3 cm
-OBJECT_HEIGHT_OFFSET_M = 0.013
+OBJECT_HEIGHT_OFFSET_M = 0.05
 
 
 # ============================================================
@@ -329,14 +329,18 @@ def main():
 
             inside_workspace = bool((0.0 <= u <= 1.0) and (0.0 <= v <= 1.0))
 
-            # 給 Unity / 機械手臂使用的工作座標
-            # x：QR1 → QR2 方向距離
-            # y：離工作平面高度
-            # z：QR1 → QR3 方向距離
+            # QR1 在 UR 基座座標系的位置（公尺）
+            QR1_UR_X = 0.171
+            QR1_UR_Y = -0.094
+            QR1_UR_Z = -0.246
+
+            # B 的 local_x = QR1→QR2 方向 = 假設 UR 的 Y 方向
+            # B 的 local_z = QR1→QR3 方向 = 假設 UR 的 X 方向
+            # B 的 height  = 高度 = UR 的 Z 方向
             position = np.array([
-                local_x,
-                OBJECT_HEIGHT_OFFSET_M,
-                local_z
+                QR1_UR_X + local_z,                       # UR X 軸：往遠離手臂方向
+                QR1_UR_Y + local_x,                       # UR Y 軸：往右方向
+                QR1_UR_Z + OBJECT_HEIGHT_OFFSET_M         # UR Z 軸：高度
             ], dtype=np.float64)
 
             converted_obj = {

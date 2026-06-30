@@ -42,17 +42,17 @@ public class QrCodeDetectorService
         Cv2.EqualizeHist(gray, enhanced);
 
         var dictionary = CvAruco.GetPredefinedDictionary(
-            PredefinedDictionaryName.Dict4X4_50
+            PredefinedDictionaryType.Dict4X4_50
         );
 
-        var parameters = new DetectorParameters();
+        var detectorParameters = new DetectorParameters();
+        var refineParameters = new RefineParameters(10f, 3f, true);
+        using var arucoDetector = new ArucoDetector(dictionary, detectorParameters, refineParameters);
 
-        CvAruco.DetectMarkers(
+        arucoDetector.DetectMarkers(
             enhanced,
-            dictionary,
             out Point2f[][] markerCorners,
             out int[] markerIds,
-            parameters,
             out _
         );
 

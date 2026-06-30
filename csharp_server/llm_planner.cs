@@ -185,18 +185,18 @@ public class LlmPlanner
         double distanceM = distanceCm / 100.0;
 
         switch (direction)
-        {         
+        {
             case "left":
-                x -= distanceM;
+                y -= distanceM;
                 break;
             case "right":
-                x += distanceM;
-                break;
-            case "forward":
                 y += distanceM;
                 break;
+            case "forward":
+                x += distanceM;
+                break;
             case "backward":
-                y -= distanceM;
+                x -= distanceM;
                 break;
             case "up":
                 z += distanceM;
