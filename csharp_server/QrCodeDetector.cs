@@ -19,10 +19,22 @@ public class QrCodeDetectorService
         { 4, "QR4" }
     };
 
+    private readonly Dictionary dictionary;
+    private readonly DetectorParameters detectorParameters;
+    private readonly RefineParameters refineParameters;
+    private readonly ArucoDetector detector;
+
+    public QrCodeDetectorService()
+    {
+        dictionary = CvAruco.GetPredefinedDictionary(PredefinedDictionaryType.Dict4X4_50);
+        detectorParameters = new DetectorParameters();
+        refineParameters = new RefineParameters();
+        detector = new ArucoDetector(dictionary, detectorParameters, refineParameters);
+    }
+
     public List<QrCodeResult> Detect(Mat image)
     {
         var results = new List<QrCodeResult>();
-
         if (image == null || image.Empty())
             return results;
 
@@ -32,15 +44,11 @@ public class QrCodeDetectorService
         else
             Cv2.CvtColor(image, gray, ColorConversionCodes.BGR2GRAY);
 
-        // OpenCvSharp4 4.10.x ArUco API
-        var dictionary = CvAruco.GetPredefinedDictionary(PredefinedDictionaryName.Dict4X4_50);
-        var detectorParameters = new DetectorParameters();
-
         Point2f[][] corners;
         int[] ids;
         Point2f[][] rejected;
 
-        CvAruco.DetectMarkers(gray, dictionary, out corners, out ids, detectorParameters, out rejected);
+        detector.DetectMarkers(gray, out corners, out ids, out rejected);
 
         if (ids == null || ids.Length == 0)
             return results;
@@ -48,12 +56,10 @@ public class QrCodeDetectorService
         for (int i = 0; i < ids.Length; i++)
         {
             int arucoId = ids[i];
-
             if (!idToName.TryGetValue(arucoId, out string? name))
                 continue;
 
             var c = corners[i];
-
             double cx = (c[0].X + c[1].X + c[2].X + c[3].X) / 4.0;
             double cy = (c[0].Y + c[1].Y + c[2].Y + c[3].Y) / 4.0;
 

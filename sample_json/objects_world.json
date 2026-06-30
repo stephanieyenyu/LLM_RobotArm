@@ -73,41 +73,5 @@
       }
     }
   },
-  "objects": [
-    {
-      "name": "tool",
-      "confidence": 0.106,
-      "source": "open_vocab",
-      "bbox": [
-        694.44,
-        435.64,
-        862.37,
-        576.43
-      ],
-      "center_pixel": [
-        778.4,
-        506.04
-      ],
-      "camera_point_on_plane": {
-        "x": 0.067108,
-        "y": 0.070813,
-        "z": 0.290932
-      },
-      "workspace_local": {
-        "x": 0.110074,
-        "y": 0.0,
-        "z": 0.028702
-      },
-      "workspace_ratio": {
-        "u": 0.480675,
-        "v": 0.137868
-      },
-      "inside_workspace": true,
-      "position": {
-        "x": 0.110074,
-        "y": 0.028702,
-        "z": 0.05
-      }
-    }
-  ]
+  "objects": []
 }
