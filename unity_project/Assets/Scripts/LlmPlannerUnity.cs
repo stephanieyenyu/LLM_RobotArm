@@ -17,7 +17,7 @@ public class SceneObjectData
 public class LlmPlannerUnity : MonoBehaviour
 {
     [Header("OpenAI 設定")]
-    public string model = "gpt-4o-mini";
+    public string model = "gpt-5";
 
     [Header("場景物件（測試用）")]
     public List<SceneObjectData> sceneObjects = new()
