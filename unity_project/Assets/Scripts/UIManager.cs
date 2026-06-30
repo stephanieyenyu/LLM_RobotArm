@@ -59,7 +59,26 @@ public class UIManager : MonoBehaviour
 
     IEnumerator WaitAndExecute()
     {
-        yield return new WaitForSeconds(3f);
-        executor.LoadAndExecute();
+        string planPath = Path.Combine(Application.streamingAssetsPath, "robot_plan.json");
+        var lastWrite = File.Exists(planPath) ? File.GetLastWriteTime(planPath) : System.DateTime.MinValue;
+
+        // 等最多 30 秒讓 terminal LLM 產生新的 robot_plan.json
+        float timeout = 30f;
+        float waited = 0f;
+
+        while (waited < timeout)
+        {
+            yield return new WaitForSeconds(0.5f);
+            waited += 0.5f;
+
+            if (File.Exists(planPath) && File.GetLastWriteTime(planPath) > lastWrite)
+            {
+                Debug.Log("robot_plan.json 已更新，開始執行");
+                executor.LoadAndExecute();
+                yield break;
+            }
+        }
+
+        Debug.LogWarning("等待 robot_plan.json 更新逾時");
     }
 }
