@@ -65,7 +65,7 @@ public class LlmPlannerUnity : MonoBehaviour
                    - target 必須是 null
             
                 規則：
-                - action 只能是 "pick_and_place" 或 "move_relative"。
+                - action 只能是 pick_and_place 或 move_relative。
                 - object 必須從 Part B 提供的物件名稱清單中選擇。
                 - pick_and_place 的 target 也必須從 Part B 提供的物件名稱清單中選擇。
                 - move_relative 的 direction 只能是 left、right、forward、backward、up、down，依下列語意判斷，不限於固定詞組：
