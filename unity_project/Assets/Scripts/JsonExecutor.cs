@@ -126,8 +126,8 @@ public class JsonExecutor : MonoBehaviour
         //   z = 高度，也就是 QR +Z
         //
         // 由 URSim 測得的座標軸對應：
-        //   QR +X 對應 UR3 -Y
-        //   QR +Y 對應 UR3 +X
+        //   QR +X 對應 UR3 +X
+        //   QR +Y 對應 UR3 +Y
         //   QR +Z 對應 UR3 +Z
 
         float obj_qr_x = p.object_position != null ? p.object_position.x : 0f; // QR1 → QR2
@@ -140,16 +140,16 @@ public class JsonExecutor : MonoBehaviour
 
         // QR coordinate → UR3 base coordinate
 
-        //QR + X = UR - Y
-        //QR + Y = UR + X
+        //QR + X = UR + X
+        //QR + Y = UR + Y
         //QR + Z = UR + Z
 
-        float ox = QR1_X + obj_qr_y;
-        float oy = QR1_Y - obj_qr_x;
+        float ox = QR1_X + obj_qr_x;
+        float oy = QR1_Y + obj_qr_y;
         float oz = QR1_Z + obj_qr_z;
 
-        float tx = QR1_X + tgt_qr_y;
-        float ty = QR1_Y - tgt_qr_x;
+        float tx = QR1_X + tgt_qr_x;
+        float ty = QR1_Y + tgt_qr_y;
         float tz = QR1_Z + tgt_qr_z;
 
         Debug.Log($"物件 UR3 座標：({ox:F4}, {oy:F4}, {oz:F4})");
