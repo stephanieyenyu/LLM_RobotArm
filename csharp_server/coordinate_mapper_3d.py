@@ -330,14 +330,10 @@ def main():
 
             inside_workspace = bool((0.0 <= u <= 1.0) and (0.0 <= v <= 1.0))
 
-            # QR1 在 UR 基座座標系的位置（公尺）
-            QR1_UR_X = 0.171
-            QR1_UR_Y = -0.094
-            QR1_UR_Z = -0.246
-
-            # B 的 local_x = QR1→QR2 方向 = 假設 UR 的 Y 方向
-            # B 的 local_z = QR1→QR3 方向 = 假設 UR 的 X 方向
-            # B 的 height  = 高度 = UR 的 Z 方向
+            # Part B output coordinate:
+            # x = QR1 → QR2 direction
+            # y = QR1 → QR3 direction
+            # z = vertical height
             position = np.array([
                 local_x,                       # x：QR1 → QR2 方向距離
                 local_z,                       # y：QR1 → QR3 方向距離

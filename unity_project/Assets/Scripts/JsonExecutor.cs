@@ -119,28 +119,33 @@ public class JsonExecutor : MonoBehaviour
     {
         var seq = new List<RobotAction>();
 
-        // LlmPlannerUnity 的 object_position / target_position 單位是公分
-        // 工作平面座標：
-        //   x = QR1 → QR2 方向（對應 UR3 X 軸）
-        //   z = QR1 → QR3 方向（對應 UR3 Y 軸）
-        //   y = 高度（固定用 QR1_Z）
+        // Part B 的 object_position / target_position 單位是公尺
+        // QR 工作平面座標：
+        //   x = QR1 → QR2 方向
+        //   y = QR1 → QR3 方向
+        //   z = 高度
         //
-        // UR3 座標 = QR1 座標 + 工作平面偏移（公分 → 公尺）
+        // 目前假設：
+        //   QR1 → QR2 對應 UR3 的 Y 方向
+        //   QR1 → QR3 對應 UR3 的 X 方向
+        //   高度對應 UR3 的 Z 方向
 
-        float obj_x = p.object_position != null ? p.object_position.x / 100f : 0f;
-        float obj_y = p.object_position != null ? p.object_position.z / 100f : 0f;
+        float obj_qr_x = p.object_position != null ? p.object_position.x : 0f; // QR1 → QR2
+        float obj_qr_y = p.object_position != null ? p.object_position.y : 0f; // QR1 → QR3
+        float obj_qr_z = p.object_position != null ? p.object_position.z : 0f; // height
 
-        float tgt_x = p.target_position != null ? p.target_position.x / 100f : obj_x;
-        float tgt_y = p.target_position != null ? p.target_position.z / 100f : obj_y;
+        float tgt_qr_x = p.target_position != null ? p.target_position.x : obj_qr_x;
+        float tgt_qr_y = p.target_position != null ? p.target_position.y : obj_qr_y;
+        float tgt_qr_z = p.target_position != null ? p.target_position.z : obj_qr_z;
 
-        // UR3 世界座標
-        float ox = QR1_X + obj_x;
-        float oy = QR1_Y + obj_y;
-        float oz = QR1_Z;                    // 工作平面高度
+        // QR coordinate → UR3 base coordinate
+        float ox = QR1_X + obj_qr_x;
+        float oy = QR1_Y + obj_qr_y;
+        float oz = QR1_Z + obj_qr_z;
 
-        float tx = QR1_X + tgt_x;
-        float ty = QR1_Y + tgt_y;
-        float tz = QR1_Z;
+        float tx = QR1_X + tgt_qr_x;
+        float ty = QR1_Y + tgt_qr_y;
+        float tz = QR1_Z + tgt_qr_z;
 
         Debug.Log($"物件 UR3 座標：({ox:F4}, {oy:F4}, {oz:F4})");
         Debug.Log($"目標 UR3 座標：({tx:F4}, {ty:F4}, {tz:F4})");
