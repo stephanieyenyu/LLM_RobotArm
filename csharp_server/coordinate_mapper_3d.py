@@ -155,8 +155,9 @@ def solve_qr_pose(qr, camera_matrix, dist_coeffs):
 def build_workspace_frame(p1, p2, p3):
     """
     QR1 = origin
-    QR2 = X direction
-    QR3 = Z direction
+    QR2 = +X direction
+    QR3 = +Y direction
+    Z = vertical height
     """
 
     origin = p1
@@ -338,9 +339,9 @@ def main():
             # B 的 local_z = QR1→QR3 方向 = 假設 UR 的 X 方向
             # B 的 height  = 高度 = UR 的 Z 方向
             position = np.array([
-                QR1_UR_X + local_z,                       # UR X 軸：往遠離手臂方向
-                QR1_UR_Y + local_x,                       # UR Y 軸：往右方向
-                QR1_UR_Z + OBJECT_HEIGHT_OFFSET_M         # UR Z 軸：高度
+                local_x,                       # x：QR1 → QR2 方向距離
+                local_z,                       # y：QR1 → QR3 方向距離
+                OBJECT_HEIGHT_OFFSET_M         # z：高度
             ], dtype=np.float64)
 
             converted_obj = {
