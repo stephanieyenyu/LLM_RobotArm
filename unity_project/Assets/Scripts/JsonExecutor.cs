@@ -86,7 +86,7 @@ public class JsonExecutor : MonoBehaviour
 
     public void LoadAndExecute()
     {
-        string path = Path.Combine(@"C:\Users\ASUS\LLM_RobotArm\shared", jsonFileName);
+        string path = Path.Combine(Application.streamingAssetsPath, jsonFileName);
 
         if (!File.Exists(path))
         {

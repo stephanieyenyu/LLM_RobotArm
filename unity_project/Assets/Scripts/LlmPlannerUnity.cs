@@ -92,7 +92,7 @@ public class LlmPlannerUnity : MonoBehaviour
                   - 只要指令中包含方向詞（左/右/前/後/上/下，或其同義表達）→ 一律是 move_relative，target 必須為 null。
                   - 只有在指令明確是「把 A 放到 B 旁邊/上面/裡面」這種兩個不同物件之間的擺放關係，且沒有方向詞時 → 才是 pick_and_place。
                   - 若同時出現方向詞與另一個物件名稱（例如「把杯子往左移到盤子旁邊」），仍優先視為 move_relative，並以方向詞與距離為主；若無法判斷距離，套用預設值 5。
-                - 最後只能輸出符合 JSON schema 的 JSON，不要加任何解釋文字。;
+                - 最後只能輸出符合 JSON schema 的 JSON，不要加任何解釋文字。";
 
         string userPrompt = $@"使用者指令：{userCommand}
 場景物件資料：{JsonConvert.SerializeObject(sceneObjects)}";
