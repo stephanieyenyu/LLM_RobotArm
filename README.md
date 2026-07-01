@@ -300,14 +300,8 @@ csharp_server 沒把 `robot_plan.json` 寫到 Unity 讀的位置。確認 `unity
 - 與真實 UR3e 的長時間穩定測試
 - URScript 執行失敗的錯誤回報回 Unity
 - 多任務排程與中斷指令
-- OwlViT 常駐加速
+- UR3e 連接夾治具
 - Unity 場景中的目標物件視覺化
-
----
-
-以下為舊版說明（保留備查）：
-
----
 
 # Part A：YOLO 物件偵測與 QRCode 定位點輸出
 
