@@ -3,17 +3,17 @@
   "object": "cell phone",
   "target": null,
   "direction": "forward",
-  "distance_cm": 5,
+  "distance_cm": 10,
   "object_position": {
     "name": "cell phone",
-    "x": 0.102729,
-    "y": 0.089618,
-    "z": 0.05
+    "x": 0.103759,
+    "y": 0.139561,
+    "z": 0.013
   },
   "target_position": {
     "name": "cell phone_target",
-    "x": 0.102729,
-    "y": 0.039618,
-    "z": 0.05
+    "x": 0.103759,
+    "y": 0.039560999999999985,
+    "z": 0.013
   }
 }

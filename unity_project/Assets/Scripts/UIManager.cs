@@ -8,6 +8,10 @@ public class UIManager : MonoBehaviour
     public UIDocument uiDocument;
     public JsonExecutor executor;
 
+    // 兩邊共用的資料夾（Unity / csharp_server 都指到這裡）
+    // 如果之後換電腦或換路徑，只要改這一行
+    private string SHARED_DIR => Application.streamingAssetsPath;
+
     private TextField inputField;
     private Button sendButton;
 
@@ -42,27 +46,54 @@ public class UIManager : MonoBehaviour
         container.Add(inputField);
         container.Add(sendButton);
         root.Add(container);
+
+        // 確保共享資料夾存在
+        if (!Directory.Exists(SHARED_DIR))
+        {
+            Directory.CreateDirectory(SHARED_DIR);
+            Debug.Log("已建立共享資料夾：" + SHARED_DIR);
+        }
     }
 
     void OnSendCommand()
     {
         string command = inputField.value;
-        if (string.IsNullOrEmpty(command)) return;
+        Debug.Log("按鈕被按下");
+        Debug.Log("輸入內容：" + command);
 
-        Debug.Log("使用者輸入：" + command);
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            Debug.LogWarning("輸入是空的，所以沒有寫入");
+            return;
+        }
 
-        string inputPath = Path.Combine(Application.streamingAssetsPath, "user_input.txt");
-        File.WriteAllText(inputPath, command);
+        try
+        {
+            string inputPath = Path.Combine(Application.streamingAssetsPath, "user_input.txt");
 
-        StartCoroutine(WaitAndExecute());
+            Debug.Log("StreamingAssetsPath：" + Application.streamingAssetsPath);
+            Debug.Log("準備寫入：" + inputPath);
+
+            Directory.CreateDirectory(Application.streamingAssetsPath);
+
+            File.WriteAllText(inputPath, command);
+
+            Debug.Log("寫入後讀回：" + File.ReadAllText(inputPath));
+
+            StartCoroutine(WaitAndExecute());
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError("寫入 user_input.txt 失敗：" + ex);
+        }
     }
 
     IEnumerator WaitAndExecute()
     {
-        string planPath = Path.Combine(Application.streamingAssetsPath, "robot_plan.json");
+        string planPath = Path.Combine(SHARED_DIR, "robot_plan.json");
         var lastWrite = File.Exists(planPath) ? File.GetLastWriteTime(planPath) : System.DateTime.MinValue;
 
-        // 等最多 30 秒讓 terminal LLM 產生新的 robot_plan.json
+        // 等最多 30 秒讓 csharp_server 產生新的 robot_plan.json
         float timeout = 30f;
         float waited = 0f;
 
@@ -79,6 +110,6 @@ public class UIManager : MonoBehaviour
             }
         }
 
-        Debug.LogWarning("等待 robot_plan.json 更新逾時");
+        Debug.LogWarning("等待 robot_plan.json 更新逾時（30 秒），請檢查 csharp_server 是否在跑");
     }
 }

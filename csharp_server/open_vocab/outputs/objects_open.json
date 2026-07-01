@@ -4,16 +4,16 @@
   "objects": [
     {
       "name": "cell phone",
-      "confidence": 0.148,
+      "confidence": 0.104,
       "bbox": [
-        467.8,
-        154.96,
-        728.05,
-        598.81
+        397.8,
+        154.24,
+        625.29,
+        358.43
       ],
       "center_pixel": [
-        597.92,
-        376.88
+        511.54,
+        256.34
       ],
       "source": "open_vocab"
     }
