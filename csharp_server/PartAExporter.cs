@@ -10,7 +10,7 @@ public static class PartAExporter
 
         // useWebcam = true 會從攝影機拍；false 用現有圖片
         bool useWebcam = true;
-        int cameraIndex = 1;
+        int cameraIndex = 0;
 
         Console.WriteLine("Current folder: " + Directory.GetCurrentDirectory());
         Console.WriteLine("Image path: " + Path.GetFullPath(imagePath));

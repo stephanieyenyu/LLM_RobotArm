@@ -34,7 +34,7 @@ namespace Assets.Scripts
             IsRealtime = realtime;
             var ip = IPAddress.Parse(address);
             client = new TcpClient();
-            client.BeginConnect(ip, realtime ? 30003 : 30001, connectCallback, null);
+            client.BeginConnect(ip, realtime ? 30003 : 30002, connectCallback, null);
         }
 
         public void Close()

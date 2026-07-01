@@ -3,17 +3,17 @@
   "image_height": 720,
   "objects": [
     {
-      "name": "tool",
-      "confidence": 0.106,
+      "name": "cell phone",
+      "confidence": 0.148,
       "bbox": [
-        694.44,
-        435.64,
-        862.37,
-        576.43
+        467.8,
+        154.96,
+        728.05,
+        598.81
       ],
       "center_pixel": [
-        778.4,
-        506.04
+        597.92,
+        376.88
       ],
       "source": "open_vocab"
     }

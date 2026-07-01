@@ -50,13 +50,13 @@ public class JsonExecutor : MonoBehaviour
 {
     [Header("設定")]
     public string jsonFileName = "robot_plan.json";
-    public string urIP = "192.168.31.237";
+    public string urIP = "192.168.50.204";
 
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
-    private const float QR1_X = -0.12264f;
-    private const float QR1_Y = -0.44734f;
-    private const float QR1_Z = -0.32492f;
+    private const float QR1_X = -0.35753f;
+    private const float QR1_Y = -0.23892f;
+    private const float QR1_Z = -0.39515f;   //TCP_Z-O.O5
 
     // 工作時的安全高度（在物件上方多少公尺）
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -97,6 +97,11 @@ public class JsonExecutor : MonoBehaviour
         string json = File.ReadAllText(path);
         plan = JsonUtility.FromJson<RobotPlan>(json);
 
+        if (plan == null)
+        {
+            Debug.LogError("JSON 解析失敗，plan 是 null");
+            return;
+        }
         if ((plan.action_sequence == null || plan.action_sequence.Count == 0)
             && !string.IsNullOrEmpty(plan.action))
         {
@@ -217,13 +222,13 @@ public class JsonExecutor : MonoBehaviour
             {
                 urListener.SendCommand("set_standard_digital_out(4, True)");
                 Debug.Log("SEND: grasp");
-                yield return new WaitForSeconds(2f);
+                yield return new WaitForSeconds(5f);
             }
             else if (act.action == "release")
             {
                 urListener.SendCommand("set_standard_digital_out(4, False)");
                 Debug.Log("SEND: release");
-                yield return new WaitForSeconds(2f);
+                yield return new WaitForSeconds(5f);
             }
         }
 

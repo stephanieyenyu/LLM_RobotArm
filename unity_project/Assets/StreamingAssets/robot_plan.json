@@ -1,19 +1,19 @@
 {
   "action": "move_relative",
-  "object": "tool",
+  "object": "cell phone",
   "target": null,
-  "direction": "right",
-  "distance_cm": 10,
+  "direction": "forward",
+  "distance_cm": 5,
   "object_position": {
-    "name": "tool",
-    "x": 0.110074,
-    "y": 0.028702,
+    "name": "cell phone",
+    "x": 0.102729,
+    "y": 0.089618,
     "z": 0.05
   },
   "target_position": {
-    "name": "tool_target",
-    "x": 0.110074,
-    "y": 0.128702,
+    "name": "cell phone_target",
+    "x": 0.102729,
+    "y": 0.039618,
     "z": 0.05
   }
 }
