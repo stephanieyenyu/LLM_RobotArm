@@ -93,9 +93,10 @@ public class UIManager : MonoBehaviour
         string planPath = Path.Combine(SHARED_DIR, "robot_plan.json");
         var lastWrite = File.Exists(planPath) ? File.GetLastWriteTime(planPath) : System.DateTime.MinValue;
 
-        // 等最多 30 秒讓 csharp_server 產生新的 robot_plan.json
-        float timeout = 30f;
+        // 等最多 120 秒讓 csharp_server 產生新的 robot_plan.json（gpt-5 有時要 1 分鐘以上）
+        float timeout = 120f;
         float waited = 0f;
+        float lastLogAt = 0f;
 
         while (waited < timeout)
         {
@@ -104,12 +105,19 @@ public class UIManager : MonoBehaviour
 
             if (File.Exists(planPath) && File.GetLastWriteTime(planPath) > lastWrite)
             {
-                Debug.Log("robot_plan.json 已更新，開始執行");
+                Debug.Log($"robot_plan.json 已更新（等了 {waited:F1} 秒），開始執行");
                 executor.LoadAndExecute();
                 yield break;
             }
+
+            // 每 15 秒提醒還在等，避免以為當機
+            if (waited - lastLogAt >= 15f)
+            {
+                Debug.Log($"仍在等 csharp_server 產生 robot_plan.json...（已等 {waited:F0} 秒 / 上限 {timeout:F0} 秒）");
+                lastLogAt = waited;
+            }
         }
 
-        Debug.LogWarning("等待 robot_plan.json 更新逾時（30 秒），請檢查 csharp_server 是否在跑");
+        Debug.LogWarning($"等待 robot_plan.json 更新逾時（{timeout} 秒），請檢查 csharp_server 是否在跑");
     }
 }

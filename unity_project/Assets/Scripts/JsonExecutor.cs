@@ -54,9 +54,9 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
-    private const float QR1_X = -0.144465f;
-    private const float QR1_Y = -0.043457f;
-    private const float QR1_Z = -0.044157f;   //TCP_Z-O.O5
+    private const float QR1_X = -0.348880f;
+    private const float QR1_Y = -0.263700f;
+    private const float QR1_Z = 0.009740f;   //TCP_Z(0.05974) - 0.05
 
     // 工作時的安全高度（在物件上方多少公尺）
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -149,12 +149,12 @@ public class JsonExecutor : MonoBehaviour
         //   QR +Y (QR1→QR3) = UR +Y
         //   QR +Z            = UR +Z
 
-        float ox = QR1_X - obj_qr_x;
-        float oy = QR1_Y - obj_qr_y;
+        float ox = QR1_X + obj_qr_x;
+        float oy = QR1_Y + obj_qr_y;
         float oz = QR1_Z + obj_qr_z;
 
-        float tx = QR1_X - tgt_qr_x;
-        float ty = QR1_Y - tgt_qr_y;
+        float tx = QR1_X + tgt_qr_x;
+        float ty = QR1_Y + tgt_qr_y;
         float tz = QR1_Z + tgt_qr_z;
 
         Debug.Log($"物件 UR3 座標：({ox:F4}, {oy:F4}, {oz:F4})");
@@ -213,7 +213,7 @@ public class JsonExecutor : MonoBehaviour
 
             if (act.action == "move_to" && act.position != null)
             {
-                string cmd = $"movej(get_inverse_kin(p[{act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}, 0, 3.14, 0], qnear=[0, -1.5708, 0, -1.5708, 0, 0]), a=0.5, v=0.3)";
+                string cmd = $"movej(get_inverse_kin(p[{act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}, 0, 3.14, 0], qnear=[0, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=0.5, v=0.3)";
                 urListener.SendCommand(cmd);
                 Debug.Log("SEND: " + cmd);
                 yield return new WaitForSeconds(10f);
