@@ -193,16 +193,16 @@ public class LlmPlanner
         switch (direction)
         {
             case "left":
-                x += distanceM;
-                break;
-            case "right":
-                x -= distanceM;
-                break;
-            case "forward":
                 y -= distanceM;
                 break;
-            case "backward":
+            case "right":
                 y += distanceM;
+                break;
+            case "forward":
+                x -= distanceM;
+                break;
+            case "backward":
+                x += distanceM;
                 break;
             case "up":
                 z += distanceM;

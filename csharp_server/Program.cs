@@ -113,7 +113,6 @@ Console.WriteLine($"輸出：{Path.GetFullPath(outputPath)}");
 Console.WriteLine("等待 Unity 輸入指令...\n");
 
 LlmPlanner planner = new();
-string lastContent = "";
 // 啟動時清空 user_input.txt
 if (File.Exists(inputPath))
 {
@@ -128,9 +127,11 @@ while (true)
         {
             string userCommand = File.ReadAllText(inputPath).Trim();
 
-            if (!string.IsNullOrWhiteSpace(userCommand) && userCommand != lastContent)
+            if (!string.IsNullOrWhiteSpace(userCommand))
             {
-                lastContent = userCommand;
+                // 先清空，避免下一輪 tick 重讀同一句
+                File.WriteAllText(inputPath, "");
+
                 Console.WriteLine($"收到指令：{userCommand}");
 
                 RobotPlan plan = await planner.GeneratePlanAsync(userCommand, sceneObjects);
@@ -144,7 +145,6 @@ while (true)
                 File.WriteAllText(outputPath, outputJson);
 
                 Console.WriteLine($"已寫入 robot_plan.json");
-                File.WriteAllText(inputPath, "");
                 Console.WriteLine($"--- robot_plan.json ---");
                 Console.WriteLine(outputJson);
                 Console.WriteLine();

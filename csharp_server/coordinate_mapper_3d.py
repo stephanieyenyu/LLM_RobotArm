@@ -155,7 +155,7 @@ def solve_qr_pose(qr, camera_matrix, dist_coeffs):
 def build_workspace_frame(p1, p2, p3):
     """
     QR1 = origin
-    QR2 = +X direction
+    QR2 = -X direction
     QR3 = +Y direction
     Z = vertical height
     """
