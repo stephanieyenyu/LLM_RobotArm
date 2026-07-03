@@ -50,6 +50,9 @@ public class LlmRobotPlanResult
     [JsonPropertyName("target")]
     public string? Target { get; set; }
 
+    [JsonPropertyName("reference_object")]
+    public string? ReferenceObject { get; set; }
+
     [JsonPropertyName("direction")]
     public string? Direction { get; set; }
 

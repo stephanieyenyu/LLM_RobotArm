@@ -56,7 +56,7 @@ public class JsonExecutor : MonoBehaviour
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
     private const float QR1_X = -0.348880f;
     private const float QR1_Y = -0.263700f;
-    private const float QR1_Z = 0.009740f;   //TCP_Z(0.05974) - 0.05
+    private const float QR1_Z = -0.00026f;   //TCP_Z(0.05974) - 0.05
 
     // 工作時的安全高度（在物件上方多少公尺）
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -160,7 +160,7 @@ public class JsonExecutor : MonoBehaviour
         Debug.Log($"物件 UR3 座標：({ox:F4}, {oy:F4}, {oz:F4})");
         Debug.Log($"目標 UR3 座標：({tx:F4}, {ty:F4}, {tz:F4})");
 
-        if (p.action == "pick_and_place" || p.action == "move_relative")
+        if (p.action == "pick_and_place" || p.action == "move_relative" || p.action == "place_relative")
         {
             seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 物件上方
             seq.Add(MakeMove(ox, oy, oz));                   // 物件位置
@@ -213,22 +213,22 @@ public class JsonExecutor : MonoBehaviour
 
             if (act.action == "move_to" && act.position != null)
             {
-                string cmd = $"movej(get_inverse_kin(p[{act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}, 0, 3.14, 0], qnear=[0, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=0.5, v=0.3)";
+                string cmd = $"movej(get_inverse_kin(p[{act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}, 0, 3.14, 0], qnear=[0, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=1.2, v=0.8)";
                 urListener.SendCommand(cmd);
                 Debug.Log("SEND: " + cmd);
-                yield return new WaitForSeconds(10f);
+                yield return new WaitForSeconds(3f);
             }
             else if (act.action == "grasp")
             {
                 urListener.SendCommand("set_standard_digital_out(4, True)");
                 Debug.Log("SEND: grasp");
-                yield return new WaitForSeconds(10f);
+                yield return new WaitForSeconds(1.5f);
             }
             else if (act.action == "release")
             {
                 urListener.SendCommand("set_standard_digital_out(4, False)");
                 Debug.Log("SEND: release");
-                yield return new WaitForSeconds(10f);
+                yield return new WaitForSeconds(1.5f);
             }
         }
 
