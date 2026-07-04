@@ -44,19 +44,23 @@ public class RobotPlan
     public NamedPosition object_position;
     public NamedPosition target_position;
     public List<RobotAction> action_sequence;
+    public string error_message;
 }
 
 public class JsonExecutor : MonoBehaviour
 {
     [Header("設定")]
     public string jsonFileName = "robot_plan.json";
-    public string urIP = "192.168.31.237";
+    public string urIP = "192.168.50.204";
+
+    [Header("UI（用於顯示 error 訊息，可留空）")]
+    public UIManager uiManager;
 
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
-    private const float QR1_X = -0.12264f;
-    private const float QR1_Y = -0.44734f;
-    private const float QR1_Z = -0.32492f;
+    private const float QR1_X = -0.348880f;
+    private const float QR1_Y = -0.263700f;
+    private const float QR1_Z = -0.00026f;   //TCP_Z(0.05974) - 0.05
 
     // 工作時的安全高度（在物件上方多少公尺）
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -96,6 +100,23 @@ public class JsonExecutor : MonoBehaviour
 
         string json = File.ReadAllText(path);
         plan = JsonUtility.FromJson<RobotPlan>(json);
+
+        if (plan == null)
+        {
+            Debug.LogError("JSON 解析失敗，plan 是 null");
+            return;
+        }
+
+        if (plan.action == "error")
+        {
+            string msg = string.IsNullOrEmpty(plan.error_message)
+                ? "指令無法辨識或物件不存在。"
+                : plan.error_message;
+
+            Debug.LogWarning("指令錯誤：" + msg);
+            uiManager?.ShowMessage(msg);
+            return;
+        }
 
         if ((plan.action_sequence == null || plan.action_sequence.Count == 0)
             && !string.IsNullOrEmpty(plan.action))
@@ -139,10 +160,10 @@ public class JsonExecutor : MonoBehaviour
         float tgt_qr_z = p.target_position != null ? p.target_position.z : obj_qr_z;
 
         // QR coordinate → UR3 base coordinate
-
-        //QR + X = UR + X
-        //QR + Y = UR + Y
-        //QR + Z = UR + Z
+        // UR base 的 X, Y 軸與 QR 平面同向：
+        //   QR +X (QR1→QR2) = UR +X
+        //   QR +Y (QR1→QR3) = UR +Y
+        //   QR +Z            = UR +Z
 
         float ox = QR1_X + obj_qr_x;
         float oy = QR1_Y + obj_qr_y;
@@ -155,7 +176,7 @@ public class JsonExecutor : MonoBehaviour
         Debug.Log($"物件 UR3 座標：({ox:F4}, {oy:F4}, {oz:F4})");
         Debug.Log($"目標 UR3 座標：({tx:F4}, {ty:F4}, {tz:F4})");
 
-        if (p.action == "pick_and_place" || p.action == "move_relative")
+        if (p.action == "pick_and_place" || p.action == "move_relative" || p.action == "place_relative")
         {
             seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 物件上方
             seq.Add(MakeMove(ox, oy, oz));                   // 物件位置
@@ -208,22 +229,22 @@ public class JsonExecutor : MonoBehaviour
 
             if (act.action == "move_to" && act.position != null)
             {
-                string cmd = $"movej(get_inverse_kin(p[{act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}, 0, 3.14, 0], qnear=[1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=0.5, v=0.3)";
+                string cmd = $"movej(get_inverse_kin(p[{act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}, 0, 3.14, 0], qnear=[0, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=1.2, v=0.8)";
                 urListener.SendCommand(cmd);
                 Debug.Log("SEND: " + cmd);
-                yield return new WaitForSeconds(5f);
+                yield return new WaitForSeconds(3f);
             }
             else if (act.action == "grasp")
             {
                 urListener.SendCommand("set_standard_digital_out(4, True)");
                 Debug.Log("SEND: grasp");
-                yield return new WaitForSeconds(2f);
+                yield return new WaitForSeconds(1.5f);
             }
             else if (act.action == "release")
             {
                 urListener.SendCommand("set_standard_digital_out(4, False)");
                 Debug.Log("SEND: release");
-                yield return new WaitForSeconds(2f);
+                yield return new WaitForSeconds(1.5f);
             }
         }
 

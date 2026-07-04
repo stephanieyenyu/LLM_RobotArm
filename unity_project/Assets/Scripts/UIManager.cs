@@ -8,8 +8,13 @@ public class UIManager : MonoBehaviour
     public UIDocument uiDocument;
     public JsonExecutor executor;
 
+    // 兩邊共用的資料夾（Unity / csharp_server 都指到這裡）
+    // 如果之後換電腦或換路徑，只要改這一行
+    private string SHARED_DIR => Application.streamingAssetsPath;
+
     private TextField inputField;
     private Button sendButton;
+    private Label statusLabel;
 
     void OnEnable()
     {
@@ -42,29 +47,81 @@ public class UIManager : MonoBehaviour
         container.Add(inputField);
         container.Add(sendButton);
         root.Add(container);
+
+        statusLabel = new Label("");
+        statusLabel.style.position = UnityEngine.UIElements.Position.Absolute;
+        statusLabel.style.bottom = 65;
+        statusLabel.style.left = 10;
+        statusLabel.style.right = 10;
+        statusLabel.style.color = new Color(1f, 0.4f, 0.4f);
+        statusLabel.style.backgroundColor = new Color(0, 0, 0, 0.6f);
+        statusLabel.style.paddingTop = 4;
+        statusLabel.style.paddingBottom = 4;
+        statusLabel.style.paddingLeft = 8;
+        statusLabel.style.display = DisplayStyle.None;
+        root.Add(statusLabel);
+
+        // 確保共享資料夾存在
+        if (!Directory.Exists(SHARED_DIR))
+        {
+            Directory.CreateDirectory(SHARED_DIR);
+            Debug.Log("已建立共享資料夾：" + SHARED_DIR);
+        }
+    }
+
+    public void ShowMessage(string message)
+    {
+        if (statusLabel == null) return;
+
+        statusLabel.text = message;
+        statusLabel.style.display = DisplayStyle.Flex;
     }
 
     void OnSendCommand()
     {
         string command = inputField.value;
-        if (string.IsNullOrEmpty(command)) return;
+        Debug.Log("按鈕被按下");
+        Debug.Log("輸入內容：" + command);
 
-        Debug.Log("使用者輸入：" + command);
+        if (statusLabel != null)
+            statusLabel.style.display = DisplayStyle.None;
 
-        string inputPath = Path.Combine(Application.streamingAssetsPath, "user_input.txt");
-        File.WriteAllText(inputPath, command);
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            Debug.LogWarning("輸入是空的，所以沒有寫入");
+            return;
+        }
 
-        StartCoroutine(WaitAndExecute());
+        try
+        {
+            string inputPath = Path.Combine(Application.streamingAssetsPath, "user_input.txt");
+
+            Debug.Log("StreamingAssetsPath：" + Application.streamingAssetsPath);
+            Debug.Log("準備寫入：" + inputPath);
+
+            Directory.CreateDirectory(Application.streamingAssetsPath);
+
+            File.WriteAllText(inputPath, command);
+
+            Debug.Log("寫入後讀回：" + File.ReadAllText(inputPath));
+
+            StartCoroutine(WaitAndExecute());
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError("寫入 user_input.txt 失敗：" + ex);
+        }
     }
 
     IEnumerator WaitAndExecute()
     {
-        string planPath = Path.Combine(Application.streamingAssetsPath, "robot_plan.json");
+        string planPath = Path.Combine(SHARED_DIR, "robot_plan.json");
         var lastWrite = File.Exists(planPath) ? File.GetLastWriteTime(planPath) : System.DateTime.MinValue;
 
-        // 等最多 30 秒讓 terminal LLM 產生新的 robot_plan.json
-        float timeout = 30f;
+        // 等最多 120 秒讓 csharp_server 產生新的 robot_plan.json（gpt-5 有時要 1 分鐘以上）
+        float timeout = 120f;
         float waited = 0f;
+        float lastLogAt = 0f;
 
         while (waited < timeout)
         {
@@ -73,12 +130,19 @@ public class UIManager : MonoBehaviour
 
             if (File.Exists(planPath) && File.GetLastWriteTime(planPath) > lastWrite)
             {
-                Debug.Log("robot_plan.json 已更新，開始執行");
+                Debug.Log($"robot_plan.json 已更新（等了 {waited:F1} 秒），開始執行");
                 executor.LoadAndExecute();
                 yield break;
             }
+
+            // 每 15 秒提醒還在等，避免以為當機
+            if (waited - lastLogAt >= 15f)
+            {
+                Debug.Log($"仍在等 csharp_server 產生 robot_plan.json...（已等 {waited:F0} 秒 / 上限 {timeout:F0} 秒）");
+                lastLogAt = waited;
+            }
         }
 
-        Debug.LogWarning("等待 robot_plan.json 更新逾時");
+        Debug.LogWarning($"等待 robot_plan.json 更新逾時（{timeout} 秒），請檢查 csharp_server 是否在跑");
     }
 }

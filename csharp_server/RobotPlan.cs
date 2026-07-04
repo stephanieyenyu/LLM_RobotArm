@@ -37,6 +37,9 @@ public class RobotPlan
 
     [JsonPropertyName("target_position")]
     public SceneObject? TargetPosition { get; set; }
+
+    [JsonPropertyName("error_message")]
+    public string? ErrorMessage { get; set; }
 }
 
 public class LlmRobotPlanResult
@@ -50,9 +53,15 @@ public class LlmRobotPlanResult
     [JsonPropertyName("target")]
     public string? Target { get; set; }
 
+    [JsonPropertyName("reference_object")]
+    public string? ReferenceObject { get; set; }
+
     [JsonPropertyName("direction")]
     public string? Direction { get; set; }
 
     [JsonPropertyName("distance_cm")]
     public double? DistanceCm { get; set; }
+
+    [JsonPropertyName("error_message")]
+    public string? ErrorMessage { get; set; }
 }

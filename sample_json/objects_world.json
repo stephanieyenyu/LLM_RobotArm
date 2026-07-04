@@ -3,7 +3,13 @@
     "type": "qr_3d_pose_mapping",
     "description": "3D workspace mapping using QRCode corners, solvePnP, plane normal, and ray-plane intersection.",
     "qr_size_m": 0.073,
-    "object_height_offset_m": 0.05,
+    "object_height_offset_m": 0.013,
+    "height_estimation": {
+      "enabled": true,
+      "method": "bbox_scaling_with_known_table",
+      "height_calibration": 0.5,
+      "grasp_height_ratio": 0.5
+    },
     "camera_matrix": [
       [
         600.0,
