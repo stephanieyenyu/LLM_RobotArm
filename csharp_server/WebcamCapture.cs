@@ -9,7 +9,7 @@ public class WebcamCapture
         int height = 720
     )
     {
-        using var capture = new VideoCapture(cameraIndex, VideoCaptureAPIs.DSHOW);
+        using var capture = new VideoCapture(cameraIndex,VideoCaptureAPIs.DSHOW);
 
         if (!capture.IsOpened())
         {
@@ -22,17 +22,55 @@ public class WebcamCapture
 
         using var frame = new Mat();
 
-        // Camera warm-up. Some webcams return dark or stale frames at first.
+        // Camera warm-up: 讀幾張 + 讓 exposure/AWB 有時間穩定
         for (int i = 0; i < 15; i++)
         {
             capture.Read(frame);
+            System.Threading.Thread.Sleep(30);   // 給相機 ~450ms 暖機
         }
 
-        if (frame.Empty())
+        // 亮度檢查 + 重試：若整張太暗（相機還沒穩），最多再拍 10 張
+        const double MinMeanBrightness = 15.0;   // 0-255，全黑 = 0
+        const int MaxRetries = 10;
+
+        double meanBrightness = 0;
+        int retry = 0;
+
+        while (retry <= MaxRetries)
         {
-            Console.WriteLine("Cannot read frame from webcam.");
+            capture.Read(frame);
+
+            if (frame.Empty())
+            {
+                Console.WriteLine("Cannot read frame from webcam.");
+                return false;
+            }
+
+            using (Mat gray = new Mat())
+            {
+                if (frame.Channels() == 1)
+                    frame.CopyTo(gray);
+                else
+                    Cv2.CvtColor(frame, gray, ColorConversionCodes.BGR2GRAY);
+
+                meanBrightness = Cv2.Mean(gray).Val0;
+            }
+
+            if (meanBrightness >= MinMeanBrightness)
+                break;
+
+            Console.WriteLine($"Frame too dark (mean brightness {meanBrightness:F1}), retry {retry + 1}/{MaxRetries}...");
+            System.Threading.Thread.Sleep(100);
+            retry++;
+        }
+
+        if (meanBrightness < MinMeanBrightness)
+        {
+            Console.WriteLine($"Webcam still dark after {MaxRetries} retries (mean brightness {meanBrightness:F1}). Aborting.");
             return false;
         }
+
+        Console.WriteLine($"Frame accepted (mean brightness {meanBrightness:F1})");
 
         string? directory = Path.GetDirectoryName(outputPath);
 

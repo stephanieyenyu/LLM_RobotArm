@@ -14,8 +14,8 @@ public class ObjectWithWorldPosition : ObjectDetectionResult
 
 public class CoordinateMapper
 {
-    private const double WorkspaceWidthMetres = 0.60;   // QR1 to QR2
-    private const double WorkspaceDepthMetres = 0.40;   // QR1 to QR3
+    private const double WorkspaceWidthMetres = 0.162;   // QR1 to QR2
+    private const double WorkspaceDepthMetres = 0.37;   // QR1 to QR3
     private const double TableHeightMetres = 0.00;
 
     public List<ObjectWithWorldPosition> MapObjectsToWorkspace(

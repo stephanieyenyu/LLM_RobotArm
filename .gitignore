@@ -53,3 +53,12 @@ csharp_server/yolo_env/
 csharp_server/outputs/
 csharp_server/open_vocab_env/
 sample_json/visual_result/
+
+# Generated artifacts (regenerated every run)
+sample_json/detected_objects.json
+sample_json/objects_world.json
+sample_json/visual_result.jpg
+unity_project/Assets/StreamingAssets/robot_plan.json
+csharp_server/open_vocab/outputs/objects_open.json
+csharp_server/images/test_scene.jpg
+csharp_server/images/0test_scene.jpg
