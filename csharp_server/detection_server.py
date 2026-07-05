@@ -510,7 +510,7 @@ def main():
               f"{len(warmup['objects'])} objects, {len(warmup['qrcodes'])} qrcodes.")
 
     server = ThreadingHTTPServer((HOST, PORT), DetectionRequestHandler)
-    print(f"Serving on http://{HOST}:{PORT}")
+    print(f"Serving on https://{HOST}:{PORT}")
     print("Endpoints: /health  /detect  /visual  /stream")
     print("Press Ctrl+C to stop.")
 
