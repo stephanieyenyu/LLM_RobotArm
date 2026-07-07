@@ -49,7 +49,7 @@ public class LlmPlanner
                 你是 UR3 機械手臂系統中的 LLM planner。
                 你的任務是把使用者的自然語言指令解析成機械手臂任務計畫。
             
-                支援三種 action：
+                支援四種 action：
                 1. pick_and_place
                    - 表示把某個物件拿起來，放到另一個物件的位置上
                    - 需要輸出 object 和 target
@@ -63,9 +63,27 @@ public class LlmPlanner
                    - 需要輸出 object、reference_object、direction、distance_cm
                    - target 必須是 null
                    - 例如「把手機放到杯子左邊 15 公分」→ object=cell phone, reference_object=cup, direction=left, distance_cm=15
+                4. error
+                   - 表示指令無法執行（見下方「何時回傳 error」）
+                   - object、target、reference_object、direction、distance_cm 全部為 null
+                   - error_message 必須填一句**中文**說明為什麼不能執行、簡短明確、能讓使用者理解
+
+                何時回傳 error（優先於前三種）：
+                - 使用者指令中的物件**不在物件清單裡**（例如清單只有 cup、cell phone，使用者說「把飛機推倒」）
+                  → error_message 例：「場景中沒有偵測到『飛機』這個物件，目前可操作的物件是 cup、cell phone。」
+                - 移動距離**過大或不合理**（例如「往下移 1 公尺」會撞穿桌面、「往上 3 公尺」超出手臂可達範圍）
+                  → error_message 例：「往下移動 100 公分會撞穿桌面，機械手臂無法執行。」
+                - 使用者要求把物件放到**桌面以下、桌面外、或機械手臂不可達的位置**
+                  → error_message 例：「無法把物件放到桌子下面，這超出機械手臂的工作平面。」
+                - 使用者要求**負距離**、**同一個物件疊到自己身上**、**兩個 place_relative 物件相同**等邏輯錯誤
+                  → error_message 例：「不能把 A 放到 A 自己旁邊。」
+                - 指令**語意完全無法解析**成任何一種 action（例如「幫我唱歌」、「你叫什麼名字」）
+                  → error_message 例：「這不是機械手臂可以執行的動作指令。」
+                - 使用者提到**危險或損害性的操作**（打人、砸東西、撞壞）
+                  → error_message 例：「基於安全考量無法執行此動作。」
 
                 規則：
-                - action 只能是 "pick_and_place"、"move_relative" 或 "place_relative"。
+                - action 只能是 "pick_and_place"、"move_relative"、"place_relative" 或 "error"。
                 - object 必須從 Part B 提供的物件名稱清單中選擇。
                 - pick_and_place 的 target 必須從物件清單中選擇。
                 - place_relative 的 reference_object 必須從物件清單中選擇，且不可與 object 相同。
@@ -97,6 +115,7 @@ public class LlmPlanner
                      → 是 move_relative（例如「把杯子往左移動 10 公分」）
                   3. 若指令是「把 A 放到 B 旁邊/上面/裡面」這種兩個物件之間的擺放，且沒有方向詞
                      → 是 pick_and_place（例如「把杯子放到書本上面」）
+                  4. 若上述任一條件的物件不存在、動作無法執行、或指令不合理 → 回傳 error
                 - 最後只能輸出符合 JSON schema 的 JSON，不要加任何解釋文字。
                 """
             ),
@@ -132,6 +151,27 @@ public class LlmPlanner
         List<SceneObject> sceneObjects
     )
     {
+        // error action：不執行動作，只回傳說明給 console + Unity
+        if (llmResult.Action == "error")
+        {
+            return new RobotPlan
+            {
+                Action = "error",
+                Object = "",
+                Target = null,
+                Direction = null,
+                DistanceCm = null,
+                ObjectPosition = null,
+                TargetPosition = null,
+                ErrorMessage = string.IsNullOrWhiteSpace(llmResult.ErrorMessage)
+                    ? "指令無法執行（未提供原因）"
+                    : llmResult.ErrorMessage,
+            };
+        }
+
+        if (string.IsNullOrWhiteSpace(llmResult.Object))
+            throw new InvalidOperationException($"{llmResult.Action} requires a valid object.");
+
         SceneObject objectPosition = FindSceneObject(sceneObjects, llmResult.Object);
 
         if (llmResult.Action == "pick_and_place")
@@ -142,7 +182,17 @@ public class LlmPlanner
             if (!string.IsNullOrWhiteSpace(llmResult.ReferenceObject))
                 throw new InvalidOperationException("pick_and_place must not have reference_object.");
 
-            SceneObject targetPosition = FindSceneObject(sceneObjects, llmResult.Target);
+            SceneObject targetObj = FindSceneObject(sceneObjects, llmResult.Target);
+
+            // 疊放：目標 z = 目標物件頂面 z + 被搬物件自己的高度
+            //（objectPosition.Z 是「被搬物件頂面」，也就是它自己的總高度）
+            SceneObject targetPosition = new SceneObject
+            {
+                Name = targetObj.Name + "_stack",
+                X = targetObj.X,
+                Y = targetObj.Y,
+                Z = targetObj.Z + objectPosition.Z,
+            };
 
             return new RobotPlan
             {
@@ -204,6 +254,13 @@ public class LlmPlanner
                 llmResult.Direction,
                 llmResult.DistanceCm.Value
             );
+
+            // 水平方向（left/right/forward/backward）→ 保留被搬物件自己的高度
+            // 避免用參考物件 B 的高度導致把 A 放太高或太低
+            if (llmResult.Direction != "up" && llmResult.Direction != "down")
+            {
+                targetPosition.Z = objectPosition.Z;
+            }
 
             return new RobotPlan
             {
@@ -291,12 +348,12 @@ public class LlmPlanner
                 ["action"] = new Dictionary<string, object?>
                 {
                     ["type"] = "string",
-                    ["enum"] = new[] { "pick_and_place", "move_relative", "place_relative" }
+                    ["enum"] = new[] { "pick_and_place", "move_relative", "place_relative", "error" }
                 },
                 ["object"] = new Dictionary<string, object?>
                 {
-                    ["type"] = "string",
-                    ["enum"] = objectNames
+                    ["type"] = new[] { "string", "null" },
+                    ["enum"] = objectNames.Cast<object?>().Append(null).ToArray()
                 },
                 ["target"] = new Dictionary<string, object?>
                 {
@@ -325,6 +382,10 @@ public class LlmPlanner
                 ["distance_cm"] = new Dictionary<string, object?>
                 {
                     ["type"] = new[] { "number", "null" }
+                },
+                ["error_message"] = new Dictionary<string, object?>
+                {
+                    ["type"] = new[] { "string", "null" }
                 }
             },
             ["required"] = new[]
@@ -334,7 +395,8 @@ public class LlmPlanner
                 "target",
                 "reference_object",
                 "direction",
-                "distance_cm"
+                "distance_cm",
+                "error_message"
             }
         };
 

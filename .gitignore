@@ -52,6 +52,7 @@ csharp_server/obj/
 csharp_server/yolo_env/
 csharp_server/outputs/
 csharp_server/open_vocab_env/
+csharp_server/yolo11_env/
 sample_json/visual_result/
 
 # Generated artifacts (regenerated every run)
@@ -62,3 +63,10 @@ unity_project/Assets/StreamingAssets/robot_plan.json
 csharp_server/open_vocab/outputs/objects_open.json
 csharp_server/images/test_scene.jpg
 csharp_server/images/0test_scene.jpg
+
+# Roboflow dataset + training outputs (both huge, both regeneratable)
+csharp_server/pliers_dataset/
+csharp_server/runs/
+
+# Runtime debug outputs from the various detectors
+csharp_server/images/

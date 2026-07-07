@@ -44,6 +44,7 @@ public class RobotPlan
     public NamedPosition object_position;
     public NamedPosition target_position;
     public List<RobotAction> action_sequence;
+    public string error_message;
 }
 
 public class JsonExecutor : MonoBehaviour
@@ -54,12 +55,16 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
-    private const float QR1_X = -0.348880f;
-    private const float QR1_Y = -0.263700f;
-    private const float QR1_Z = -0.00026f;   //TCP_Z(0.05974) - 0.05
+    private const float QR1_X = -0.338000f;
+    private const float QR1_Y = -0.391390f;
+    private const float QR1_Z = -0.00906f;   //TCP_Z(0.05974) - 0.05
 
     // 工作時的安全高度（在物件上方多少公尺）
     private const float SAFE_Z_OFFSET = 0.08f;
+
+    // 深度感測 z 值系統性偏低（USB 2.1 低解析度 + 光滑面 IR 亂反射），
+    // 補一個固定 offset 讓爪尖不要撞下去
+    private const float Z_CORRECTION = 0.02f;
 
     private URPackageListener urListener;
     private RobotPlan plan;
@@ -102,6 +107,14 @@ public class JsonExecutor : MonoBehaviour
             Debug.LogError("JSON 解析失敗，plan 是 null");
             return;
         }
+
+        // error action：不執行任何動作、直接印警告
+        if (plan.action == "error")
+        {
+            Debug.LogWarning($"[LLM] 指令無法執行：{plan.error_message}");
+            return;
+        }
+
         if ((plan.action_sequence == null || plan.action_sequence.Count == 0)
             && !string.IsNullOrEmpty(plan.action))
         {
@@ -151,11 +164,11 @@ public class JsonExecutor : MonoBehaviour
 
         float ox = QR1_X + obj_qr_x;
         float oy = QR1_Y + obj_qr_y;
-        float oz = QR1_Z + obj_qr_z;
+        float oz = QR1_Z + obj_qr_z + Z_CORRECTION;
 
         float tx = QR1_X + tgt_qr_x;
         float ty = QR1_Y + tgt_qr_y;
-        float tz = QR1_Z + tgt_qr_z;
+        float tz = QR1_Z + tgt_qr_z + Z_CORRECTION;
 
         Debug.Log($"物件 UR3 座標：({ox:F4}, {oy:F4}, {oz:F4})");
         Debug.Log($"目標 UR3 座標：({tx:F4}, {ty:F4}, {tz:F4})");
@@ -231,6 +244,13 @@ public class JsonExecutor : MonoBehaviour
                 yield return new WaitForSeconds(1.5f);
             }
         }
+
+        // 任務結束後回到 home 姿態：手臂縮回、不遮視野，方便下一次感知
+        // 用關節角度而非 TCP 座標，IK 一定解得到、動作最順
+        string homeCmd = "movej([0, -1.5708, 1.5708, -1.5708, -1.5708, 0], a=1.2, v=0.8)";
+        urListener.SendCommand(homeCmd);
+        Debug.Log("SEND (home): " + homeCmd);
+        yield return new WaitForSeconds(3f);
 
         Debug.Log("=== 任務完成 ===");
     }
