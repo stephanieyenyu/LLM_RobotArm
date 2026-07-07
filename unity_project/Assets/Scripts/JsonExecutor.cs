@@ -53,6 +53,9 @@ public class JsonExecutor : MonoBehaviour
     public string jsonFileName = "robot_plan.json";
     public string urIP = "192.168.50.204";
 
+    [Header("UI（用於顯示 error 訊息，可留空）")]
+    public UIManager uiManager;
+
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
     private const float QR1_X = -0.338000f;

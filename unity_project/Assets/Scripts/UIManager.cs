@@ -14,6 +14,7 @@ public class UIManager : MonoBehaviour
 
     private TextField inputField;
     private Button sendButton;
+    private Label statusLabel;
 
     void OnEnable()
     {
@@ -47,6 +48,19 @@ public class UIManager : MonoBehaviour
         container.Add(sendButton);
         root.Add(container);
 
+        statusLabel = new Label("");
+        statusLabel.style.position = UnityEngine.UIElements.Position.Absolute;
+        statusLabel.style.bottom = 65;
+        statusLabel.style.left = 10;
+        statusLabel.style.right = 10;
+        statusLabel.style.color = new Color(1f, 0.4f, 0.4f);
+        statusLabel.style.backgroundColor = new Color(0, 0, 0, 0.6f);
+        statusLabel.style.paddingTop = 4;
+        statusLabel.style.paddingBottom = 4;
+        statusLabel.style.paddingLeft = 8;
+        statusLabel.style.display = DisplayStyle.None;
+        root.Add(statusLabel);
+
         // 確保共享資料夾存在
         if (!Directory.Exists(SHARED_DIR))
         {
@@ -55,11 +69,22 @@ public class UIManager : MonoBehaviour
         }
     }
 
+    public void ShowMessage(string message)
+    {
+        if (statusLabel == null) return;
+
+        statusLabel.text = message;
+        statusLabel.style.display = DisplayStyle.Flex;
+    }
+
     void OnSendCommand()
     {
         string command = inputField.value;
         Debug.Log("按鈕被按下");
         Debug.Log("輸入內容：" + command);
+
+        if (statusLabel != null)
+            statusLabel.style.display = DisplayStyle.None;
 
         if (string.IsNullOrWhiteSpace(command))
         {
