@@ -45,7 +45,7 @@ CAMERA_FPS = 6
 CAMERA_BRIGHTNESS_MIN = 15.0
 
 DETECT_INTERVAL_SEC = 0.2       # 目標偵測間隔（0.2s = 5 FPS）
-SERVER_HOST = "0.0.0.0"
+SERVER_HOST = "127.0.0.1"        # 只綁 loopback（同機 csharp_server 用），避免暴露到 LAN
 SERVER_PORT = 5000
 
 # --- YOLO 相關 ---
