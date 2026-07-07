@@ -1,307 +1,99 @@
 ﻿# LLM_RobotArm
 
-以自然語言（中文）指令控制 UR3e 機械手臂完成物件操作的框架。
+以中文自然語言指令控制 UR3e 機械手臂的框架。RealSense D435i 即時偵測工作台物件 → OpenAI gpt-5 解析指令 → Unity 送 URScript 到手臂。
 
-系統將完整流程切成四段（Sense → Recognize+Plan → Execute），對應 kickoff 中的 Framework 項目：
-
-- **Part A（Sense）**：C# / OpenCvSharp — Webcam 拍照，偵測 ArUco 定位碼與場景物件
-- **Part B（Coordinate mapping）**：Python — 用 solvePnP 建工作平面座標系，把物件像素轉成 3D 座標
-- **Part C（Recognize + Plan）**：C# + OpenAI — LLM 把使用者指令解析成機械手臂任務計畫
-- **Part D（Execute）**：Unity — 讀取任務計畫，展開成動作序列，透過 TCP 送 URScript 給 URSim/UR3e
-
----
-
-## 系統架構
+## 系統流程
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  csharp_server（.NET 8 Console App，主控端）                          │
-│                                                                       │
-│   Part A                     Part B                    Part C         │
-│   ────────                   ────────                  ────────       │
-│   Webcam ─┐                                                          │
-│           ├─► ArUco 偵測 ──►                                          │
-│   test_   │                  solvePnP（Python）───►  LlmPlanner       │
-│   scene   ├─► OwlViT 偵測 ►                          （OpenAI）       │
-│           │   (YOLO fallback)  workspace frame ──►                   │
-│                                                       ▼               │
-│                                             robot_plan.json          │
-└──────────────────────────────────────────────────────────────────────┘
-                    ▲                                    │
-                    │ user_input.txt                    │ robot_plan.json
-                    │                                    ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  unity_project（Unity 2022.3 LTS，遙控端）                            │
-│                                                                       │
-│   UIManager ──► JsonExecutor ──► URPackageListener ──► TCP 30002     │
-│   (輸入指令)     (展開動作序列)    (URScript 送出)                     │
-└──────────────────────────────────────────────────────────────────────┘
-                                                        │
-                                                        ▼
-                                              URSim / 真實 UR3e
+Unity UI（輸入指令）
+   ↓  StreamingAssets/user_input.txt
+csharp_server (dotnet)
+   ↓  HTTP GET localhost:5000/scene
+perception_server (Python + Flask)
+   ├─ RealSense 常駐串流
+   ├─ YOLO11n（COCO 物件） + HSV 立方體 + ArUco QR
+   └─ 每 200ms 更新場景，回傳 3D 世界座標
+   ↓
+LLM Planner（gpt-5，四種 action：pick_and_place / move_relative / place_relative / error）
+   ↓  StreamingAssets/robot_plan.json
+Unity JsonExecutor
+   ↓  TCP 30002 URScript
+UR3e
 ```
 
----
+## 檔案總覽
 
-## 目錄結構
+**csharp_server/**
+- `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP
+- `Program.cs` — 監聽 user_input.txt、拉 HTTP 場景、呼叫 LLM、寫 robot_plan.json
+- `llm_planner.cs` — gpt-5 呼叫、JSON schema、error 處理
+- `RobotPlan.cs` — plan / SceneObject 資料類別
+- `models/pliers.pt`、`yolo11n.pt` — YOLO 權重
+- `QRcode/aruco_1~4.png` — 可列印定位碼
 
-```
-LLM_RobotArm/
-├── csharp_server/                      Part A + B + C
-│   ├── Program.cs                      主流程排程 A → B → C
-│   ├── PartAExporter.cs                Part A 排程
-│   ├── WebcamCapture.cs                webcam 拍照
-│   ├── QrCodeDetector.cs               ArUco 偵測（Dict4X4_50）
-│   ├── OpenVocabDetector.cs            spawn Python OwlViT
-│   ├── yolo_detector.cs                YOLO fallback（COCO 80 類）
-│   ├── DetectionModels.cs              偵測結果 POCO
-│   ├── coordinate_mapper.cs            debug 用 2D homography
-│   ├── coordinate_mapper_3d.py         Part B 主體（solvePnP）
-│   ├── llm_planner.cs                  Part C，呼叫 OpenAI gpt-5
-│   ├── RobotPlan.cs                    任務計畫 POCO
-│   ├── open_vocab/
-│   │   ├── detect_open_vocab.py        OwlViT 推論腳本
-│   │   └── prompts.txt                 OwlViT 候選類別
-│   ├── open_vocab_env/                 Python venv（本機建立，git 不追）
-│   ├── models/yolo11n.onnx             YOLO 權重
-│   ├── images/
-│   │   ├── test_scene.jpg              執行時的場景圖（webcam 覆寫）
-│   │   └── test_scene_nocam.jpg        無 webcam 環境下的測試備援
-│   └── outputs/                        本地備份輸出（gitignored）
-│
-├── unity_project/                      Part D
-│   └── Assets/
-│       ├── Scripts/
-│       │   ├── UIManager.cs            指令輸入 UI、監看計畫檔更新
-│       │   ├── JsonExecutor.cs         讀計畫、展開動作、送 URScript
-│       │   ├── URPackageListener.cs    UR TCP client（30002 主要）
-│       │   ├── URUtil.cs               UR 封包 struct 轉換
-│       │   └── Util.cs                 big-endian 網路型別
-│       ├── Scenes/MainScene.unity
-│       └── StreamingAssets/
-│           ├── user_input.txt          Unity 寫入、csharp_server 讀取
-│           └── robot_plan.json         csharp_server 寫入、Unity 讀取
-│
-├── sample_json/                        Part A/B 中繼 JSON（gitignored）
-├── docs/                               系統架構、週報、Part C 說明
-├── requirements.txt                    Python 相依（給 Part B / OwlViT）
-└── README.md
-```
+**unity_project/Assets/Scripts/**
+- `UIManager.cs` — 指令輸入 UI、監看計畫更新
+- `JsonExecutor.cs` — 展開動作序列、送 URScript、任務後回 home
+- `URPackageListener.cs` — UR TCP client（port 30002）
+- `URUtil.cs`、`Util.cs` — 封包型別工具
 
----
+## 前置
 
-## 環境需求
+- .NET SDK 8+
+- Python 3.10+（用 `csharp_server/yolo11_env` 這個 venv）
+- Unity 2022.3 LTS
+- Intel RealSense D435i（USB 3 直接接筆電）
+- `setx OPENAI_API_KEY "sk-你的-key"` 後重開 PowerShell
+- UR3e 或 URSim（Teach Pendant 切 Remote Control、TCP Z offset 設 0.170、速度滑桿 100%）
+- 工作台貼四張 ArUco（QR1 左下、QR2 右下、QR3 左上、QR4 右上）
 
-| 項目 | 版本 |
-|---|---|
-| .NET SDK | 8.0+ |
-| Python | 3.10+（測試過 3.13） |
-| Unity | 2022.3 LTS（測試過 2022.3.62f3）|
-| OpenAI API Key | 需可用 `gpt-5` |
-| VirtualBox + URSim | VIRTUAL-5.9.4.1031232，Bridged Adapter 網路 |
-| Webcam（可選） | 若無可改讀 `images/test_scene_nocam.jpg` |
-| GPU（可選） | NVIDIA + CUDA，用於加速 OwlViT |
+## 每次執行
 
----
-
-## 首次安裝
-
-### 1. Clone repo
-
-```powershell
-git clone https://github.com/stephanieyenyu/LLM_RobotArm.git
-cd LLM_RobotArm
-```
-
-### 2. 設定 OpenAI API Key
-
-```powershell
-setx OPENAI_API_KEY "sk-你的-key"
-```
-設定後**關掉 PowerShell 再重開一次**才會生效。
-
-### 3. 建立 Part B / OwlViT 用的 Python venv
-
+**Terminal 1**（感知）：
 ```powershell
 cd csharp_server
-python -m venv open_vocab_env
+yolo11_env\Scripts\python.exe perception_server.py
 ```
 
-**NVIDIA GPU 版**（推薦，OwlViT 推論快很多）：
-```powershell
-open_vocab_env\Scripts\python.exe -m pip install --upgrade pip
-open_vocab_env\Scripts\pip.exe install torch --index-url https://download.pytorch.org/whl/cu124
-open_vocab_env\Scripts\pip.exe install transformers pillow numpy opencv-python
-```
-
-**純 CPU 版**：
-```powershell
-open_vocab_env\Scripts\pip.exe install torch transformers pillow numpy opencv-python
-```
-
-第一次執行 OwlViT 會下載模型權重（~600 MB），要等一下。
-
-### 4. 準備 URSim / UR3e
-
-1. VirtualBox 啟動 URSim 虛擬機（網路設 Bridged Adapter）
-2. URSim 中 Initialize Robot → START，左下角要是 **Normal**
-3. 右上角 About 記下 IP，例如 `192.168.50.204`
-4. 開 Unity 專案 → 選中 Hierarchy 的 `Executor` → Inspector 中 `Ur IP` 填入該 IP
-
-### 5. 準備場景
-
-- 桌面貼四個 ArUco 定位碼（可用 `csharp_server/aruco_1.png ~ aruco_4.png` 列印）
-- 依 `QR1`（左下）、`QR2`（右下）、`QR3`（左上）、`QR4`（右上）擺，形成一個工作平面矩形
-- 中間放一個物件（OwlViT prompts.txt 認得的類別）
-
----
-
-## 執行流程
-
-**每次跑要開兩個東西：csharp_server 一個、Unity 一個。**
-
-### Step 1. 啟動 csharp_server（開一個 PowerShell）
-
+**Terminal 2**（LLM planner）：
 ```powershell
 cd csharp_server
 dotnet run
 ```
 
-啟動後會依序：
-1. 拍照或讀 `images/test_scene.jpg`
-2. 偵測 QRCode 與物件（優先 OwlViT，失敗才 YOLO）
-3. 寫 `sample_json/detected_objects.json`
-4. 呼叫 Python 算 3D 座標，寫 `sample_json/objects_world.json`
-5. 進入監聽狀態：
-   ```
-   === LLM Planner 已啟動 ===
-   監聽：...\unity_project\Assets\StreamingAssets\user_input.txt
-   輸出：...\unity_project\Assets\StreamingAssets\robot_plan.json
-   等待 Unity 輸入指令...
-   ```
+**Unity**：Hub 開 `unity_project` → Play → Executor 的 `Ur IP` 填 UR3e IP。
 
-### Step 2. 啟動 Unity（Unity Hub 開 `unity_project/` → Play）
+**Debug**：瀏覽器 `http://localhost:5000/debug/live` 看即時偵測畫面。
 
-Unity 起來後，`Executor` 會自動 TCP 連 URSim。畫面下方會有輸入框與「執行」按鈕。
+## 指令範例
 
-### Step 3. 下指令
+- 「把黑色方塊放到黃色方塊上面」→ `pick_and_place` 疊放
+- 「把杯子往前移 5 公分」→ `move_relative`
+- 「把手機放到杯子左邊 15 公分」→ `place_relative`
+- 「把飛機推倒」→ `error`（場景沒有飛機）
 
-在輸入框打自然語言指令，例如：
+## 支援的物件
 
-- 「把杯子往前移動 5 公分」→ `move_relative`
-- 「把杯子放到書本上面」→ `pick_and_place`
-- 「把工具向左移動 10 公分」→ 中文 → OwlViT 偵測到的 `tool`
+YOLO11n COCO 白名單：cup、cell phone、bottle、book、mouse、keyboard、laptop
+HSV：5cm 黃色立方體、5cm 黑色立方體
+QR：QR1-4（ArUco Dict4X4_50）
 
-按執行按鈕，接下來的流程是：
+## 座標校準
 
+`unity_project/Assets/Scripts/JsonExecutor.cs` 頂部三個常數：
+```csharp
+QR1_X, QR1_Y, QR1_Z   // Teach Pendant 手動 jog TCP 到 QR1 上方 5cm 讀值，Z 減 0.05 填入
+Z_CORRECTION = 0.02f  // 補償 depth 系統性偏低
+SAFE_Z_OFFSET = 0.08f // 抓取前後在物件上方留 8cm 安全空間
 ```
-UIManager 寫 user_input.txt
-      ↓
-csharp_server 讀到，呼叫 LLM，寫 robot_plan.json
-      ↓
-UIManager 偵測到 mtime 更新，呼叫 JsonExecutor.LoadAndExecute()
-      ↓
-JsonExecutor 依動作類型展開成 8 步：
-  上方 → 位置 → grasp → 抬起 → 目標上方 → 目標位置 → release → 抬起
-      ↓
-URPackageListener 每步送 URScript 到 TCP 30002：
-  move_to → movej(get_inverse_kin(p[x,y,z,0,3.14,0], ...))
-  grasp   → set_standard_digital_out(4, True)
-  release → set_standard_digital_out(4, False)
-      ↓
-URSim / UR3e 執行
-```
-
-Unity Console 會顯示每步的 SEND 內容；URSim I/O 頁面可看到 digital_out 4 隨 grasp/release 亮滅。
-
----
-
-## 檔案流
-
-跨程式溝通全部走檔案：
-
-| 檔案 | 誰寫 | 誰讀 | 用途 |
-|---|---|---|---|
-| `csharp_server/images/test_scene.jpg` | WebcamCapture | Part A | 每次執行的場景圖 |
-| `sample_json/detected_objects.json` | Part A | Part B | 偵測結果 |
-| `sample_json/objects_world.json` | Part B | Part C | 物件 3D 座標 |
-| `StreamingAssets/user_input.txt` | Unity UIManager | csharp_server 輪詢 | 使用者中文指令 |
-| `StreamingAssets/robot_plan.json` | csharp_server | Unity JsonExecutor | LLM 產出的任務計畫 |
-
-Unity ↔ UR3e 之間走 TCP：port 30002（Primary，送 URScript）、30003（Realtime,收狀態封包）。
-
----
-
-## 座標系換算
-
-Part B 輸出的 x/y/z 是「QR 工作平面局部座標，公尺」：
-- `x` = QR1 → QR2 方向（水平）
-- `y` = QR1 → QR3 方向(縱深)
-- `z` = 工作平面法向（高度）
-
-`JsonExecutor.cs` 中的 `QR1_X / Y / Z` 常數是 QR1 在 UR3 基座座標系的量測值（用 UR3 Teach Pendant 手動移到 QR1 正上方 5 cm 讀出來的 TCP 座標）。運算方式：
-
-```
-UR3_base = QR1_offset + QR_local
-```
-
-換場地或重貼 QRCode 一定要重新量測 `QR1_X / Y / Z`，否則機械手臂會定位錯誤。
-
----
-
-## 支援的動作
-
-Part C 目前定義兩種 action：
-
-| action | LLM 輸出欄位 | 由 Unity 展開的動作序列 |
-|---|---|---|
-| `pick_and_place` | object, target | 上方 → 物件位置 → grasp → 抬 → 目標上方 → 目標位置 → release → 抬 |
-| `move_relative` | object, direction, distance_cm | 同上，但 target 座標由 C# 從 direction + distance_cm 計算 |
-
-`direction` 只能是 `left / right / forward / backward / up / down`。單位換算以公分為主，會處理中文數字（例如「五」「兩公分半」）。
-
----
+換場地或重貼 QRCode 一定要重新量測。
 
 ## 常見問題
 
-**csharp_server 顯示「監聽」的路徑跟 Unity 印的 StreamingAssetsPath 不一樣**
-你有兩份 repo 副本，`dotnet run` 跑到不是 Unity 開的那份。確認 `cd` 到 Unity 專案同一層的 `csharp_server` 再跑。
-
-**Part A 沒偵測到物件（`objects: []`）**
-- 場景裡的物件 OwlViT prompts.txt 沒列到 → 加進 `csharp_server/open_vocab/prompts.txt`
-- OwlViT 環境沒建 → 檢查 `open_vocab_env/Scripts/python.exe` 是否存在
-- confidence 太低（< 0.08）→ 減少 prompts.txt 裡不相關的類別
-
-**Unity Console 出現「找不到 JSON」**
-csharp_server 沒把 `robot_plan.json` 寫到 Unity 讀的位置。確認 `unity_project/Assets/Scripts/JsonExecutor.cs` 的 `LoadAndExecute()` 用的是 `Path.Combine(Application.streamingAssetsPath, jsonFileName)`。
-
-**URSim 進入 Protective Stop**
-`movel` 目標超出工作範圍或近奇異點。改讓 `robot_plan.json` 的 `move_to` 帶 `joints` 走 `movej`，或縮小 `SAFE_Z_OFFSET`。
-
-**UR3 連線失敗**
-- URSim 沒起 / 沒 START
-- IP 錯（Unity Inspector 的 `Ur IP` 要對）
-- 主機與虛擬機不在同網段（VirtualBox 網路要 Bridged Adapter，不是 NAT）
-
-**OwlViT 太慢（每次 Part A 都要重載 model）**
-目前架構每次 spawn 新 Python process。未來可改成 Python 常駐 server + HTTP/named pipe 呼叫。
-
----
-
-## 已完成 / 尚未完成
-
-**已完成**
-- Part A：ArUco + OwlViT（YOLO fallback）偵測
-- Part B：solvePnP 三點建工作平面，物件像素轉 3D
-- Part C：OpenAI gpt-5 中文指令解析，支援 pick_and_place 與 move_relative
-- Part D：URScript 產生與 TCP 送出、pick_and_place 8 步展開
-
-**尚未完成**
-- 與真實 UR3e 的長時間穩定測試
-- URScript 執行失敗的錯誤回報回 Unity
-- 多任務排程與中斷指令
-- UR3e 連接夾治具
-- Unity 場景中的目標物件視覺化
+- **「無法連線 perception_server」** → Terminal 1 沒起或還在載入 model
+- **「場景中沒有帶有效座標的物件」** → QR1-3 沒都在鏡頭裡
+- **等待 robot_plan.json 逾時（120 秒）** → OpenAI API 慢
+- **手臂完全不動** → Teach Pendant 沒切 Remote Control、速度滑桿在 0、或 IP 錯
 
 # Part A：YOLO 物件偵測與 QRCode 定位點輸出
 
