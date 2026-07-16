@@ -135,6 +135,12 @@ while (true)
                     Console.WriteLine();
                     Console.ForegroundColor = prev;
                 }
+                else if (plan.Action == "arrange_pattern")
+                {
+                    int stepCount = plan.PlacementSteps?.Count ?? 0;
+                    Console.WriteLine($"已寫入 robot_plan.json (arrange_pattern: pattern={plan.Pattern}, color={plan.BlockColor}, {stepCount} 步)");
+                    Console.WriteLine();
+                }
                 else
                 {
                     Console.WriteLine($"已寫入 robot_plan.json");

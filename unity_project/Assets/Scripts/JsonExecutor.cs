@@ -34,6 +34,13 @@ public class RobotAction
 }
 
 [System.Serializable]
+public class PlacementStep
+{
+    public NamedPosition source_position;
+    public NamedPosition target_position;
+}
+
+[System.Serializable]
 public class RobotPlan
 {
     public string action;
@@ -45,6 +52,11 @@ public class RobotPlan
     public NamedPosition target_position;
     public List<RobotAction> action_sequence;
     public string error_message;
+
+    // arrange_pattern 專用
+    public string pattern;
+    public string block_color;
+    public List<PlacementStep> placement_steps;
 }
 
 public class JsonExecutor : MonoBehaviour
@@ -121,8 +133,17 @@ public class JsonExecutor : MonoBehaviour
         if ((plan.action_sequence == null || plan.action_sequence.Count == 0)
             && !string.IsNullOrEmpty(plan.action))
         {
-            plan.action_sequence = ExpandAction(plan);
-            Debug.Log($"展開動作：{plan.action} → {plan.action_sequence.Count} 步");
+            if (plan.action == "arrange_pattern")
+            {
+                plan.action_sequence = ExpandArrangePattern(plan);
+                int stepCount = plan.placement_steps != null ? plan.placement_steps.Count : 0;
+                Debug.Log($"展開 arrange_pattern（pattern={plan.pattern}, color={plan.block_color}, {stepCount} 顆積木）→ {plan.action_sequence.Count} 步");
+            }
+            else
+            {
+                plan.action_sequence = ExpandAction(plan);
+                Debug.Log($"展開動作：{plan.action} → {plan.action_sequence.Count} 步");
+            }
         }
 
         Debug.Log("載入任務");
@@ -202,6 +223,53 @@ public class JsonExecutor : MonoBehaviour
             action = "move_to",
             position = new Position { x = x, y = y, z = z }
         };
+    }
+
+    // arrange_pattern 展開：把 N 個 PlacementStep 各自展成 8 步 pick_and_place
+    // 共 N × 8 個動作，依序執行
+    List<RobotAction> ExpandArrangePattern(RobotPlan p)
+    {
+        var seq = new List<RobotAction>();
+
+        if (p.placement_steps == null || p.placement_steps.Count == 0)
+        {
+            Debug.LogWarning("arrange_pattern 沒有 placement_steps");
+            return seq;
+        }
+
+        int index = 0;
+        foreach (var step in p.placement_steps)
+        {
+            index++;
+
+            if (step.source_position == null || step.target_position == null)
+            {
+                Debug.LogWarning($"第 {index} 步 placement_step 缺 source 或 target，跳過");
+                continue;
+            }
+
+            // QR 平面座標 → UR3 base 座標，比照現有 ExpandAction 的公式
+            float ox = QR1_X + step.source_position.x;
+            float oy = QR1_Y + step.source_position.y;
+            float oz = QR1_Z + step.source_position.z + Z_CORRECTION;
+
+            float tx = QR1_X + step.target_position.x;
+            float ty = QR1_Y + step.target_position.y;
+            float tz = QR1_Z + step.target_position.z + Z_CORRECTION;
+
+            Debug.Log($"[step {index}] 積木 UR3 座標 ({ox:F4}, {oy:F4}, {oz:F4}) → 擺放 ({tx:F4}, {ty:F4}, {tz:F4})");
+
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 積木上方
+            seq.Add(MakeMove(ox, oy, oz));                   // 積木位置
+            seq.Add(new RobotAction { action = "grasp" });   // 夾取
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 拿起
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET));  // 目標上方
+            seq.Add(MakeMove(tx, ty, tz));                   // 目標位置
+            seq.Add(new RobotAction { action = "release" }); // 放開
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET));  // 完成上方
+        }
+
+        return seq;
     }
 
     IEnumerator ExecutePlan()

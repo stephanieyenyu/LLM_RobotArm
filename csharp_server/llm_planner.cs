@@ -49,21 +49,32 @@ public class LlmPlanner
                 你是 UR3 機械手臂系統中的 LLM planner。
                 你的任務是把使用者的自然語言指令解析成機械手臂任務計畫。
             
-                支援四種 action：
+                支援五種 action：
                 1. pick_and_place
                    - 表示把某個物件拿起來，放到另一個物件的位置上
                    - 需要輸出 object 和 target
-                   - reference_object、direction、distance_cm 必須是 null
+                   - reference_object、direction、distance_cm、pattern、block_color 必須是 null
                 2. move_relative
                    - 表示把某個物件往某個方向移動指定距離（以物件自己現在的位置為基準）
                    - 需要輸出 object、direction、distance_cm
-                   - target、reference_object 必須是 null
+                   - target、reference_object、pattern、block_color 必須是 null
                 3. place_relative
                    - 表示把某個物件拿起來，放到「另一個參考物件」的某個方向、某個距離處
                    - 需要輸出 object、reference_object、direction、distance_cm
-                   - target 必須是 null
+                   - target、pattern、block_color 必須是 null
                    - 例如「把手機放到杯子左邊 15 公分」→ object=cell phone, reference_object=cup, direction=left, distance_cm=15
-                4. error
+                4. arrange_pattern
+                   - 表示用多個立方體積木在擺放區拚出指定字樣或形狀
+                   - 需要輸出 pattern 與 block_color
+                   - object、target、reference_object、direction、distance_cm 全部必須是 null
+                   - pattern 可以是：
+                     - "line_N"：一條線 N 個積木，N 為 2~10 的正整數（例如「line_5」）
+                     - "square"、"O"、"X"、"triangle"：預定義幾何形狀
+                     - 英文字母 A-Z 單一大寫字母（例如「H」、「A」）
+                   - block_color 只能是 "yellow" 或 "black"（依使用者要求）；未指定時預設 "yellow"
+                   - 例如「拚出一條 5 顆積木的線」→ pattern="line_5", block_color="yellow"
+                   - 例如「用黑色積木拚 H」→ pattern="H", block_color="black"
+                5. error
                    - 表示指令無法執行（見下方「何時回傳 error」）
                    - object、target、reference_object、direction、distance_cm 全部為 null
                    - error_message 必須填一句**中文**說明為什麼不能執行、簡短明確、能讓使用者理解
@@ -83,7 +94,7 @@ public class LlmPlanner
                   → error_message 例：「基於安全考量無法執行此動作。」
 
                 規則：
-                - action 只能是 "pick_and_place"、"move_relative"、"place_relative" 或 "error"。
+                - action 只能是 "pick_and_place"、"move_relative"、"place_relative"、"arrange_pattern" 或 "error"。
                 - object 必須從 Part B 提供的物件名稱清單中選擇。
                 - pick_and_place 的 target 必須從物件清單中選擇。
                 - place_relative 的 reference_object 必須從物件清單中選擇，且不可與 object 相同。
@@ -108,14 +119,16 @@ public class LlmPlanner
                 - 物件原始位置與新位置會由 C# 程式根據 Part B 座標計算。
                 - 如果中文名稱和英文物件名稱語意相近，請選擇最符合的英文物件名稱。
                 - action 判斷的核心原則（依序判斷）：
-                  1. 若指令同時出現「第二個物件名稱」+「方向詞」（含或不含距離）
+                  1. 若指令是「拚出 / 排出 / 擺出 XXX（字母、形狀、直線）」這類「用多顆積木組成圖形」的意圖
+                     → 是 arrange_pattern（例如「拚出 H」、「排一條 5 顆的線」、「拚一個方框」）
+                  2. 若指令同時出現「第二個物件名稱」+「方向詞」（含或不含距離）
                      → 一律是 place_relative（object=要搬動的物件，reference_object=參考物件）
                      → 例如「把杯子往左移到盤子旁邊」、「把手機放到書本前方 8 公分」
-                  2. 若指令只有方向詞、沒有第二個物件
+                  3. 若指令只有方向詞、沒有第二個物件
                      → 是 move_relative（例如「把杯子往左移動 10 公分」）
-                  3. 若指令是「把 A 放到 B 旁邊/上面/裡面」這種兩個物件之間的擺放，且沒有方向詞
+                  4. 若指令是「把 A 放到 B 旁邊/上面/裡面」這種兩個物件之間的擺放，且沒有方向詞
                      → 是 pick_and_place（例如「把杯子放到書本上面」）
-                  4. 若上述任一條件的物件不存在、動作無法執行、或指令不合理 → 回傳 error
+                  5. 若上述任一條件的物件不存在、動作無法執行、或指令不合理 → 回傳 error
                 - 最後只能輸出符合 JSON schema 的 JSON，不要加任何解釋文字。
                 """
             ),
@@ -166,6 +179,42 @@ public class LlmPlanner
                 ErrorMessage = string.IsNullOrWhiteSpace(llmResult.ErrorMessage)
                     ? "指令無法執行（未提供原因）"
                     : llmResult.ErrorMessage,
+            };
+        }
+
+        // arrange_pattern action：用多顆積木拚出 pattern，不需要 object
+        if (llmResult.Action == "arrange_pattern")
+        {
+            if (string.IsNullOrWhiteSpace(llmResult.Pattern))
+                throw new InvalidOperationException("arrange_pattern requires pattern.");
+
+            string blockColor = string.IsNullOrWhiteSpace(llmResult.BlockColor)
+                ? "yellow"
+                : llmResult.BlockColor;
+
+            int[,] bitmap = PatternGenerator.GetBitmap(llmResult.Pattern);
+            PlacementPlanner.PlanResult planResult =
+                PlacementPlanner.Plan(bitmap, sceneObjects, blockColor);
+
+            if (planResult.Error != null)
+            {
+                return new RobotPlan
+                {
+                    Action = "error",
+                    Object = "",
+                    Pattern = llmResult.Pattern,
+                    BlockColor = blockColor,
+                    ErrorMessage = planResult.Error,
+                };
+            }
+
+            return new RobotPlan
+            {
+                Action = "arrange_pattern",
+                Object = "",
+                Pattern = llmResult.Pattern,
+                BlockColor = blockColor,
+                PlacementSteps = planResult.Steps,
             };
         }
 
@@ -348,7 +397,7 @@ public class LlmPlanner
                 ["action"] = new Dictionary<string, object?>
                 {
                     ["type"] = "string",
-                    ["enum"] = new[] { "pick_and_place", "move_relative", "place_relative", "error" }
+                    ["enum"] = new[] { "pick_and_place", "move_relative", "place_relative", "arrange_pattern", "error" }
                 },
                 ["object"] = new Dictionary<string, object?>
                 {
@@ -386,6 +435,15 @@ public class LlmPlanner
                 ["error_message"] = new Dictionary<string, object?>
                 {
                     ["type"] = new[] { "string", "null" }
+                },
+                ["pattern"] = new Dictionary<string, object?>
+                {
+                    ["type"] = new[] { "string", "null" }
+                },
+                ["block_color"] = new Dictionary<string, object?>
+                {
+                    ["type"] = new[] { "string", "null" },
+                    ["enum"] = new object?[] { "yellow", "black", null }
                 }
             },
             ["required"] = new[]
@@ -396,7 +454,9 @@ public class LlmPlanner
                 "reference_object",
                 "direction",
                 "distance_cm",
-                "error_message"
+                "error_message",
+                "pattern",
+                "block_color"
             }
         };
 

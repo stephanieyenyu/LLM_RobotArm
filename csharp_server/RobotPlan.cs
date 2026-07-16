@@ -1,4 +1,5 @@
-﻿using System.Text.Json.Serialization;
+using System.Collections.Generic;
+using System.Text.Json.Serialization;
 
 public class SceneObject
 {
@@ -13,6 +14,16 @@ public class SceneObject
 
     [JsonPropertyName("z")]
     public double Z { get; set; }
+}
+
+public class PlacementStep
+{
+    // arrange_pattern 展開後每一步的來源（補貨區某顆積木）與目標（拼字擺放區某格）
+    [JsonPropertyName("source_position")]
+    public SceneObject? SourcePosition { get; set; }
+
+    [JsonPropertyName("target_position")]
+    public SceneObject? TargetPosition { get; set; }
 }
 
 public class RobotPlan
@@ -40,6 +51,16 @@ public class RobotPlan
 
     [JsonPropertyName("error_message")]
     public string? ErrorMessage { get; set; }
+
+    // arrange_pattern 專用
+    [JsonPropertyName("pattern")]
+    public string? Pattern { get; set; }
+
+    [JsonPropertyName("block_color")]
+    public string? BlockColor { get; set; }
+
+    [JsonPropertyName("placement_steps")]
+    public List<PlacementStep>? PlacementSteps { get; set; }
 }
 
 public class LlmRobotPlanResult
@@ -64,4 +85,11 @@ public class LlmRobotPlanResult
 
     [JsonPropertyName("error_message")]
     public string? ErrorMessage { get; set; }
+
+    // arrange_pattern 專用
+    [JsonPropertyName("pattern")]
+    public string? Pattern { get; set; }
+
+    [JsonPropertyName("block_color")]
+    public string? BlockColor { get; set; }
 }
