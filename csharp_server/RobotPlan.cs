@@ -61,6 +61,9 @@ public class RobotPlan
 
     [JsonPropertyName("placement_steps")]
     public List<PlacementStep>? PlacementSteps { get; set; }
+    [JsonPropertyName("bitmap")]
+    public List<string>? Bitmap { get; set; }
+
 }
 
 public class LlmRobotPlanResult
