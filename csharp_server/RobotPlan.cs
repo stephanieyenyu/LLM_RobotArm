@@ -14,6 +14,13 @@ public class SceneObject
 
     [JsonPropertyName("z")]
     public double Z { get; set; }
+
+    // 形狀資訊（cube 為預設；domino 才會有 orientation）
+    [JsonPropertyName("shape")]
+    public string Shape { get; set; } = "cube";          // "cube" | "domino"
+
+    [JsonPropertyName("orientation")]
+    public string? Orientation { get; set; }              // null / "horizontal" / "vertical"
 }
 
 public class PlacementStep
@@ -61,6 +68,11 @@ public class RobotPlan
 
     [JsonPropertyName("placement_steps")]
     public List<PlacementStep>? PlacementSteps { get; set; }
+
+    // LLM 直接產生的 bitmap（例如 ["10001","11111","10001"]），
+    // 交給 BitmapParser 轉成 int[,] 再交給 PlacementPlanner
+    [JsonPropertyName("bitmap")]
+    public List<string>? Bitmap { get; set; }
 }
 
 public class LlmRobotPlanResult
@@ -92,4 +104,7 @@ public class LlmRobotPlanResult
 
     [JsonPropertyName("block_color")]
     public string? BlockColor { get; set; }
+
+    [JsonPropertyName("bitmap")]
+    public List<string>? Bitmap { get; set; }
 }

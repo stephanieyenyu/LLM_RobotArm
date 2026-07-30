@@ -101,7 +101,9 @@ while (true)
                         Name = obj.Name,
                         X = obj.Position!.X,
                         Y = obj.Position!.Y,
-                        Z = obj.Position!.Z
+                        Z = obj.Position!.Z,
+                        Shape = string.IsNullOrEmpty(obj.Shape) ? "cube" : obj.Shape,
+                        Orientation = obj.Orientation,
                     })
                     .ToList();
 
@@ -113,7 +115,10 @@ while (true)
 
                 Console.WriteLine($"當下場景：{sceneObjects.Count} 個物件");
                 foreach (var o in sceneObjects)
-                    Console.WriteLine($"  {o.Name}  x={o.X:F3}  y={o.Y:F3}  z={o.Z:F3}");
+                {
+                    string oriTag = string.IsNullOrEmpty(o.Orientation) ? "" : $" [{o.Orientation}]";
+                    Console.WriteLine($"  {o.Name}  x={o.X:F3}  y={o.Y:F3}  z={o.Z:F3}  shape={o.Shape}{oriTag}");
+                }
 
                 RobotPlan plan = await planner.GeneratePlanAsync(userCommand, sceneObjects);
 
@@ -178,6 +183,13 @@ public class WorldObject
 
     [JsonPropertyName("position")]
     public WorldPos? Position { get; set; }
+
+    // 由 perception_server 依 HSV + minAreaRect 判定
+    [JsonPropertyName("shape")]
+    public string? Shape { get; set; }              // "cube" | "domino"
+
+    [JsonPropertyName("orientation")]
+    public string? Orientation { get; set; }         // null / "horizontal" / "vertical"
 }
 
 public class WorldPos

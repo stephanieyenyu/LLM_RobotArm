@@ -24,7 +24,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pyrealsense2 as rs
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 from ultralytics import YOLO
 
 
@@ -75,10 +75,22 @@ YELLOW_HSV_LOW = np.array([18, 100, 100])
 YELLOW_HSV_HIGH = np.array([38, 255, 255])
 BLACK_HSV_LOW = np.array([0, 0, 0])
 BLACK_HSV_HIGH = np.array([180, 80, 60])
-MIN_AREA_PX = 500
-MAX_AREA_PX = 30000
-ASPECT_RATIO_TOL = 0.35
-SOLIDITY_MIN = 0.85
+# HSV 形狀偵測參數
+# 目前支援兩種積木：
+#   cube   = 2.5 × 2.5 × 2.5 cm（正方形俯視）
+#   domino = 5 × 2.5 × 2.5 cm（長方形俯視，1:2 比例）
+# 用 minAreaRect 的長短邊比 + 面積雙門檻分類
+CUBE_MIN_AREA_PX = 150          # 2.5 cm cube 在 640x480 下約 20x20 px ≈ 400
+CUBE_MAX_AREA_PX = 1500
+CUBE_RATIO_MAX = 1.35           # 長短邊比 <= 這個 → 視為 cube
+
+DOMINO_MIN_AREA_PX = 350        # domino 面積約 cube 的 2 倍
+DOMINO_MAX_AREA_PX = 3000
+DOMINO_RATIO_MIN = 1.65         # 長短邊比在這區間 → 視為 domino
+DOMINO_RATIO_MAX = 2.40
+DOMINO_ORIENTATION_TOL_DEG = 22.5   # 長軸偏離 X/Y 軸多少度內視為對齊；超過則當「斜擺」拒絕
+
+SOLIDITY_MIN = 0.80             # 小物件輪廓比較毛，稍微放寬
 
 # --- 跨源去重 ---
 IOU_DEDUPE_THRESHOLD = 0.5
@@ -91,7 +103,7 @@ ROI_MARGIN_PX = 10
 
 # --- Part B: QR + solvePnP 3D 座標對應 ---
 QR_SIZE_M = 0.073                    # ArUco 實際邊長，公尺
-OBJECT_HEIGHT_OFFSET_M = 0.013       # 只在深度讀失敗時當 fallback
+OBJECT_HEIGHT_OFFSET_M = 0.025       # 2.5 cm 立方體頂面；只在深度讀失敗時當 fallback
 
 # RealSense 提供真實的相機內參（fx, fy, cx, cy），這裡的值只是預設，
 # 啟動時會被真實 intrinsics 覆蓋（見 setup_realsense）
@@ -125,6 +137,11 @@ latest_state = {
 }
 latest_frame = None
 stop_event = threading.Event()
+
+# 執行狀態：idle = 感知快照可供 Unity 顯示；executing = 手臂執行中，Unity 端凍結場景
+# 由 Unity JsonExecutor 在動作前後 POST 切換
+_execution_mode = "idle"
+_execution_mode_lock = threading.Lock()
 
 
 # ============================================================
@@ -220,8 +237,17 @@ def detect_qrcodes(image_bgr):
     return qrcodes, qr_mask
 
 
-def hsv_cube_detect(image_bgr, hsv_low, hsv_high, class_name, exclude_mask=None):
-    """對單一顏色範圍找立方體。若 exclude_mask 非空，這些區域跳過。"""
+def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None):
+    """
+    對單一顏色 HSV 範圍找 cube（2.5×2.5）或 domino（5×2.5）兩種形狀。
+    用旋轉最小外接矩形（minAreaRect）取長短邊，比軸對齊 boundingRect 準——
+    domino 若斜放，軸對齊 bbox 會接近正方形被誤判成 cube。
+
+    每個偵測物件多兩個欄位：
+      shape       = "cube" 或 "domino"
+      orientation = None（cube）/ "horizontal"（長軸沿 QR X）/ "vertical"（長軸沿 QR Y）
+    name 也對應改成 {color}_cube 或 {color}_domino。
+    """
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, hsv_low, hsv_high)
 
@@ -229,7 +255,8 @@ def hsv_cube_detect(image_bgr, hsv_low, hsv_high, class_name, exclude_mask=None)
         # 把 QR 範圍從偵測 mask 中扣掉
         mask = cv2.bitwise_and(mask, cv2.bitwise_not(exclude_mask))
 
-    kernel = np.ones((5, 5), np.uint8)
+    # 3x3 kernel：2.5 cm cube 在畫面上只有 ~20x20 px，5x5 open 會侵蝕太多
+    kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
@@ -237,30 +264,57 @@ def hsv_cube_detect(image_bgr, hsv_low, hsv_high, class_name, exclude_mask=None)
 
     detections = []
     for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < MIN_AREA_PX or area > MAX_AREA_PX:
+        area = float(cv2.contourArea(cnt))
+        # 大範圍先過濾：從 cube 最小到 domino 最大都可能
+        if area < CUBE_MIN_AREA_PX or area > DOMINO_MAX_AREA_PX:
             continue
 
-        x, y, w, h = cv2.boundingRect(cnt)
-        aspect = w / h if h > 0 else 0
-        if abs(aspect - 1.0) > ASPECT_RATIO_TOL:
-            continue
-
-        hull = cv2.convexHull(cnt)
-        hull_area = cv2.contourArea(hull)
-        solidity = area / hull_area if hull_area > 0 else 0
+        hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
+        solidity = area / hull_area if hull_area > 0 else 0.0
         if solidity < SOLIDITY_MIN:
             continue
 
-        cx = x + w / 2
-        cy = y + h / 2
+        # 旋轉最小外接矩形
+        (rcx, rcy), (rw, rh), angle = cv2.minAreaRect(cnt)
+        if rw < 1 or rh < 1:
+            continue
+        long_side = max(rw, rh)
+        short_side = min(rw, rh)
+        ratio = long_side / short_side
+
+        # 分類：ratio + 面積雙門檻
+        if ratio <= CUBE_RATIO_MAX and CUBE_MIN_AREA_PX <= area <= CUBE_MAX_AREA_PX:
+            shape = "cube"
+            orientation = None
+        elif (DOMINO_RATIO_MIN <= ratio <= DOMINO_RATIO_MAX
+              and DOMINO_MIN_AREA_PX <= area <= DOMINO_MAX_AREA_PX):
+            shape = "domino"
+            # minAreaRect 的 angle 定義隨 OpenCV 版本不同，
+            # 統一成「長邊在 image 座標裡的角度」normalize 到 [0, 180)
+            long_angle = angle if rw >= rh else angle + 90
+            long_angle = long_angle % 180
+            if long_angle < DOMINO_ORIENTATION_TOL_DEG or long_angle > (180 - DOMINO_ORIENTATION_TOL_DEG):
+                orientation = "horizontal"       # 長軸 ≈ image X ≈ QR X（QR1→QR2）
+            elif abs(long_angle - 90) < DOMINO_ORIENTATION_TOL_DEG:
+                orientation = "vertical"         # 長軸 ≈ image Y ≈ QR Y（QR1→QR3）
+            else:
+                continue                         # 斜擺，暫不處理
+        else:
+            # ratio + 面積對不上任何 shape → 丟掉
+            continue
+
+        # 軸對齊 bbox 保留給 depth 讀取跟 workspace polygon 判定用，跟原本一致
+        x, y, w, h = cv2.boundingRect(cnt)
+
         detections.append({
-            "name": class_name,
-            "confidence": round(float(solidity), 3),
+            "name": f"{color_name}_{shape}",
+            "confidence": round(solidity, 3),
             "bbox": [round(float(x), 2), round(float(y), 2),
                      round(float(x + w), 2), round(float(y + h), 2)],
-            "center_pixel": [round(float(cx), 2), round(float(cy), 2)],
+            "center_pixel": [round(float(rcx), 2), round(float(rcy), 2)],   # 旋轉 bbox 中心較準
             "source": "cube_hsv",
+            "shape": shape,
+            "orientation": orientation,
         })
     return detections
 
@@ -383,11 +437,15 @@ def build_workspace_frame(p1, p2, p3):
     }
 
 
-def project_pixel_to_workspace(pixel, camera_matrix, frame):
+def project_pixel_to_workspace(pixel, camera_matrix, frame, obj_top_z_m=OBJECT_HEIGHT_OFFSET_M):
     """
-    像素 → 相機射線 → 工作平面交點 → 局部 (x, y) 座標（公尺）。
-    y 保留給高度用（先固定 OBJECT_HEIGHT_OFFSET_M），x, z 就是平面上的位置。
-    Part B 的輸出對應 x = QR1→QR2、y = QR1→QR3、z = 高度。
+    像素 → 相機射線 → 「工作平面 + obj_top_z_m 高度」的平面交點 → 局部 (x, y) 座標（公尺）。
+    obj_top_z_m 預設 = cube / domino 頂面高度（2.5 cm）；若給 0 就是 QR 平面。
+
+    這個方法**跟相機角度無關**，適合已知高度的物件（cube / domino）。
+    傾斜相機下比 depth 讀值準：depth 讀值容易讀到頂面前緣或側邊，導致 Z 誤差。
+
+    輸出 x = QR1→QR2、y = QR1→QR3、z = obj_top_z_m。
     """
     px, py = pixel
     pixel_h = np.array([px, py, 1.0], dtype=np.float64)
@@ -400,19 +458,22 @@ def project_pixel_to_workspace(pixel, camera_matrix, frame):
     if abs(denom) < 1e-9:
         return None
 
-    t = float(np.dot(frame["origin"] - np.zeros(3), frame["normal"])) / denom
+    # 平面方程：P · normal = (origin + obj_top_z_m * normal) · normal
+    #                     = origin · normal + obj_top_z_m（normal 是單位向量）
+    # 射線 P(t) = t · ray；求 t
+    t = (float(np.dot(frame["origin"], frame["normal"])) + obj_top_z_m) / denom
     if t < 0:
         return None
 
     point_camera = t * ray
     rel = point_camera - frame["origin"]
     local_x = float(np.dot(rel, frame["x_axis"]))
-    local_z = float(np.dot(rel, frame["z_axis"]))
+    local_y = float(np.dot(rel, frame["z_axis"]))
 
     return {
         "x": round(local_x, 6),                        # QR1→QR2 方向
-        "y": round(local_z, 6),                        # QR1→QR3 方向
-        "z": round(OBJECT_HEIGHT_OFFSET_M, 6),         # 高度（先寫死）
+        "y": round(local_y, 6),                        # QR1→QR3 方向
+        "z": round(obj_top_z_m, 6),                    # 已知高度
     }
 
 
@@ -527,7 +588,14 @@ def compute_world_positions(objects, qrcodes, image_width, image_height, depth_i
     camera_matrix = build_camera_matrix(image_width, image_height)
 
     for obj in objects:
-        depth_m = read_depth_meters_for_object(depth_image, obj["bbox"]) if depth_image is not None else None
+        # 讀深度：在 bbox 中心像素周圍取 3px patch、取 25 分位數
+        #   - 一致性：用同一個像素做深度讀跟反投影，不會像舊版讀 bbox 10% 那樣拿到邊緣像素卻套在中心點
+        #   - 偏向頂面：25% 分位數比中位數更靠近相機（頂面），比 10% 又不那麼容易誤中噪點
+        #   - 傾斜相機下也 OK：中心像素通常還是打在頂面上
+        depth_m = (
+            read_depth_meters(depth_image, obj["center_pixel"], patch_radius=3, percentile=25)
+            if depth_image is not None else None
+        )
         obj_camera = deproject_pixel_to_camera(obj["center_pixel"], depth_m) if depth_m else None
 
         if obj_camera is not None:
@@ -542,9 +610,14 @@ def compute_world_positions(objects, qrcodes, image_width, image_height, depth_i
                 "source": "depth",
             }
         else:
-            pos = project_pixel_to_workspace(obj["center_pixel"], camera_matrix, frame)
+            # depth 完全讀不到（極近像素全 0）→ fall back 到「射線 + 已知高度」
+            # 高度用 OBJECT_HEIGHT_OFFSET_M 只是為了給個合理近似值，實務上很少走到這
+            pos = project_pixel_to_workspace(
+                obj["center_pixel"], camera_matrix, frame,
+                obj_top_z_m=OBJECT_HEIGHT_OFFSET_M,
+            )
             if pos is not None:
-                pos["source"] = "ray_plane"
+                pos["source"] = "ray_plane_fallback"
                 obj["position"] = pos
 
     return _cached_workspace_info
@@ -618,9 +691,10 @@ def detect_all(image_bgr, depth_image=None):
     workspace_polygon = build_workspace_polygon(qrcodes)
 
     yolo_dets = yolo_detect_np(YOLO11N, image_bgr, COCO_TARGETS, "yolo_coco", YOLO_CONF)
+    # 一次找 cube + domino（每個顏色都會回傳兩種形狀混合的清單）
     cube_dets = (
-        hsv_cube_detect(image_bgr, YELLOW_HSV_LOW, YELLOW_HSV_HIGH, "yellow_cube", qr_mask)
-        + hsv_cube_detect(image_bgr, BLACK_HSV_LOW, BLACK_HSV_HIGH, "black_cube", qr_mask)
+        hsv_shape_detect(image_bgr, YELLOW_HSV_LOW, YELLOW_HSV_HIGH, "yellow", qr_mask)
+        + hsv_shape_detect(image_bgr, BLACK_HSV_LOW, BLACK_HSV_HIGH, "black", qr_mask)
     )
 
     # 只保留在 QR 圍出的工作區內的偵測 → 手臂本體、桌邊雜物都會被濾掉
@@ -772,6 +846,27 @@ def endpoint_scene():
     return jsonify(snapshot)
 
 
+@app.route("/scene/mode", methods=["GET"])
+def endpoint_get_mode():
+    with _execution_mode_lock:
+        return jsonify({"mode": _execution_mode})
+
+
+@app.route("/scene/mode", methods=["POST"])
+def endpoint_set_mode():
+    global _execution_mode
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+    if mode not in ("idle", "executing"):
+        return jsonify({"error": "mode must be 'idle' or 'executing'"}), 400
+    with _execution_mode_lock:
+        prev = _execution_mode
+        _execution_mode = mode
+    if prev != mode:
+        print(f"[perception] execution mode: {prev} -> {mode}")
+    return jsonify({"mode": mode})
+
+
 @app.route("/health")
 def endpoint_health():
     with state_lock:
@@ -868,9 +963,11 @@ def main():
 
     print()
     print(f"[server] Starting on http://localhost:{SERVER_PORT}")
-    print(f"  GET /scene         - 當下 detection JSON")
-    print(f"  GET /health        - FPS / 上次更新時間")
-    print(f"  GET /debug/frame   - 標好 bbox 的最新一幀 JPEG")
+    print(f"  GET /scene            - 當下 detection JSON")
+    print(f"  GET /scene/mode       - 執行狀態（idle / executing）")
+    print(f"  POST /scene/mode      - 由 Unity 切換執行狀態")
+    print(f"  GET /health           - FPS / 上次更新時間")
+    print(f"  GET /debug/frame      - 標好 bbox 的最新一幀 JPEG")
     print()
 
     try:

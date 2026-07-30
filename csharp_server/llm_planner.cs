@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using OpenAI.Chat;
 
 public class LlmPlanner
@@ -48,38 +48,55 @@ public class LlmPlanner
                 """
                 你是 UR3 機械手臂系統中的 LLM planner。
                 你的任務是把使用者的自然語言指令解析成機械手臂任務計畫。
-            
+
                 支援五種 action：
                 1. pick_and_place
                    - 表示把某個物件拿起來，放到另一個物件的位置上
                    - 需要輸出 object 和 target
-                   - reference_object、direction、distance_cm、pattern、block_color 必須是 null
+                   - reference_object、direction、distance_cm、pattern、block_color、bitmap 必須是 null
                 2. move_relative
                    - 表示把某個物件往某個方向移動指定距離（以物件自己現在的位置為基準）
                    - 需要輸出 object、direction、distance_cm
-                   - target、reference_object、pattern、block_color 必須是 null
+                   - target、reference_object、pattern、block_color、bitmap 必須是 null
                 3. place_relative
                    - 表示把某個物件拿起來，放到「另一個參考物件」的某個方向、某個距離處
                    - 需要輸出 object、reference_object、direction、distance_cm
-                   - target、pattern、block_color 必須是 null
+                   - target、pattern、block_color、bitmap 必須是 null
                    - 例如「把手機放到杯子左邊 15 公分」→ object=cell phone, reference_object=cup, direction=left, distance_cm=15
                 4. arrange_pattern
-                   - 表示用多個立方體積木在擺放區拚出指定字樣或形狀
-                   - 需要輸出 pattern 與 block_color
+                   - 表示使用多個積木排列出指定文字或圖案
+                   - 需要輸出：
+                       pattern（圖案描述文字，例如 "H"、"Heart"、"Arrow"、"OpenAI"）
+                       block_color（"yellow" 或 "black"）
+                       bitmap（二維圖案，字串陣列）
+                   - bitmap 規則：
+                     - 是字串陣列
+                     - 每一列只能包含 0 或 1（1 = 放積木、0 = 留白）
+                     - 每一列長度必須完全一致
+                     - bitmap 最大不可超過 5 × 5（超過會被 PlacementPlanner 拒絕）
+                     - 請直接生成 bitmap，不可以假設 C# 已經知道 H 或愛心長什麼樣
+                   - block_color 只能是 "yellow" 或 "black"；未指定時預設 "yellow"
                    - object、target、reference_object、direction、distance_cm 全部必須是 null
-                   - pattern 可以是：
-                     - "line_N"：一條線 N 個積木，N 為 2~10 的正整數（例如「line_5」）
-                     - "square"、"O"、"X"、"triangle"：預定義幾何形狀
-                     - 英文字母 A-Z 單一大寫字母（例如「H」、「A」）
-                   - block_color 只能是 "yellow" 或 "black"（依使用者要求）；未指定時預設 "yellow"
-                   - 例如「拚出一條 5 顆積木的線」→ pattern="line_5", block_color="yellow"
-                   - 例如「用黑色積木拚 H」→ pattern="H", block_color="black"
+
+                   例如「用黑色積木排 H」→
+                   {
+                     "action": "arrange_pattern",
+                     "pattern": "H",
+                     "block_color": "black",
+                     "bitmap": [
+                       "10001",
+                       "10001",
+                       "11111",
+                       "10001",
+                       "10001"
+                     ]
+                   }
                 5. error
                    - 表示指令無法執行（見下方「何時回傳 error」）
-                   - object、target、reference_object、direction、distance_cm 全部為 null
+                   - object、target、reference_object、direction、distance_cm、pattern、block_color、bitmap 全部為 null
                    - error_message 必須填一句**中文**說明為什麼不能執行、簡短明確、能讓使用者理解
 
-                何時回傳 error（優先於前三種）：
+                何時回傳 error（優先於前四種）：
                 - 使用者指令中的物件**不在物件清單裡**（例如清單只有 cup、cell phone，使用者說「把飛機推倒」）
                   → error_message 例：「場景中沒有偵測到『飛機』這個物件，目前可操作的物件是 cup、cell phone。」
                 - 移動距離**過大或不合理**（例如「往下移 1 公尺」會撞穿桌面、「往上 3 公尺」超出手臂可達範圍）
@@ -182,7 +199,8 @@ public class LlmPlanner
             };
         }
 
-        // arrange_pattern action：用多顆積木拚出 pattern，不需要 object
+        // arrange_pattern action：用多顆積木拚出 pattern
+        // LLM 直接產生 bitmap → BitmapParser 轉 int[,] → PlacementPlanner 排步驟
         if (llmResult.Action == "arrange_pattern")
         {
             if (string.IsNullOrWhiteSpace(llmResult.Pattern))
@@ -192,7 +210,37 @@ public class LlmPlanner
                 ? "yellow"
                 : llmResult.BlockColor;
 
-            int[,] bitmap = PatternGenerator.GetBitmap(llmResult.Pattern);
+            if (llmResult.Bitmap == null || llmResult.Bitmap.Count == 0)
+            {
+                return new RobotPlan
+                {
+                    Action = "error",
+                    Object = "",
+                    Pattern = llmResult.Pattern,
+                    Bitmap = llmResult.Bitmap,
+                    BlockColor = blockColor,
+                    ErrorMessage = "LLM 沒有產生 bitmap。",
+                };
+            }
+
+            int[,] bitmap;
+            try
+            {
+                bitmap = BitmapParser.Parse(llmResult.Bitmap);
+            }
+            catch (Exception ex)
+            {
+                return new RobotPlan
+                {
+                    Action = "error",
+                    Object = "",
+                    Pattern = llmResult.Pattern,
+                    Bitmap = llmResult.Bitmap,
+                    BlockColor = blockColor,
+                    ErrorMessage = $"Bitmap 格式錯誤：{ex.Message}",
+                };
+            }
+
             PlacementPlanner.PlanResult planResult =
                 PlacementPlanner.Plan(bitmap, sceneObjects, blockColor);
 
@@ -203,6 +251,7 @@ public class LlmPlanner
                     Action = "error",
                     Object = "",
                     Pattern = llmResult.Pattern,
+                    Bitmap = llmResult.Bitmap,
                     BlockColor = blockColor,
                     ErrorMessage = planResult.Error,
                 };
@@ -213,6 +262,7 @@ public class LlmPlanner
                 Action = "arrange_pattern",
                 Object = "",
                 Pattern = llmResult.Pattern,
+                Bitmap = llmResult.Bitmap,
                 BlockColor = blockColor,
                 PlacementSteps = planResult.Steps,
             };
@@ -444,7 +494,15 @@ public class LlmPlanner
                 {
                     ["type"] = new[] { "string", "null" },
                     ["enum"] = new object?[] { "yellow", "black", null }
-                }
+                },
+                ["bitmap"] = new Dictionary<string, object?>
+                {
+                    ["type"] = new[] { "array", "null" },
+                    ["items"] = new Dictionary<string, object?>
+                    {
+                        ["type"] = "string"
+                    }
+                },
             },
             ["required"] = new[]
             {
@@ -456,7 +514,8 @@ public class LlmPlanner
                 "distance_cm",
                 "error_message",
                 "pattern",
-                "block_color"
+                "block_color",
+                "bitmap"
             }
         };
 

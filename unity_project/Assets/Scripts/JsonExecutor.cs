@@ -1,9 +1,11 @@
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Networking;
 using System.IO;
 using System;
 using System.Linq;
+using System.Text;
 using Assets.Scripts;
 
 [System.Serializable]
@@ -23,6 +25,8 @@ public class NamedPosition
 {
     public string name;
     public float x, y, z;
+    public string shape;         // "cube" / "domino"（未提供時為空字串）
+    public string orientation;   // "horizontal" / "vertical" / ""（cube 或未提供）
 }
 
 [System.Serializable]
@@ -31,6 +35,10 @@ public class RobotAction
     public string action;
     public Position position;
     public JointAngles joints;
+    // move_to 專用：wrist 旋轉依據
+    //   ""/"vertical"    → 預設 pose (0, 3.14, 0)，夾爪開口沿 Base X
+    //   "horizontal"     → 加轉 90° 圍 tool Z，夾爪開口沿 Base Y
+    public string orientation;
 }
 
 [System.Serializable]
@@ -65,14 +73,18 @@ public class JsonExecutor : MonoBehaviour
     public string jsonFileName = "robot_plan.json";
     public string urIP = "192.168.50.204";
 
+    [Header("Perception Server")]
+    // 執行手臂動作前後會 POST 這裡，通知 SceneSyncer 凍結 / 解凍畫面
+    public string perceptionModeUrl = "http://localhost:5000/scene/mode";
+
     [Header("UI（用於顯示 error 訊息，可留空）")]
     public UIManager uiManager;
 
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
-    private const float QR1_X = -0.338000f;
-    private const float QR1_Y = -0.391390f;
-    private const float QR1_Z = -0.00906f;   //TCP_Z(0.05974) - 0.05
+    private const float QR1_X = -0.308330f;
+    private const float QR1_Y = -0.405240f;
+    private const float QR1_Z = 0.0345f;   //TCP_Z(0.05974) - 0.05
 
     // 工作時的安全高度（在物件上方多少公尺）
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -80,6 +92,11 @@ public class JsonExecutor : MonoBehaviour
     // 深度感測 z 值系統性偏低（USB 2.1 低解析度 + 光滑面 IR 亂反射），
     // 補一個固定 offset 讓爪尖不要撞下去
     private const float Z_CORRECTION = 0.02f;
+
+    // 高空巡航高度（相對 QR1 平面）：所有物件之間的水平飛行都走這個高度
+    // 手臂會先升到這裡再水平移動、再下降，強制走「直角軌跡」不是斜線
+    // 15cm 遠高於任何常見物件（積木 5cm、杯子 10cm）
+    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.15f;
 
     private URPackageListener urListener;
     private RobotPlan plan;
@@ -199,14 +216,26 @@ public class JsonExecutor : MonoBehaviour
 
         if (p.action == "pick_and_place" || p.action == "move_relative" || p.action == "place_relative")
         {
-            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 物件上方
-            seq.Add(MakeMove(ox, oy, oz));                   // 物件位置
-            seq.Add(new RobotAction { action = "grasp" });   // 夾取
-            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 拿起
-            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET));  // 目標上方
-            seq.Add(MakeMove(tx, ty, tz));                   // 目標位置
-            seq.Add(new RobotAction { action = "release" }); // 放開
-            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET));  // 完成上方
+            // 巡航高度 = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE，所有水平移動走這個高度
+            float travelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
+
+            // Wrist orientation：pick 時用物件本身的 orientation（source），place 時用目標的
+            //（pick_and_place / move_relative / place_relative 沒改變形狀，通常 src == tgt）
+            string srcOri = p.object_position != null ? p.object_position.orientation : "";
+            string tgtOri = p.target_position != null ? p.target_position.orientation : srcOri;
+
+            seq.Add(MakeMove(ox, oy, travelZ, srcOri));              // ① 到物件上方高空巡航點（純水平）
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri));   // ② 垂直下降到 SAFE_Z（同 x,y）
+            seq.Add(MakeMove(ox, oy, oz, srcOri));                    // ③ 垂直下降到物件（同 x,y）
+            seq.Add(new RobotAction { action = "grasp" });            // ④ 夾取
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri));   // ⑤ 垂直上升
+            seq.Add(MakeMove(ox, oy, travelZ, srcOri));               // ⑥ 垂直上升到巡航高度
+            seq.Add(MakeMove(tx, ty, travelZ, tgtOri));               // ⑦ 純水平飛到目標上空（同時把 wrist 轉到目標 orientation）
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri));   // ⑧ 垂直下降到 SAFE_Z
+            seq.Add(MakeMove(tx, ty, tz, tgtOri));                    // ⑨ 垂直下降到目標
+            seq.Add(new RobotAction { action = "release" });          // ⑩ 放開
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri));   // ⑪ 垂直上升
+            seq.Add(MakeMove(tx, ty, travelZ, tgtOri));               // ⑫ 垂直上升到巡航高度
         }
         else
         {
@@ -216,12 +245,13 @@ public class JsonExecutor : MonoBehaviour
         return seq;
     }
 
-    RobotAction MakeMove(float x, float y, float z)
+    RobotAction MakeMove(float x, float y, float z, string orientation = null)
     {
         return new RobotAction
         {
             action = "move_to",
-            position = new Position { x = x, y = y, z = z }
+            position = new Position { x = x, y = y, z = z },
+            orientation = orientation ?? "",
         };
     }
 
@@ -257,16 +287,29 @@ public class JsonExecutor : MonoBehaviour
             float ty = QR1_Y + step.target_position.y;
             float tz = QR1_Z + step.target_position.z + Z_CORRECTION;
 
-            Debug.Log($"[step {index}] 積木 UR3 座標 ({ox:F4}, {oy:F4}, {oz:F4}) → 擺放 ({tx:F4}, {ty:F4}, {tz:F4})");
+            Debug.Log($"[step {index}] 積木 UR3 座標 ({ox:F4}, {oy:F4}, {oz:F4}) → 擺放 ({tx:F4}, {ty:F4}, {tz:F4})  " +
+                      $"[src:{step.source_position.orientation ?? "-"} → tgt:{step.target_position.orientation ?? "-"}]");
 
-            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 積木上方
-            seq.Add(MakeMove(ox, oy, oz));                   // 積木位置
-            seq.Add(new RobotAction { action = "grasp" });   // 夾取
-            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET));  // 拿起
-            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET));  // 目標上方
-            seq.Add(MakeMove(tx, ty, tz));                   // 目標位置
-            seq.Add(new RobotAction { action = "release" }); // 放開
-            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET));  // 完成上方
+            // 巡航高度，強制走直角軌跡（升 → 平飛 → 降）
+            float travelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
+
+            // pick 時 wrist 對源 orientation（perception 偵測到 domino 的方向）
+            // place 時 wrist 對目標 orientation（PlacementPlanner packing 決定的方向）
+            string srcOri = step.source_position.orientation ?? "";
+            string tgtOri = step.target_position.orientation ?? "";
+
+            seq.Add(MakeMove(ox, oy, travelZ, srcOri));              // ① 積木上方巡航點（純水平飛過來）
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri));   // ② 垂直下降
+            seq.Add(MakeMove(ox, oy, oz, srcOri));                    // ③ 垂直下降到積木
+            seq.Add(new RobotAction { action = "grasp" });            // ④ 夾取
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri));   // ⑤ 垂直上升
+            seq.Add(MakeMove(ox, oy, travelZ, srcOri));               // ⑥ 上升到巡航高度
+            seq.Add(MakeMove(tx, ty, travelZ, tgtOri));               // ⑦ 純水平飛到目標上空（同時 wrist 轉到目標方向）
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri));   // ⑧ 垂直下降
+            seq.Add(MakeMove(tx, ty, tz, tgtOri));                    // ⑨ 垂直下降到目標
+            seq.Add(new RobotAction { action = "release" });          // ⑩ 放開
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri));   // ⑪ 垂直上升
+            seq.Add(MakeMove(tx, ty, travelZ, tgtOri));               // ⑫ 上升到巡航高度（供下一個 step 銜接）
         }
 
         return seq;
@@ -288,41 +331,107 @@ public class JsonExecutor : MonoBehaviour
             yield break;
         }
 
+        // 通知 perception 進入執行狀態 → SceneSyncer 會凍結畫面
+        yield return StartCoroutine(SetPerceptionMode("executing"));
+
+        // ------------------------------------------------------------------
+        // 把整個 action_sequence 打包成一支 URScript program，一次送出。
+        // 因為 UR 的 primary interface（port 30002）每次 SendCommand 都當成
+        // 「新 program」執行，會中斷前一個 movej。以前一步一步送，很容易在
+        // movej 還沒完成時就被下一步（例如 set_digital_out）打斷，導致夾爪
+        // 在錯的位置關閉、抓不到 cube。
+        //
+        // 打包成一支 program 後，URScript 內部會嚴格依序執行：
+        //   movej(...)  ← 阻塞直到手臂到達目標
+        //   set_standard_digital_out(...)  ← 到達後才觸發
+        //   movej(...)  ← 依序繼續
+        // ------------------------------------------------------------------
+
         Debug.Log($"=== 開始執行，共 {plan.action_sequence.Count} 步 ===");
 
-        for (int i = 0; i < plan.action_sequence.Count; i++)
+        int total = plan.action_sequence.Count;
+
+        for (int i = 0; i < total; i++)
         {
             var act = plan.action_sequence[i];
-            Debug.Log($"[{i + 1}/{plan.action_sequence.Count}] {act.action}");
+            int stepNo = i + 1;
 
             if (act.action == "move_to" && act.position != null)
             {
-                string cmd = $"movej(get_inverse_kin(p[{act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}, 0, 3.14, 0], qnear=[0, -1.5708, 1.5708, -1.5708, -1.5708, 0]), a=1.2, v=0.8)";
+                string cmd = BuildMovejLine(act.position.x, act.position.y, act.position.z, act.orientation);
+                string oriTag = string.IsNullOrEmpty(act.orientation) ? "-" : act.orientation;
+                Debug.Log($"[{stepNo}/{total}] move_to ({act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}) ori={oriTag}");
+                Debug.Log($"    SEND: {cmd}");
                 urListener.SendCommand(cmd);
-                Debug.Log("SEND: " + cmd);
                 yield return new WaitForSeconds(3f);
             }
             else if (act.action == "grasp")
             {
+                Debug.Log($"[{stepNo}/{total}] grasp");
+                Debug.Log("    SEND: set_standard_digital_out(4, True)");
                 urListener.SendCommand("set_standard_digital_out(4, True)");
-                Debug.Log("SEND: grasp");
                 yield return new WaitForSeconds(1.5f);
             }
             else if (act.action == "release")
             {
+                Debug.Log($"[{stepNo}/{total}] release");
+                Debug.Log("    SEND: set_standard_digital_out(4, False)");
                 urListener.SendCommand("set_standard_digital_out(4, False)");
-                Debug.Log("SEND: release");
                 yield return new WaitForSeconds(1.5f);
             }
         }
 
-        // 任務結束後回到 home 姿態：手臂縮回、不遮視野，方便下一次感知
-        // 用關節角度而非 TCP 座標，IK 一定解得到、動作最順
+        // 任務結束後回 home
         string homeCmd = "movej([0, -1.5708, 1.5708, -1.5708, -1.5708, 0], a=1.2, v=0.8)";
+        Debug.Log($"[home] SEND: {homeCmd}");
         urListener.SendCommand(homeCmd);
-        Debug.Log("SEND (home): " + homeCmd);
         yield return new WaitForSeconds(3f);
 
+        // 通知 perception 恢復 idle → SceneSyncer 會再抓一次 /scene 更新最終位置
+        yield return StartCoroutine(SetPerceptionMode("idle"));
+
         Debug.Log("=== 任務完成 ===");
+    }
+
+    // 產生單一 movej URScript 行（用 IK 從 TCP pose 求 joint angles）
+    // 實測夾爪安裝方向後，orientation 對 wrist 旋轉的關係：
+    //   "horizontal"             → 預設 pose [0, 3.14, 0]，開口沿 Base X 軸
+    //                              → 適合抓「長軸沿 X 的 horizontal domino」
+    //   "" / null / "vertical"  → 用 pose_trans 加轉 90° 圍 tool Z，開口沿 Base Y 軸
+    //                              → 適合抓 cube（任意方向皆可）或「長軸沿 Y 的 vertical domino」
+    // qnear 的 wrist_3 也跟著調，讓 IK 選到對的解
+    string BuildMovejLine(float x, float y, float z, string orientation)
+    {
+        bool rotate = orientation != "horizontal";
+        string qnear = rotate
+            ? "[0, -1.5708, 1.5708, -1.5708, -1.5708, 1.5708]"
+            : "[0, -1.5708, 1.5708, -1.5708, -1.5708, 0]";
+
+        if (rotate)
+        {
+            // pose_trans(A, B) = A 作用 B（B 在 A 的 local frame）→ 在下降 pose 上再繞 tool Z 轉 90°
+            return $"movej(get_inverse_kin(pose_trans(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], p[0, 0, 0, 0, 0, 1.5708]), qnear={qnear}), a=1.2, v=0.8)";
+        }
+        return $"movej(get_inverse_kin(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], qnear={qnear}), a=1.2, v=0.8)";
+    }
+
+    // 通知 perception_server 現在的執行狀態，讓 SceneSyncer 決定要不要更新 Unity 場景
+    IEnumerator SetPerceptionMode(string mode)
+    {
+        string json = "{\"mode\":\"" + mode + "\"}";
+        byte[] body = Encoding.UTF8.GetBytes(json);
+        using (UnityWebRequest req = new UnityWebRequest(perceptionModeUrl, "POST"))
+        {
+            req.uploadHandler = new UploadHandlerRaw(body);
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.SetRequestHeader("Content-Type", "application/json");
+            req.timeout = 3;
+            yield return req.SendWebRequest();
+
+            if (req.result != UnityWebRequest.Result.Success)
+                Debug.LogWarning($"[perception mode] 設 {mode} 失敗：{req.error}");
+            else
+                Debug.Log($"[perception mode] → {mode}");
+        }
     }
 }
