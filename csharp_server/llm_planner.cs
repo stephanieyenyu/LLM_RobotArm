@@ -88,7 +88,7 @@ public class LlmPlanner
 
                      每一列長度必須完全一致。
 
-                     bitmap 最大不可超過 12 × 12。
+                     bitmap 最大不可超過 5 × 5。
 
                      請直接生成 bitmap，不可以假設 C# 已經知道 H 或愛心長什麼樣。
 
