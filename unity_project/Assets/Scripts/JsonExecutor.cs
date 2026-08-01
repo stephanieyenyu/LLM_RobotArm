@@ -25,8 +25,9 @@ public class NamedPosition
 {
     public string name;
     public float x, y, z;
-    public string shape;         // "cube" / "domino"（未提供時為空字串）
-    public string orientation;   // "horizontal" / "vertical" / ""（cube 或未提供）
+    public string shape;
+    public string orientation;
+    public float skew_deg;
 }
 
 [System.Serializable]
@@ -35,10 +36,8 @@ public class RobotAction
     public string action;
     public Position position;
     public JointAngles joints;
-    // move_to 專用：wrist 旋轉依據
-    //   ""/"vertical"    → 預設 pose (0, 3.14, 0)，夾爪開口沿 Base X
-    //   "horizontal"     → 加轉 90° 圍 tool Z，夾爪開口沿 Base Y
     public string orientation;
+    public float skew_deg;
 }
 
 [System.Serializable]
@@ -100,6 +99,7 @@ public class JsonExecutor : MonoBehaviour
 
     private URPackageListener urListener;
     private RobotPlan plan;
+    private const float SKEW_SIGN = 1f; 
 
     void Start()
     {
@@ -223,19 +223,21 @@ public class JsonExecutor : MonoBehaviour
             //（pick_and_place / move_relative / place_relative 沒改變形狀，通常 src == tgt）
             string srcOri = p.object_position != null ? p.object_position.orientation : "";
             string tgtOri = p.target_position != null ? p.target_position.orientation : srcOri;
+            float srcSkew = p.object_position != null ? p.object_position.skew_deg : 0f;
+            float tgtSkew = 0f; 
 
-            seq.Add(MakeMove(ox, oy, travelZ, srcOri));              // ① 到物件上方高空巡航點（純水平）
-            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri));   // ② 垂直下降到 SAFE_Z（同 x,y）
-            seq.Add(MakeMove(ox, oy, oz, srcOri));                    // ③ 垂直下降到物件（同 x,y）
-            seq.Add(new RobotAction { action = "grasp" });            // ④ 夾取
-            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri));   // ⑤ 垂直上升
-            seq.Add(MakeMove(ox, oy, travelZ, srcOri));               // ⑥ 垂直上升到巡航高度
-            seq.Add(MakeMove(tx, ty, travelZ, tgtOri));               // ⑦ 純水平飛到目標上空（同時把 wrist 轉到目標 orientation）
-            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri));   // ⑧ 垂直下降到 SAFE_Z
-            seq.Add(MakeMove(tx, ty, tz, tgtOri));                    // ⑨ 垂直下降到目標
-            seq.Add(new RobotAction { action = "release" });          // ⑩ 放開
-            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri));   // ⑪ 垂直上升
-            seq.Add(MakeMove(tx, ty, travelZ, tgtOri));               // ⑫ 垂直上升到巡航高度
+            seq.Add(MakeMove(ox, oy, travelZ, srcOri, srcSkew));
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri, srcSkew));
+            seq.Add(MakeMove(ox, oy, oz, srcOri, srcSkew));
+            seq.Add(new RobotAction { action = "grasp" });
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri, srcSkew));
+            seq.Add(MakeMove(ox, oy, travelZ, srcOri, srcSkew));
+            seq.Add(MakeMove(tx, ty, travelZ, tgtOri, tgtSkew));
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri, tgtSkew));
+            seq.Add(MakeMove(tx, ty, tz, tgtOri, tgtSkew));
+            seq.Add(new RobotAction { action = "release" });
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri, tgtSkew));
+            seq.Add(MakeMove(tx, ty, travelZ, tgtOri, tgtSkew));
         }
         else
         {
@@ -252,6 +254,7 @@ public class JsonExecutor : MonoBehaviour
             action = "move_to",
             position = new Position { x = x, y = y, z = z },
             orientation = orientation ?? "",
+            skew_deg = skewDeg,
         };
     }
 
@@ -260,58 +263,56 @@ public class JsonExecutor : MonoBehaviour
     List<RobotAction> ExpandArrangePattern(RobotPlan p)
     {
         var seq = new List<RobotAction>();
-
+    
         if (p.placement_steps == null || p.placement_steps.Count == 0)
         {
             Debug.LogWarning("arrange_pattern 沒有 placement_steps");
             return seq;
         }
-
+    
         int index = 0;
         foreach (var step in p.placement_steps)
         {
             index++;
-
+    
             if (step.source_position == null || step.target_position == null)
             {
                 Debug.LogWarning($"第 {index} 步 placement_step 缺 source 或 target，跳過");
                 continue;
             }
-
-            // QR 平面座標 → UR3 base 座標，比照現有 ExpandAction 的公式
+    
             float ox = QR1_X + step.source_position.x;
             float oy = QR1_Y + step.source_position.y;
             float oz = QR1_Z + step.source_position.z + Z_CORRECTION;
-
+    
             float tx = QR1_X + step.target_position.x;
             float ty = QR1_Y + step.target_position.y;
             float tz = QR1_Z + step.target_position.z + Z_CORRECTION;
-
-            Debug.Log($"[step {index}] 積木 UR3 座標 ({ox:F4}, {oy:F4}, {oz:F4}) → 擺放 ({tx:F4}, {ty:F4}, {tz:F4})  " +
-                      $"[src:{step.source_position.orientation ?? "-"} → tgt:{step.target_position.orientation ?? "-"}]");
-
-            // 巡航高度，強制走直角軌跡（升 → 平飛 → 降）
-            float travelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
-
-            // pick 時 wrist 對源 orientation（perception 偵測到 domino 的方向）
-            // place 時 wrist 對目標 orientation（PlacementPlanner packing 決定的方向）
+    
             string srcOri = step.source_position.orientation ?? "";
             string tgtOri = step.target_position.orientation ?? "";
-
-            seq.Add(MakeMove(ox, oy, travelZ, srcOri));              // ① 積木上方巡航點（純水平飛過來）
-            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri));   // ② 垂直下降
-            seq.Add(MakeMove(ox, oy, oz, srcOri));                    // ③ 垂直下降到積木
-            seq.Add(new RobotAction { action = "grasp" });            // ④ 夾取
-            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri));   // ⑤ 垂直上升
-            seq.Add(MakeMove(ox, oy, travelZ, srcOri));               // ⑥ 上升到巡航高度
-            seq.Add(MakeMove(tx, ty, travelZ, tgtOri));               // ⑦ 純水平飛到目標上空（同時 wrist 轉到目標方向）
-            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri));   // ⑧ 垂直下降
-            seq.Add(MakeMove(tx, ty, tz, tgtOri));                    // ⑨ 垂直下降到目標
-            seq.Add(new RobotAction { action = "release" });          // ⑩ 放開
-            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri));   // ⑪ 垂直上升
-            seq.Add(MakeMove(tx, ty, travelZ, tgtOri));               // ⑫ 上升到巡航高度（供下一個 step 銜接）
+            float srcSkew = step.source_position.skew_deg;
+            float tgtSkew = step.target_position.skew_deg;
+    
+            Debug.Log($"[step {index}] 積木 UR3 座標 ({ox:F4}, {oy:F4}, {oz:F4}) → 擺放 ({tx:F4}, {ty:F4}, {tz:F4})  " +
+                      $"[src:{step.source_position.orientation ?? "-"} skew={srcSkew:F1}° → tgt:{step.target_position.orientation ?? "-"}]");
+    
+            float travelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
+    
+            seq.Add(MakeMove(ox, oy, travelZ, srcOri, srcSkew));
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri, srcSkew));
+            seq.Add(MakeMove(ox, oy, oz, srcOri, srcSkew));
+            seq.Add(new RobotAction { action = "grasp" });
+            seq.Add(MakeMove(ox, oy, oz + SAFE_Z_OFFSET, srcOri, srcSkew));
+            seq.Add(MakeMove(ox, oy, travelZ, srcOri, srcSkew));
+            seq.Add(MakeMove(tx, ty, travelZ, tgtOri, tgtSkew));
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri, tgtSkew));
+            seq.Add(MakeMove(tx, ty, tz, tgtOri, tgtSkew));
+            seq.Add(new RobotAction { action = "release" });
+            seq.Add(MakeMove(tx, ty, tz + SAFE_Z_OFFSET, tgtOri, tgtSkew));
+            seq.Add(MakeMove(tx, ty, travelZ, tgtOri, tgtSkew));
         }
-
+    
         return seq;
     }
 
@@ -358,7 +359,7 @@ public class JsonExecutor : MonoBehaviour
 
             if (act.action == "move_to" && act.position != null)
             {
-                string cmd = BuildMovejLine(act.position.x, act.position.y, act.position.z, act.orientation);
+                string cmd = BuildMovejLine(act.position.x, act.position.y, act.position.z, act.orientation, act.skew_deg);
                 string oriTag = string.IsNullOrEmpty(act.orientation) ? "-" : act.orientation;
                 Debug.Log($"[{stepNo}/{total}] move_to ({act.position.x:F4}, {act.position.y:F4}, {act.position.z:F4}) ori={oriTag}");
                 Debug.Log($"    SEND: {cmd}");
@@ -400,21 +401,23 @@ public class JsonExecutor : MonoBehaviour
     //   "" / null / "vertical"  → 用 pose_trans 加轉 90° 圍 tool Z，開口沿 Base Y 軸
     //                              → 適合抓 cube（任意方向皆可）或「長軸沿 Y 的 vertical domino」
     // qnear 的 wrist_3 也跟著調，讓 IK 選到對的解
-    string BuildMovejLine(float x, float y, float z, string orientation)
+    string BuildMovejLine(float x, float y, float z, string orientation, float skewDeg = 0f)
     {
         bool rotate = orientation != "horizontal";
+    
+        float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
+        float totalRad = totalDeg * Mathf.Deg2Rad;
+    
         string qnear = rotate
             ? "[0, -1.5708, 1.5708, -1.5708, -1.5708, 1.5708]"
             : "[0, -1.5708, 1.5708, -1.5708, -1.5708, 0]";
-
-        if (rotate)
+    
+        if (Mathf.Abs(totalDeg) > 0.01f)
         {
-            // pose_trans(A, B) = A 作用 B（B 在 A 的 local frame）→ 在下降 pose 上再繞 tool Z 轉 90°
-            return $"movej(get_inverse_kin(pose_trans(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], p[0, 0, 0, 0, 0, 1.5708]), qnear={qnear}), a=1.2, v=0.8)";
+            return $"movej(get_inverse_kin(pose_trans(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], p[0, 0, 0, 0, 0, {totalRad:F4}]), qnear={qnear}), a=1.2, v=0.8)";
         }
         return $"movej(get_inverse_kin(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], qnear={qnear}), a=1.2, v=0.8)";
     }
-
     // 通知 perception_server 現在的執行狀態，讓 SceneSyncer 決定要不要更新 Unity 場景
     IEnumerator SetPerceptionMode(string mode)
     {
