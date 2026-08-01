@@ -69,28 +69,18 @@ public class LlmPlanner
                        pattern（圖案描述文字，例如 "H"、"Heart"、"Arrow"、"OpenAI"）
                        block_color（"yellow" 或 "black"）
                        bitmap（二維圖案，字串陣列）
-                   - bitmap 規則：
-                     - 是字串陣列
-                     - 每一列只能包含 0 或 1（1 = 放積木、0 = 留白）
-                     - 每一列長度必須完全一致
-                     - bitmap 最大不可超過 5 × 5（超過會被 PlacementPlanner 拒絕）
-                     - 請直接生成 bitmap，不可以假設 C# 已經知道 H 或愛心長什麼樣
-                   - block_color 只能是 "yellow" 或 "black"；未指定時預設 "yellow"
-                   - object、target、reference_object、direction、distance_cm 全部必須是 null
-
-                   例如「用黑色積木排 H」→
-                   {
-                     "action": "arrange_pattern",
-                     "pattern": "H",
-                     "block_color": "black",
-                     "bitmap": [
-                       "10001",
-                       "10001",
-                       "11111",
-                       "10001",
-                       "10001"
-                     ]
-                   }
+                    - bitmap 規則：
+                    - 是字串陣列
+                    - 每一列只能包含 0 或 1（1 = 該格需要被積木覆蓋、0 = 留白）
+                    - 每一列長度必須完全一致
+                    - LLM 必須依照圖案複雜度與可用積木數量，自行選擇合適的 rows × columns
+                    - bitmap 必須在系統允許的最大範圍內，例如最大不可超過 12 × 12
+                    - 優先使用能清楚表達圖案的最小矩陣，避免產生過大的圖案
+                    - 1 的總數不可超過可用積木可覆蓋的格數
+                    - cube 可覆蓋 1 格，domino 可覆蓋相鄰的 2 格
+                    - 請直接生成 bitmap，不可以假設 C# 已經知道 H 或愛心長什麼樣
+                    - block_color 只能是 "yellow" 或 "black"；未指定時預設 "yellow"
+                    - object、target、reference_object、direction、distance_cm 全部必須是 null
                 5. error
                    - 表示指令無法執行（見下方「何時回傳 error」）
                    - object、target、reference_object、direction、distance_cm、pattern、block_color、bitmap 全部為 null
