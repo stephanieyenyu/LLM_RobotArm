@@ -20,14 +20,15 @@ public static class PlacementPlanner
     // 每一格的實際大小 = 4 cm（2.5 cm 立方體 + 1.5 cm 間隙）。
     // Domino（5 cm 長）跨相鄰 2 格（8 cm span），實體只佔中間 5 cm，
     // 兩端各留 1.5 cm 不會撞到隔壁 piece。
-    private const double CELL_SIZE = 0.05;
+    private const double CELL_SIZE = 0.055;
 
-    // 積木放到桌面上時的頂面 Z（2.5 cm 立方體的頂面高度）。
-    private const double DEFAULT_BLOCK_Z = 0.015;
+    // 目標 Z 直接沿用 source（perception 實測深度）的 Z ——
+    // 同種積木高度應該一致，「拿多高、放多高」比硬編數值準。
+    // 在 Step 6 的 pairing 迴圈裡 target.Z = nearest.Z。
 
     // 擺放區可用格數上限（5 × 5）。超出的 pattern 會被拒絕。
-    private const int MAX_GRID_ROWS = 5;
-    private const int MAX_GRID_COLS = 5;
+    private const int MAX_GRID_ROWS = 6;
+    private const int MAX_GRID_COLS = 6;
 
     // ------------------------------------------------------------------
     // 對外資料類別
@@ -136,6 +137,10 @@ public static class PlacementPlanner
             List<SceneObject> pool = piece.Shape == "domino" ? remainingDominos : remainingCubes;
             SceneObject nearest = pool.OrderBy(s => Dist2DSquared(s, target)).First();
 
+            // Target Z 用 source 的實測深度（同種積木高度一致）
+            // 這樣手臂放下的高度會跟拿起來時完全一樣，不用寫死常數
+            target.Z = nearest.Z;
+
             steps.Add(new PlacementStep
             {
                 SourcePosition = nearest,          // 帶著 nearest.Orientation（pick 時 wrist 角度依據）
@@ -242,7 +247,7 @@ public static class PlacementPlanner
             Name = $"grid_{p.Shape}_r{p.Row}_c{p.Col}",
             X = centerX,
             Y = centerY,
-            Z = DEFAULT_BLOCK_Z,
+            Z = 0.0,                        // 佔位；pairing 迴圈會用 source.Z 覆蓋
             Shape = p.Shape,
             Orientation = p.Orientation,
         };

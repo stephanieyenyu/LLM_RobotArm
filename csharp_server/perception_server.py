@@ -37,11 +37,11 @@ BASE_DIR = Path(__file__).resolve().parent
 # --- Intel RealSense D435i ---
 # USB 2.1 上限：depth 480x270 + color 640x480 @ 6fps（其他組合啟動失敗）
 # 換到 USB 3 之後可以升到 1280x720
-CAMERA_WIDTH = 640              # color 解析度
-CAMERA_HEIGHT = 480
-DEPTH_WIDTH = 480               # depth 解析度（會 align 到 color 座標）
-DEPTH_HEIGHT = 270
-CAMERA_FPS = 6
+CAMERA_WIDTH = 1280              # color 解析度
+CAMERA_HEIGHT = 720
+DEPTH_WIDTH = 848               # depth 解析度（會 align 到 color 座標）
+DEPTH_HEIGHT = 480
+CAMERA_FPS = 30
 CAMERA_BRIGHTNESS_MIN = 15.0
 
 DETECT_INTERVAL_SEC = 0.2       # 目標偵測間隔（0.2s = 5 FPS）
@@ -68,7 +68,7 @@ COCO_TARGETS = {
 # --- ArUco 相關 ---
 ARUCO_DICT_TYPE = cv2.aruco.DICT_4X4_50
 ARUCO_ID_TO_NAME = {1: "QR1", 2: "QR2", 3: "QR3", 4: "QR4"}
-QR_MASK_DILATION_PX = 15        # QR bbox 向外擴幾個像素，避免邊緣殘影誤判成立方體
+QR_MASK_DILATION_PX = 30        # QR bbox 向外擴幾個像素，避免邊緣殘影誤判成立方體（1280x720 用 30；640x480 用 15）
 
 # --- HSV 立方體遮罩參數 ---
 YELLOW_HSV_LOW = np.array([18, 100, 100])
@@ -80,12 +80,12 @@ BLACK_HSV_HIGH = np.array([180, 80, 60])
 #   cube   = 2.5 × 2.5 × 2.5 cm（正方形俯視）
 #   domino = 5 × 2.5 × 2.5 cm（長方形俯視，1:2 比例）
 # 用 minAreaRect 的長短邊比 + 面積雙門檻分類
-CUBE_MIN_AREA_PX = 150          # 2.5 cm cube 在 640x480 下約 20x20 px ≈ 400
-CUBE_MAX_AREA_PX = 1500
+CUBE_MIN_AREA_PX = 600          # 2.5 cm cube 在 1280x720 下約 40x40 px ≈ 1600（640x480 是 150）
+CUBE_MAX_AREA_PX = 6000
 CUBE_RATIO_MAX = 1.35           # 長短邊比 <= 這個 → 視為 cube
 
-DOMINO_MIN_AREA_PX = 350        # domino 面積約 cube 的 2 倍
-DOMINO_MAX_AREA_PX = 3000
+DOMINO_MIN_AREA_PX = 1400       # domino 面積約 cube 的 2 倍
+DOMINO_MAX_AREA_PX = 12000
 DOMINO_RATIO_MIN = 1.65         # 長短邊比在這區間 → 視為 domino
 DOMINO_RATIO_MAX = 2.40
 DOMINO_ORIENTATION_TOL_DEG = 22.5   # 長軸偏離 X/Y 軸多少度內視為對齊；超過則當「斜擺」拒絕

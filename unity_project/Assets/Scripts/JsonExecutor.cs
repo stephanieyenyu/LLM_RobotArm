@@ -82,8 +82,8 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
-    private const float QR1_X = -0.308330f;
-    private const float QR1_Y = -0.405240f;
+    private const float QR1_X = -0.31404f;
+    private const float QR1_Y = -0.40606f;
     private const float QR1_Z = 0.0345f;   //TCP_Z(0.05974) - 0.05
 
     // 工作時的安全高度（在物件上方多少公尺）
@@ -382,7 +382,7 @@ public class JsonExecutor : MonoBehaviour
         }
 
         // 任務結束後回 home
-        string homeCmd = "movej([0, -1.5708, 1.5708, -1.5708, -1.5708, 0], a=1.2, v=0.8)";
+        string homeCmd = "movej([0, -1.5708, 0, -1.5708, 0, 0], a=1.2, v=0.8)";
         Debug.Log($"[home] SEND: {homeCmd}");
         urListener.SendCommand(homeCmd);
         yield return new WaitForSeconds(3f);
