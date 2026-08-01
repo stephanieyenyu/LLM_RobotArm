@@ -280,6 +280,7 @@ public class LlmPlanner
                 X = targetObj.X,
                 Y = targetObj.Y,
                 Z = targetObj.Z + objectPosition.Z,
+                SkewDeg = objectPosition.SkewDeg,
             };
 
             return new RobotPlan
@@ -411,7 +412,8 @@ public class LlmPlanner
             Name = original.Name + "_target",
             X = x,
             Y = y,
-            Z = z
+            Z = z,
+            SkewDeg = original.SkewDeg,
         };
     }
 
