@@ -81,8 +81,8 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 在 UR3 基座座標系的位置（Teach Pendant 量測值，單位公尺）
     // 這是手臂 TCP 移到 QR1 正上方 5cm 時的座標
-    private const float QR1_X = -0.31404f;
-    private const float QR1_Y = -0.40606f;
+    private const float QR1_X = -0.31372f;
+    private const float QR1_Y = -0.41118f;
     private const float QR1_Z = 0.0345f;   //TCP_Z(0.05974) - 0.05
 
     // 工作時的安全高度（在物件上方多少公尺）
@@ -247,7 +247,7 @@ public class JsonExecutor : MonoBehaviour
         return seq;
     }
 
-    RobotAction MakeMove(float x, float y, float z, string orientation = null)
+    RobotAction MakeMove(float x, float y, float z, string orientation = null, float skewDeg = 0f)
     {
         return new RobotAction
         {

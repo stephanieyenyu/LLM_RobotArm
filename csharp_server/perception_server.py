@@ -19,6 +19,7 @@ Endpoint：
 
 import threading
 import time
+from collections import Counter, deque
 from pathlib import Path
 
 import cv2
@@ -91,6 +92,12 @@ DOMINO_RATIO_MAX = 2.40
 DOMINO_ORIENTATION_TOL_DEG = 22.5   # 長軸偏離 X/Y 軸多少度內視為對齊；超過則當「斜擺」拒絕
 
 SOLIDITY_MIN = 0.80             # 小物件輪廓比較毛，稍微放寬
+
+# --- 多幀穩定濾波（減少 orientation / 面積門檻邊緣物件的閃爍）---
+STABILITY_WINDOW = 5            # 檢查過去這麼多幀
+STABILITY_MIN_HITS = 3          # 至少在 N 幀中出現這麼多次才回報
+STABILITY_MATCH_PX = 25         # 中心點差 < 這個像素就當作「同一顆物件」
+_recent_frames = deque(maxlen=STABILITY_WINDOW)
 
 # --- 跨源去重 ---
 IOU_DEDUPE_THRESHOLD = 0.5
@@ -296,14 +303,22 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
         elif (DOMINO_RATIO_MIN <= ratio <= DOMINO_RATIO_MAX
               and DOMINO_MIN_AREA_PX <= area <= DOMINO_MAX_AREA_PX):
             shape = "domino"
+            # 長軸角度 normalize 到 [0, 180)：0=沿 X（水平）、90=沿 Y（垂直）
             long_angle = angle if rw >= rh else angle + 90
             long_angle = long_angle % 180
-            if long_angle < DOMINO_ORIENTATION_TOL_DEG or long_angle > (180 - DOMINO_ORIENTATION_TOL_DEG):
+
+            # 不再拒絕斜擺 domino——像 cube 一樣算出跟最近象限的偏差角，
+            # orientation 表達「哪個象限最近」，skew_deg 補償實際傾斜。
+            #   long_angle in [0, 45) 或 [135, 180) → 較接近水平（0°）
+            #   long_angle in [45, 135)              → 較接近垂直（90°）
+            if long_angle < 45 or long_angle >= 135:
                 orientation = "horizontal"
-            elif abs(long_angle - 90) < DOMINO_ORIENTATION_TOL_DEG:
-                orientation = "vertical"
+                raw_skew = long_angle if long_angle < 45 else long_angle - 180
             else:
-                continue
+                orientation = "vertical"
+                raw_skew = long_angle - 90
+
+            skew_deg = 0.0 if abs(raw_skew) < CUBE_SKEW_TOL_DEG else round(raw_skew, 2)
         else:
             continue
 
@@ -593,16 +608,40 @@ def compute_world_positions(objects, qrcodes, image_width, image_height, depth_i
     camera_matrix = build_camera_matrix(image_width, image_height)
 
     for obj in objects:
-        # 讀深度：在 bbox 中心像素周圍取 3px patch、取 25 分位數
-        #   - 一致性：用同一個像素做深度讀跟反投影，不會像舊版讀 bbox 10% 那樣拿到邊緣像素卻套在中心點
-        #   - 偏向頂面：25% 分位數比中位數更靠近相機（頂面），比 10% 又不那麼容易誤中噪點
-        #   - 傾斜相機下也 OK：中心像素通常還是打在頂面上
+        # 讀深度：中心像素周圍 3px patch、25 分位數（偏向頂面）
         depth_m = (
             read_depth_meters(depth_image, obj["center_pixel"], patch_radius=3, percentile=25)
             if depth_image is not None else None
         )
-        obj_camera = deproject_pixel_to_camera(obj["center_pixel"], depth_m) if depth_m else None
 
+        shape = obj.get("shape")
+        if shape in ("cube", "domino"):
+            # 已知形狀：X/Y 用射線 + 標稱 2.5 cm 平面（避免 depth 噪點傳染到 XY 定位）；
+            # Z 仍從 depth 讀（動態高度，維持「不寫死高度」的設計）
+            xy_pos = project_pixel_to_workspace(
+                obj["center_pixel"], camera_matrix, frame,
+                obj_top_z_m=OBJECT_HEIGHT_OFFSET_M,
+            )
+            if xy_pos is None:
+                continue
+
+            local_z = OBJECT_HEIGHT_OFFSET_M
+            if depth_m is not None:
+                obj_camera = deproject_pixel_to_camera(obj["center_pixel"], depth_m)
+                if obj_camera is not None:
+                    rel = obj_camera - frame["origin"]
+                    local_z = float(np.dot(rel, frame["normal"]))
+
+            obj["position"] = {
+                "x": xy_pos["x"],                    # 射線幾何（穩）
+                "y": xy_pos["y"],
+                "z": round(local_z, 6),              # depth 實測（動態）
+                "source": "ray_xy+depth_z",
+            }
+            continue
+
+        # 未知形狀（cup、bottle 等，沒有固定高度）→ 全部從 depth 算
+        obj_camera = deproject_pixel_to_camera(obj["center_pixel"], depth_m) if depth_m else None
         if obj_camera is not None:
             rel = obj_camera - frame["origin"]
             local_x = float(np.dot(rel, frame["x_axis"]))
@@ -615,8 +654,6 @@ def compute_world_positions(objects, qrcodes, image_width, image_height, depth_i
                 "source": "depth",
             }
         else:
-            # depth 完全讀不到（極近像素全 0）→ fall back 到「射線 + 已知高度」
-            # 高度用 OBJECT_HEIGHT_OFFSET_M 只是為了給個合理近似值，實務上很少走到這
             pos = project_pixel_to_workspace(
                 obj["center_pixel"], camera_matrix, frame,
                 obj_top_z_m=OBJECT_HEIGHT_OFFSET_M,
@@ -687,6 +724,53 @@ def cross_source_dedupe(detections, iou_threshold=IOU_DEDUPE_THRESHOLD):
     return kept
 
 
+def stabilize_detections(current):
+    """
+    多幀穩定濾波：只回報過去 STABILITY_WINDOW 幀內出現 ≥ STABILITY_MIN_HITS 次的物件。
+    對每個穩定物件，位置 / skew 用歷史平均、orientation 用歷史多數，減少邊緣像素造成的閃爍。
+
+    副作用：新放上桌的物件會慢 (WINDOW - MIN_HITS + 1) 幀才被回報；
+    拿走的物件會多顯示 (WINDOW - MIN_HITS + 1) 幀後才消失。
+    """
+    _recent_frames.append(current)
+
+    # buffer 還沒累積夠 → 直接回原始 detections（不然一啟動什麼都看不到）
+    if len(_recent_frames) < STABILITY_MIN_HITS:
+        return current
+
+    stable = []
+    for det in current:
+        # 找過去所有幀中「同 name + 中心點接近」的匹配
+        matches = []
+        cx, cy = det["center_pixel"]
+        for frame_dets in _recent_frames:
+            for other in frame_dets:
+                if other["name"] != det["name"]:
+                    continue
+                ocx, ocy = other["center_pixel"]
+                if abs(ocx - cx) < STABILITY_MATCH_PX and abs(ocy - cy) < STABILITY_MATCH_PX:
+                    matches.append(other)
+                    break                    # 每幀最多算 1 次
+
+        if len(matches) < STABILITY_MIN_HITS:
+            continue
+
+        # 平均位置 / skew、多數 orientation
+        avg_cx = sum(m["center_pixel"][0] for m in matches) / len(matches)
+        avg_cy = sum(m["center_pixel"][1] for m in matches) / len(matches)
+        avg_skew = sum(m.get("skew_deg", 0.0) for m in matches) / len(matches)
+        orientations = [m.get("orientation") for m in matches]
+        mode_orient = Counter(orientations).most_common(1)[0][0]
+
+        smoothed = dict(det)
+        smoothed["center_pixel"] = [round(avg_cx, 2), round(avg_cy, 2)]
+        smoothed["skew_deg"] = round(avg_skew, 2)
+        smoothed["orientation"] = mode_orient
+        stable.append(smoothed)
+
+    return stable
+
+
 def detect_all(image_bgr, depth_image=None):
     """對單一幀跑完整偵測管線；QR 先偵測、遮蓋後再跑 HSV 立方體。
     depth_image (uint16 mm, 已 align 到 color 座標) 可選；有就給物件真實高度。"""
@@ -707,6 +791,9 @@ def detect_all(image_bgr, depth_image=None):
     cube_dets = filter_by_workspace(cube_dets, workspace_polygon)
 
     all_dets = cross_source_dedupe(yolo_dets + cube_dets)
+
+    # 多幀穩定濾波：過濾掉閃爍的偵測、平均位置/skew/orientation
+    all_dets = stabilize_detections(all_dets)
 
     # Part B：算 3D 世界座標（QR1 為原點的工作平面局部座標，單位公尺）
     # 有深度時 z 是真實高度；沒有時 z 用 OBJECT_HEIGHT_OFFSET_M。
