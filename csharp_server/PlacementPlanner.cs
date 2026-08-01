@@ -26,8 +26,8 @@ public static class PlacementPlanner
     private const double DEFAULT_BLOCK_Z = 0.015;
 
     // 擺放區可用格數上限（5 × 5）。超出的 pattern 會被拒絕。
-    private const int MAX_GRID_ROWS = 5;
-    private const int MAX_GRID_COLS = 5;
+    private const int MAX_GRID_ROWS = 8;
+    private const int MAX_GRID_COLS = 8;
 
     // ------------------------------------------------------------------
     // 對外資料類別
