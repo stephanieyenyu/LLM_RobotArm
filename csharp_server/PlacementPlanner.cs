@@ -20,7 +20,7 @@ public static class PlacementPlanner
     // 每一格的實際大小 = 4 cm（2.5 cm 立方體 + 1.5 cm 間隙）。
     // Domino（5 cm 長）跨相鄰 2 格（8 cm span），實體只佔中間 5 cm，
     // 兩端各留 1.5 cm 不會撞到隔壁 piece。
-    private const double CELL_SIZE = 0.05;
+    private const double CELL_SIZE = 0.055
 
     // 積木放到桌面上時的頂面 Z（2.5 cm 立方體的頂面高度）。
     private const double DEFAULT_BLOCK_Z = 0.015;
