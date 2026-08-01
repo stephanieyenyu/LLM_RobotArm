@@ -101,6 +101,8 @@ ROI_MIN_QRS = 3
 # 把工作區多邊形往外擴（正值）或往內縮（負值）幾個像素
 ROI_MARGIN_PX = 10
 
+CUBE_SKEW_TOL_DEG = 6.0
+
 # --- Part B: QR + solvePnP 3D 座標對應 ---
 QR_SIZE_M = 0.073                    # ArUco 實際邊長，公尺
 OBJECT_HEIGHT_OFFSET_M = 0.025       # 2.5 cm 立方體頂面；只在深度讀失敗時當 fallback
@@ -282,25 +284,27 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
         short_side = min(rw, rh)
         ratio = long_side / short_side
 
-        # 分類：ratio + 面積雙門檻
+        skew_deg = 0.0
+
         if ratio <= CUBE_RATIO_MAX and CUBE_MIN_AREA_PX <= area <= CUBE_MAX_AREA_PX:
             shape = "cube"
+            raw_skew = angle % 90
+            if raw_skew > 45:
+                raw_skew -= 90
+            skew_deg = 0.0 if abs(raw_skew) < CUBE_SKEW_TOL_DEG else round(raw_skew, 2)
             orientation = None
         elif (DOMINO_RATIO_MIN <= ratio <= DOMINO_RATIO_MAX
               and DOMINO_MIN_AREA_PX <= area <= DOMINO_MAX_AREA_PX):
             shape = "domino"
-            # minAreaRect 的 angle 定義隨 OpenCV 版本不同，
-            # 統一成「長邊在 image 座標裡的角度」normalize 到 [0, 180)
             long_angle = angle if rw >= rh else angle + 90
             long_angle = long_angle % 180
             if long_angle < DOMINO_ORIENTATION_TOL_DEG or long_angle > (180 - DOMINO_ORIENTATION_TOL_DEG):
-                orientation = "horizontal"       # 長軸 ≈ image X ≈ QR X（QR1→QR2）
+                orientation = "horizontal"
             elif abs(long_angle - 90) < DOMINO_ORIENTATION_TOL_DEG:
-                orientation = "vertical"         # 長軸 ≈ image Y ≈ QR Y（QR1→QR3）
+                orientation = "vertical"
             else:
-                continue                         # 斜擺，暫不處理
+                continue
         else:
-            # ratio + 面積對不上任何 shape → 丟掉
             continue
 
         # 軸對齊 bbox 保留給 depth 讀取跟 workspace polygon 判定用，跟原本一致
@@ -315,6 +319,7 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
             "source": "cube_hsv",
             "shape": shape,
             "orientation": orientation,
+            "skew_deg": skew_deg,
         })
     return detections
 

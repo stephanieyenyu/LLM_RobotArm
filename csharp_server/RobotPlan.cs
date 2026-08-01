@@ -15,12 +15,14 @@ public class SceneObject
     [JsonPropertyName("z")]
     public double Z { get; set; }
 
-    // 形狀資訊（cube 為預設；domino 才會有 orientation）
     [JsonPropertyName("shape")]
-    public string Shape { get; set; } = "cube";          // "cube" | "domino"
+    public string Shape { get; set; } = "cube";
 
     [JsonPropertyName("orientation")]
-    public string? Orientation { get; set; }              // null / "horizontal" / "vertical"
+    public string? Orientation { get; set; }
+
+    [JsonPropertyName("skew_deg")]
+    public double SkewDeg { get; set; }
 }
 
 public class PlacementStep

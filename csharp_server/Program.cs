@@ -104,9 +104,9 @@ while (true)
                         Z = obj.Position!.Z,
                         Shape = string.IsNullOrEmpty(obj.Shape) ? "cube" : obj.Shape,
                         Orientation = obj.Orientation,
+                        SkewDeg = obj.SkewDeg,
                     })
                     .ToList();
-
                 if (sceneObjects.Count == 0)
                 {
                     Console.WriteLine("[perception] 場景中沒有帶有效座標的物件（QR1-3 沒偵測到？）");
@@ -114,10 +114,11 @@ while (true)
                 }
 
                 Console.WriteLine($"當下場景：{sceneObjects.Count} 個物件");
-                foreach (var o in sceneObjects)
-                {
+               foreach (var o in sceneObjects)
+               {
                     string oriTag = string.IsNullOrEmpty(o.Orientation) ? "" : $" [{o.Orientation}]";
-                    Console.WriteLine($"  {o.Name}  x={o.X:F3}  y={o.Y:F3}  z={o.Z:F3}  shape={o.Shape}{oriTag}");
+                    string skewTag = o.SkewDeg != 0 ? $" skew={o.SkewDeg:F1}°" : "";
+                    Console.WriteLine($"  {o.Name}  x={o.X:F3}  y={o.Y:F3}  z={o.Z:F3}  shape={o.Shape}{oriTag}{skewTag}");
                 }
 
                 RobotPlan plan = await planner.GeneratePlanAsync(userCommand, sceneObjects);
@@ -184,14 +185,15 @@ public class WorldObject
     [JsonPropertyName("position")]
     public WorldPos? Position { get; set; }
 
-    // 由 perception_server 依 HSV + minAreaRect 判定
     [JsonPropertyName("shape")]
-    public string? Shape { get; set; }              // "cube" | "domino"
+    public string? Shape { get; set; }
 
     [JsonPropertyName("orientation")]
-    public string? Orientation { get; set; }         // null / "horizontal" / "vertical"
-}
+    public string? Orientation { get; set; }
 
+    [JsonPropertyName("skew_deg")]
+    public double SkewDeg { get; set; }
+}
 public class WorldPos
 {
     [JsonPropertyName("x")]

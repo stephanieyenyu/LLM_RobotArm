@@ -74,7 +74,7 @@ public class LlmPlanner
                     - 每一列只能包含 0 或 1（1 = 該格需要被積木覆蓋、0 = 留白）
                     - 每一列長度必須完全一致
                     - LLM 必須依照圖案複雜度與可用積木數量，自行選擇合適的 rows × columns
-                    - bitmap 必須在系統允許的最大範圍內
+                    - bitmap 必須在系統允許的最大範圍內，例如最大不可超過 6 × 6
                     - 1 的總數不可超過可用積木可覆蓋的格數
                     - cube 可覆蓋 1 格，domino 可覆蓋相鄰的 2 格
                     - 請直接生成 bitmap，不可以假設 C# 已經知道 H 或愛心長什麼樣
@@ -280,6 +280,7 @@ public class LlmPlanner
                 X = targetObj.X,
                 Y = targetObj.Y,
                 Z = targetObj.Z + objectPosition.Z,
+                SkewDeg = objectPosition.SkewDeg,
             };
 
             return new RobotPlan
@@ -411,7 +412,8 @@ public class LlmPlanner
             Name = original.Name + "_target",
             X = x,
             Y = y,
-            Z = z
+            Z = z,
+            SkewDeg = original.SkewDeg,
         };
     }
 
