@@ -24,7 +24,7 @@ public class PatternDesigner
         _maxCols = maxCols;
     }
 
-public async Task<CanonicalPattern> DesignAsync(string userCommand, string blockColor = "yellow"int cubeBudget = 0, int dominoBudget = 0)
+    public async Task<CanonicalPattern> DesignAsync(string userCommand, string blockColor = "yellow", int cubeBudget = 0, int dominoBudget = 0)
     {
         if (string.IsNullOrWhiteSpace(userCommand))
             throw new ArgumentException("User command is empty.", nameof(userCommand));

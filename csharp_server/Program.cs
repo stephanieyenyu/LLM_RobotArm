@@ -120,7 +120,7 @@ async Task RunTaskAsync(string userCommand)
     CanonicalPattern pattern;
     try
     {
-        pattern = await patternDesigner.DesignAsync(userCommand, blockColor);
+        pattern = await patternDesigner.DesignAsync(userCommand, blockColor, cubeBudget, dominoBudget);
     }
     catch (Exception ex)
     {
@@ -152,9 +152,8 @@ async Task RunTaskAsync(string userCommand)
         JsonSerializer.Serialize(patternDump, jsonOptions)
     );
 
-    // Layer 2：算所有 target
-    int dominoBudget = initialSnap.Count(s => s.Name == $"{blockColor}_domino" && s.X < 0.30);
-    var realize = LayoutRealizer.Realize(pattern, workspace, dominoBudget);
+    // Layer 2：算所有 target（cubeBudget / dominoBudget 已在上面算好）
+    var realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
     if (realize.Error != null || realize.Targets == null)
     {
         Console.WriteLine($"[Layer 2] {realize.Error}");
