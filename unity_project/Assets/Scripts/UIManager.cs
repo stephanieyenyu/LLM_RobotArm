@@ -67,6 +67,42 @@ public class UIManager : MonoBehaviour
             Directory.CreateDirectory(SHARED_DIR);
             Debug.Log("已建立共享資料夾：" + SHARED_DIR);
         }
+
+        // ---------------------------------------------------------
+        // 右上角三個手動控制按鈕：鬆開 / 夾緊 / 回 Home
+        // ---------------------------------------------------------
+        var controlPanel = new VisualElement();
+        controlPanel.style.position = UnityEngine.UIElements.Position.Absolute;
+        controlPanel.style.top = 10;
+        controlPanel.style.right = 10;
+        controlPanel.style.flexDirection = FlexDirection.Column;
+        controlPanel.style.backgroundColor = new Color(0, 0, 0, 0.7f);
+        controlPanel.style.paddingTop = 6;
+        controlPanel.style.paddingBottom = 6;
+        controlPanel.style.paddingLeft = 6;
+        controlPanel.style.paddingRight = 6;
+
+        var openBtn = new Button(() => { if (executor != null) executor.ReleaseGripper(); });
+        openBtn.text = "鬆開夾爪";
+        openBtn.style.height = 36;
+        openBtn.style.width = 120;
+        openBtn.style.marginBottom = 4;
+
+        var gripBtn = new Button(() => { if (executor != null) executor.GripGripper(); });
+        gripBtn.text = "夾緊夾爪";
+        gripBtn.style.height = 36;
+        gripBtn.style.width = 120;
+        gripBtn.style.marginBottom = 4;
+
+        var homeBtn = new Button(() => { if (executor != null) executor.GoHome(); });
+        homeBtn.text = "回 Home";
+        homeBtn.style.height = 36;
+        homeBtn.style.width = 120;
+
+        controlPanel.Add(openBtn);
+        controlPanel.Add(gripBtn);
+        controlPanel.Add(homeBtn);
+        root.Add(controlPanel);
     }
 
     public void ShowMessage(string message)
@@ -115,11 +151,13 @@ public class UIManager : MonoBehaviour
 
     IEnumerator WaitAndExecute()
     {
-        string planPath = Path.Combine(SHARED_DIR, "robot_plan.json");
-        var lastWrite = File.Exists(planPath) ? File.GetLastWriteTime(planPath) : System.DateTime.MinValue;
+        // 分層架構下：csharp_server 的 orchestrator 會逐步寫 current_step.json、
+        // JsonExecutor 自己 poll 這個檔案來執行。UI 只要等到「至少一步」被 Unity 收到就代表任務啟動了。
+        // 這裡等 current_step.json 出現 / 更新，log 一下讓使用者知道 pipeline 通了。
+        string stepPath = Path.Combine(SHARED_DIR, "current_step.json");
+        var lastWrite = File.Exists(stepPath) ? File.GetLastWriteTime(stepPath) : System.DateTime.MinValue;
 
-        // 等最多 120 秒讓 csharp_server 產生新的 robot_plan.json（gpt-5 有時要 1 分鐘以上）
-        float timeout = 120f;
+        float timeout = 120f;     // gpt-5 設計 pattern 有時要一分鐘以上
         float waited = 0f;
         float lastLogAt = 0f;
 
@@ -128,21 +166,19 @@ public class UIManager : MonoBehaviour
             yield return new WaitForSeconds(0.5f);
             waited += 0.5f;
 
-            if (File.Exists(planPath) && File.GetLastWriteTime(planPath) > lastWrite)
+            if (File.Exists(stepPath) && File.GetLastWriteTime(stepPath) > lastWrite)
             {
-                Debug.Log($"robot_plan.json 已更新（等了 {waited:F1} 秒），開始執行");
-                executor.LoadAndExecute();
+                Debug.Log($"[UI] current_step.json 已更新（等了 {waited:F1} 秒），Executor 會自動 poll 執行");
                 yield break;
             }
 
-            // 每 15 秒提醒還在等，避免以為當機
             if (waited - lastLogAt >= 15f)
             {
-                Debug.Log($"仍在等 csharp_server 產生 robot_plan.json...（已等 {waited:F0} 秒 / 上限 {timeout:F0} 秒）");
+                Debug.Log($"[UI] 仍在等 csharp_server 產生第一步...（已等 {waited:F0} 秒 / 上限 {timeout:F0} 秒）");
                 lastLogAt = waited;
             }
         }
 
-        Debug.LogWarning($"等待 robot_plan.json 更新逾時（{timeout} 秒），請檢查 csharp_server 是否在跑");
+        Debug.LogWarning($"[UI] 等待 current_step.json 逾時（{timeout} 秒）— 檢查 csharp_server / perception_server 是否在跑");
     }
 }

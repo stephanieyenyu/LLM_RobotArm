@@ -126,31 +126,8 @@ public class RobotArm : MonoBehaviour
 
             GUILayout.EndHorizontal();
         }
-        else
-        {
-            // Wenn ein Roboter verbunden ist, dann werden Schaltflächen für die Roboterfunktionalitäten angezeigt
-            if (GUILayout.Button("Disconnect"))
-            {
-                urListener.Close();
-            }
-            
-            if(GUILayout.Button("Home"))
-            {
-                var anglesDeg = new[] { -269, -104, -106, -148, -88, 180 };
-                var anglesRad = anglesDeg.Select(a => a * MathF.PI / 180f);
-                var anglesString = string.Join(", ", anglesRad.Select(a => a.ToString(CultureInfo.InvariantCulture)));
-                urListener.SendCommand($"movej([{anglesString}], a=1.2, v=1.05)");
-                
-                /*var bedTransform = PrintBed.localToWorldMatrix;
-                Vector3 homePoint = bedTransform.GetColumn(3);
-                Vector3 homeDown = bedTransform * Vector3.down;
-                var homePointRobot = Robot2Unity.inverse * new Vector4(homePoint.x, homePoint.y, homePoint.z, 1);
-                string cmd = $"movej(p[{homePointRobot.x.ToString(CultureInfo.InvariantCulture)}, {homePointRobot.y.ToString(CultureInfo.InvariantCulture)}, {homePointRobot.z.ToString(CultureInfo.InvariantCulture)}, 3.14145, 0, 0])";
-                SendProgram(new []{cmd}, "home");*/
-            }
-
-            // GCode / 3D 印表機功能移除（本專案不需要）
-        }
+        // 連線後不再顯示 Disconnect / Home 按鈕
+        // 這些功能移到 UIManager 的三個按鈕（Open / Grip / Home）
         GUILayout.EndArea();
     }
 
