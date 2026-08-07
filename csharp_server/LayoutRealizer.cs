@@ -25,7 +25,8 @@ public static class LayoutRealizer
     public static RealizeResult Realize(
         CanonicalPattern pattern,
         WorkspaceBounds ws,
-        int dominoBudget)
+        int cubeBudget,
+    int dominoBudget)
     {
         if (pattern.Bitmap == null)
             return new RealizeResult { Error = "canonical pattern bitmap 為空。" };
@@ -92,9 +93,28 @@ public static class LayoutRealizer
         }
 
         if (targets.Count == 0)
-            return new RealizeResult { Error = "pattern 沒有任何要放置積木的格子。" };
+    return new RealizeResult { Error = "pattern 沒有任何要放置積木的格子。" };
 
-        return new RealizeResult { Targets = targets };
+int cubesNeeded = targets.Count(t => t.ExpectedShape == "cube");
+int dominosNeeded = targets.Count(t => t.ExpectedShape == "domino");
+
+if (cubesNeeded > cubeBudget)
+{
+    return new RealizeResult
+    {
+        Error = $"cube 不足：需要 {cubesNeeded} 顆，但目前只有 {cubeBudget} 顆。",
+    };
+}
+
+if (dominosNeeded > dominoBudget)
+{
+    return new RealizeResult
+    {
+        Error = $"domino 不足：需要 {dominosNeeded} 顆，但目前只有 {dominoBudget} 顆。",
+    };
+}
+
+return new RealizeResult { Targets = targets };
     }
 
     private static TargetCell BuildCube(int r, int c, int rows, WorkspaceBounds ws, string color)
