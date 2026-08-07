@@ -24,7 +24,7 @@ public class PatternDesigner
         _maxCols = maxCols;
     }
 
-    public async Task<CanonicalPattern> DesignAsync(string userCommand, string blockColor = "yellow")
+public async Task<CanonicalPattern> DesignAsync(string userCommand, string blockColor = "yellow"int cubeBudget = 0, int dominoBudget = 0)
     {
         if (string.IsNullOrWhiteSpace(userCommand))
             throw new ArgumentException("User command is empty.", nameof(userCommand));
@@ -38,25 +38,28 @@ public class PatternDesigner
             )
         };
 
-        var messages = new List<ChatMessage>
+int maxCoveredCells = cubeBudget + dominoBudget * 2;
+var messages = new List<ChatMessage>
         {
             new SystemChatMessage(
                 $$"""
-                你是圖案設計師。使用者會描述想要拼出的圖形（字母 / 幾何形狀 / 簡單符號），
-                你要輸出一個 canonical bitmap。
-
                 規則：
-                - bitmap 是二維字串陣列，每一列同長度
-                - 每格只能是 "0"（空）或 "1"（有積木）
-                - 大小限制：最多 {{_maxRows}} × {{_maxCols}}
-                - 對稱字母（H、O、X、I、A、T、U、V、W、M、Y）必須完全對稱
-                - 筆劃寬度統一為 1 格
-                - 生成後你必須在 self_verification 欄位裡：
-                    a) 檢查對稱性（水平 / 垂直是否對稱）
-                    b) render ASCII 圖（■ 代表 1、□ 代表 0）
-                    c) 有問題就重畫再輸出
-
-                只輸出符合 JSON schema 的 JSON，不加解釋文字。
+                 - bitmap 是二維字串陣列，每一列同長度
+                 - 每格只能是 "0"（空）或 "1"（有積木）
+                 - 大小限制：最多 {{_maxRows}} × {{_maxCols}}
+                 - 目前可用 cube 數量：{{cubeBudget}}
+                 - 目前可用 domino 數量：{{dominoBudget}}
+                 - 一顆 cube 可覆蓋 bitmap 中 1 格
+                 - 一顆 domino 可覆蓋 bitmap 中相鄰的 2 格
+                 - 請根據可用積木數量自行決定 bitmap 的 rows 和 columns
+                 - 不一定要用滿最大尺寸；積木較少時，請生成較小但仍可辨識的圖案
+                 - 對稱字母（H、O、X、I、A、T、U、V、W、M、Y）必須完全對稱
+                 - 筆劃寬度統一為 1 格
+                 - 生成後你必須在 self_verification 欄位裡：
+                     a) 檢查對稱性（水平 / 垂直是否對稱）
+                     b) render ASCII 圖（■ 代表 1、□ 代表 0）
+                     c) 有問題就重畫再輸出
+                 只輸出符合 JSON schema 的 JSON，不加解釋文字。
                 """
             ),
             new UserChatMessage(
@@ -77,9 +80,17 @@ public class PatternDesigner
         if (raw.Bitmap == null || raw.Bitmap.Count == 0)
             throw new InvalidOperationException("Pattern LLM returned empty bitmap.");
 
-        int[,] bitmap = BitmapParser.Parse(raw.Bitmap);
+     int[,] bitmap = BitmapParser.Parse(raw.Bitmap);
 
-        return new CanonicalPattern
+     int occupiedCells = BitmapParser.CountOccupiedCells(bitmap);
+     if (occupiedCells > maxCoveredCells)
+     {
+     throw new InvalidOperationException(
+         $"LLM 產生的 bitmap 需要 {occupiedCells} 格，但目前可用積木最多只能覆蓋 {maxCoveredCells} 格。"
+     );
+     }
+
+     return new CanonicalPattern
         {
             PatternId = raw.PatternId ?? userCommand,
             Bitmap = bitmap,
