@@ -107,6 +107,14 @@ async Task RunTaskAsync(string userCommand)
     // 先掃一次拿到 supplies + block color 決策依據
     var initialSnap = await FetchSceneAsync();
     string blockColor = GuessBlockColor(userCommand, initialSnap);
+    
+    int cubeBudget = initialSnap.Count(s =>
+    s.Name == $"{blockColor}_cube" && s.X < 0.30);
+
+    int dominoBudget = initialSnap.Count(s =>
+    s.Name == $"{blockColor}_domino" && s.X < 0.30);
+
+    int maxCoveredCells = cubeBudget + dominoBudget * 2;
     Console.WriteLine($"[Layer 1] 呼 LLM 設計 pattern (color={blockColor})...");
 
     CanonicalPattern pattern;
