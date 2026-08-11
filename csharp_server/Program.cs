@@ -64,6 +64,7 @@ Console.WriteLine();
 var workspace = new WorkspaceBounds();
 var patternDesigner = new PatternDesigner(workspace.MaxRows, workspace.MaxCols);
 var motionPlanner = new MotionPlanner();
+var commandRouter = new CommandRouter();
 
 // 清空 input 與舊檔案
 if (File.Exists(inputPath)) File.WriteAllText(inputPath, "");
@@ -105,6 +106,42 @@ while (true)
 
 // --- 主任務閉環 ---
 async Task RunTaskAsync(string userCommand)
+{
+    var initialScene = await FetchSceneAsync();
+    if (initialScene.Count == 0)
+    {
+        Console.WriteLine("[CommandRouter] Scene contains no objects with valid coordinates.");
+        return;
+    }
+
+    RoutedCommand routed;
+    try
+    {
+        routed = await commandRouter.RouteAsync(userCommand, initialScene);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[CommandRouter] Failed: {ex.Message}");
+        return;
+    }
+
+    Console.WriteLine($"[CommandRouter] action={routed.Action} — {routed.Reasoning}");
+    switch (routed.Action)
+    {
+        case "arrange_pattern":
+            await RunPatternTaskAsync(userCommand);
+            break;
+        case "move_relative":
+        case "stack":
+            await RunSingleObjectTaskAsync(routed, initialScene);
+            break;
+        default:
+            Console.WriteLine($"[CommandRouter] Unsupported action: {routed.Action}");
+            break;
+    }
+}
+
+async Task RunPatternTaskAsync(string userCommand)
 {
     // 先掃一次，取得 supplies 與 block color 的決策依據
     var initialSnap = await FetchSceneAsync();
@@ -304,6 +341,108 @@ async Task RunTaskAsync(string userCommand)
 }
 
 // --- 輔助函式 ---
+async Task RunSingleObjectTaskAsync(RoutedCommand routed, List<SceneObject> initialScene)
+{
+    globalStepId++;
+    Assignment assignment;
+    try
+    {
+        assignment = SingleObjectTaskBuilder.Build(routed, initialScene, globalStepId);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[SingleObject] Cannot build task: {ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    Console.WriteLine($"[SingleObject] {assignment.Reasoning}");
+    string? feedback = null;
+    const int maxRetries = 2;
+
+    for (int retry = 0; retry <= maxRetries; retry++)
+    {
+        var beforeSnap = await FetchSceneAsync();
+        MotionPlan? motionPlan = null;
+        string validationError = "";
+
+        for (int planAttempt = 1; planAttempt <= 3; planAttempt++)
+        {
+            string plannerFeedback = string.Join("; ", new[] { feedback, validationError }
+                .Where(s => !string.IsNullOrWhiteSpace(s)));
+            try
+            {
+                motionPlan = await motionPlanner.PlanAsync(assignment, beforeSnap, plannerFeedback);
+            }
+            catch (Exception ex)
+            {
+                validationError = "Motion Planner call failed: " + ex.Message;
+                motionPlan = null;
+                continue;
+            }
+
+            if (MotionPlanValidator.TryValidate(motionPlan, out validationError))
+                break;
+            Console.WriteLine($"[MotionPlanner] Attempt {planAttempt} rejected: {validationError}");
+            motionPlan = null;
+        }
+
+        if (motionPlan == null)
+        {
+            Console.WriteLine("[MotionPlanner] Could not produce a safe plan.");
+            break;
+        }
+
+        var envelope = new StepEnvelope
+        {
+            StepId = assignment.StepId,
+            Done = false,
+            SourcePosition = assignment.Source,
+            TargetPosition = new SceneObject
+            {
+                Name = routed.Action == "stack" ? "stack_target" : "relative_target",
+                X = assignment.Target!.WorldX,
+                Y = assignment.Target.WorldY,
+                Z = assignment.Target.WorldZ,
+                Shape = assignment.Target.ExpectedShape,
+                Orientation = assignment.Target.ExpectedOrientation,
+            },
+            Comment = assignment.Reasoning + " | Motion: " + motionPlan.Reasoning,
+            ActionSequence = motionPlan.ActionSequence,
+        };
+
+        // A retry must have a fresh step id so Unity will execute it again.
+        if (retry > 0)
+        {
+            assignment.StepId = ++globalStepId;
+            envelope.StepId = assignment.StepId;
+        }
+
+        WriteStepFile(envelope);
+        Console.WriteLine($"[Executor] Sent step {assignment.StepId}; waiting for Unity...");
+        var execResult = await WaitForStepDoneAsync(assignment.StepId, timeoutSec: 90);
+        if (execResult == null || !execResult.Completed)
+        {
+            feedback = execResult?.Error ?? "Unity execution timeout";
+            Console.WriteLine($"[Executor] Failed: {feedback}");
+            // Execution state is unknown; do not blindly return to the old source coordinate.
+            break;
+        }
+
+        var afterSnap = await FetchSceneAsync();
+        var verify = Verifier.CheckSingleObjectStep(
+            assignment, beforeSnap, afterSnap, requireStackHeight: routed.Action == "stack");
+        Console.WriteLine($"[Verifier] {verify.OverallStatus} — {verify.Note}");
+        if (verify.OverallStatus == "ok")
+            break;
+        if (verify.OverallStatus != "retry")
+            break;
+        feedback = verify.Note;
+    }
+
+    WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+}
+
 async Task<List<SceneObject>> FetchSceneAsync()
 {
     try

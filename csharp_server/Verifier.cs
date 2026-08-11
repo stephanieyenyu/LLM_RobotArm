@@ -120,6 +120,84 @@ public static class Verifier
         return results;
     }
 
+    /// <summary>
+    /// Verifies move_relative and stack. Unlike pattern verification, this selects the
+    /// moved object's identity at the destination so the lower stack object is not
+    /// mistaken for the placed object.
+    /// </summary>
+    public static VerifyResult CheckSingleObjectStep(
+        Assignment step,
+        List<SceneObject> beforeSnapshot,
+        List<SceneObject> afterSnapshot,
+        bool requireStackHeight)
+    {
+        var result = new VerifyResult { StepId = step.StepId };
+        if (step.Source == null || step.Target == null)
+        {
+            result.OverallStatus = "abort";
+            result.Note = "Single-object assignment is missing source or target.";
+            return result;
+        }
+
+        var sourceStillThere = afterSnapshot.Any(o =>
+            o.Name == step.Source.Name &&
+            Distance2D(o.X, o.Y, step.Source.X, step.Source.Y) < SOURCE_MATCH_M);
+        result.SourceRemoved = !sourceStillThere;
+
+        var movedAtTarget = afterSnapshot
+            .Where(o => o.Name == step.Source.Name)
+            .Where(o => Distance2D(o.X, o.Y, step.Target.WorldX, step.Target.WorldY)
+                        < POSITION_TOLERANCE_M)
+            .OrderBy(o => Distance2D(o.X, o.Y, step.Target.WorldX, step.Target.WorldY))
+            .ThenBy(o => Math.Abs(o.Z - step.Target.WorldZ))
+            .FirstOrDefault();
+
+        if (movedAtTarget != null)
+        {
+            result.TargetOccupied = true;
+            result.ShapeMatch = movedAtTarget.Shape == step.Target.ExpectedShape;
+            result.ColorMatch = movedAtTarget.Name.Contains(step.Target.ExpectedColor);
+            result.PositionErrorMm = Distance2D(
+                movedAtTarget.X, movedAtTarget.Y, step.Target.WorldX, step.Target.WorldY) * 1000.0;
+            result.OrientationErrorDeg = Math.Abs(movedAtTarget.SkewDeg);
+        }
+
+        bool heightMatches = !requireStackHeight ||
+            (movedAtTarget != null && Math.Abs(movedAtTarget.Z - step.Target.WorldZ) <= 0.030);
+
+        if (result.SourceRemoved && result.TargetOccupied && result.ShapeMatch &&
+            result.ColorMatch && heightMatches)
+        {
+            result.OverallStatus = "ok";
+            result.Note = requireStackHeight
+                ? $"Stack verified; XY error {result.PositionErrorMm:F1} mm."
+                : $"Relative move verified; XY error {result.PositionErrorMm:F1} mm.";
+        }
+        else if (!result.SourceRemoved && !result.TargetOccupied)
+        {
+            result.OverallStatus = "retry";
+            result.Note = "Source object did not move and destination is empty.";
+        }
+        else if (result.SourceRemoved && !result.TargetOccupied)
+        {
+            result.OverallStatus = "abort";
+            result.Note = "Source disappeared but the expected object was not found; manual recovery is required.";
+        }
+        else if (result.TargetOccupied && !heightMatches)
+        {
+            result.OverallStatus = "retry";
+            result.Note = $"Object reached stack XY but height is incorrect " +
+                          $"(actual {movedAtTarget!.Z:F3}, expected {step.Target.WorldZ:F3} m).";
+        }
+        else
+        {
+            result.OverallStatus = "replan";
+            result.Note = "Scene changed unexpectedly; obtain a new scene and replan.";
+        }
+
+        return result;
+    }
+
     private static double Distance2D(double x1, double y1, double x2, double y2)
     {
         double dx = x1 - x2;

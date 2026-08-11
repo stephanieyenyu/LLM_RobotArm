@@ -14,9 +14,13 @@ perception_server (Python + Flask)
    ├─ YOLO11n（COCO 物件） + HSV 立方體 + ArUco QR
    └─ 每 200ms 更新場景，回傳 3D 世界座標
    ↓
-LLM Planner（gpt-5，四種 action：pick_and_place / move_relative / place_relative / error）
-   ↓  StreamingAssets/robot_plan.json
-Unity JsonExecutor
+LLM CommandRouter（arrange_pattern / move_relative / stack）
+   ├─ PatternDesigner：自然語言 → bitmap
+   └─ SingleObjectTaskBuilder：方向/距離或疊放目標 → 實際座標
+   ↓
+LLM MotionPlanner → MotionPlanValidator
+   ↓  StreamingAssets/current_step.json（robot function sequence）
+Unity JsonExecutor（高階 function → URScript）
    ↓  TCP 30002 URScript
 UR3e
 ```
@@ -25,15 +29,19 @@ UR3e
 
 **csharp_server/**
 - `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP
-- `Program.cs` — 監聽 user_input.txt、拉 HTTP 場景、呼叫 LLM、寫 robot_plan.json
-- `llm_planner.cs` — gpt-5 呼叫、JSON schema、error 處理
+- `Program.cs` — 監聽 user_input.txt、路由任務、執行感知/規劃/驗證閉環
+- `CommandRouter.cs` — LLM 判斷排圖、相對移動或疊放
+- `PatternDesigner.cs` — LLM 將排圖指令轉成 bitmap
+- `SingleObjectTaskBuilder.cs` — 用確定性幾何計算相對移動與疊放座標
+- `MotionPlanner.cs` — LLM 使用白名單 robot functions 規劃動作
+- `MotionPlanValidator.cs` — 執行前安全狀態機驗證
 - `RobotPlan.cs` — plan / SceneObject 資料類別
 - `models/pliers.pt`、`yolo11n.pt` — YOLO 權重
 - `QRcode/aruco_1~4.png` — 可列印定位碼
 
 **unity_project/Assets/Scripts/**
 - `UIManager.cs` — 指令輸入 UI、監看計畫更新
-- `JsonExecutor.cs` — 展開動作序列、送 URScript、任務後回 home
+- `JsonExecutor.cs` — 解譯 LLM robot function sequence、送 URScript
 - `URPackageListener.cs` — UR TCP client（port 30002）
 - `URUtil.cs`、`Util.cs` — 封包型別工具
 
@@ -67,10 +75,18 @@ dotnet run
 
 ## 指令範例
 
-- 「把黑色方塊放到黃色方塊上面」→ `pick_and_place` 疊放
-- 「把杯子往前移 5 公分」→ `move_relative`
-- 「把手機放到杯子左邊 15 公分」→ `place_relative`
-- 「把飛機推倒」→ `error`（場景沒有飛機）
+- 「排 H」→ `arrange_pattern`
+- 「把黃色方塊往前移 5 公分」→ `move_relative`
+- 「把黃色方塊往左移 10 公分」→ `move_relative`
+- 「把黑色方塊疊在黃色方塊上面」→ `stack`
+
+相對方向沿用 QR 工作座標定義：`left=+X`、`right=-X`、`forward=-Y`、`backward=+Y`。
+如果現場視角相反，只需在 `SingleObjectTaskBuilder.cs` 調整這四個映射。
+
+疊放高度不使用固定積木高度。感知伺服器透過 RealSense depth 取得來源積木頂面
+`source.Z`；來源積木位於 QR 桌面時，此值就是實測積木高度。疊放目標使用
+`targetZ = reference.Z + source.Z`。若量到的來源高度不在 0.005–0.100 m，系統會拒絕
+執行並要求刷新場景，避免使用錯誤深度撞擊積木。
 
 ## 支援的物件
 
