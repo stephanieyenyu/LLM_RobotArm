@@ -1,6 +1,6 @@
-# LLM Motion Planner嚗ayer 4A嚗?
-瘥?`TaskAssigner` assignment 銝???Unity 撅??摰?12 甇乓蜓?抒?撘??澆
-`MotionPlanner`嚗? LLM 敺????robot functions 銝剔???雿?
+# LLM Motion Planner（Layer 4A）
+
+每個 `TaskAssigner` assignment 不再由 Unity 固定展開成 12 步，而是先交給 `MotionPlanner`，由 LLM 使用下列高階 robot functions 組合動作：
 
 - `move_above(location, height_m)`
 - `descend(location)`
@@ -10,14 +10,19 @@
 - `wait(seconds)`
 - `go_home()`
 
-LLM 銝頛詨?? URScript?遙?漣璅?蝭閫漲?漲???漲???
-`action_sequence` 敹??? `MotionPlanValidator` ??摨??瑼Ｘ嚗?敺?撖怠
-`current_step.json`?nity `JsonExecutor` ?圾霅舐? function嚗?雿輻?Ｘ?摨扳?????URScript ?Ｙ??典銵?
-?亙??券?霅仃??銝餅蝔????航炊?? LLM嚗?憭??啗??甈～?瑁?敺?
-`Verifier` ? `retry` ??`replan`嚗府??銋??銝?頛?Motion Planner??
-## ?唳?蝔?
-`TaskAssigner ??MotionPlanner ??MotionPlanValidator ??current_step.json ??Unity Executor ??UR3e ??Verifier`
+LLM 不可直接輸出任意 URScript、任意世界座標、速度、加速度或 I/O 指令。
+`action_sequence` 產生後先經 `MotionPlanValidator` 做白名單與參數範圍驗證，通過後才寫入 `current_step.json`。Unity `JsonExecutor` 只解讀上述 function，並使用既有的座標轉換與 URScript 安全實作。
 
-## 摰??
+若規劃呼叫失敗、回傳非 JSON 或驗證失敗，系統最多要求 LLM 修正三次，之後停止該任務。`Verifier` 回傳 `retry` 或 `replan` 時，其錯誤說明會在下一輪提供給 Motion Planner。
 
-- 瘥??急?憭?20 ??function calls??- 摰擃漲???0.05??.15 m??- 敹?靘?摰?靘?銝?亥????冗??璅??寞餈????整?Ｗ? Home??- ?芷?撽????思??? Unity??- Unity 銝??JSON 銝剔??? URScript ?遙?漣璅?
+## 資料流程
+
+`TaskAssigner → MotionPlanner → MotionPlanValidator → current_step.json → Unity Executor → UR3e → Verifier`
+
+## 安全限制
+
+- 每個計畫最多 20 個 function calls。
+- 安全高度限制在 0.05～0.15 m。
+- 動作順序必須符合：接近來源、下降、夾取、抬升、接近目標、下降、釋放、抬升、回 Home。
+- 所有位置參數只允許 `source` 或 `target`。
+- Unity 不接受 JSON 內的任意 URScript 或世界座標。

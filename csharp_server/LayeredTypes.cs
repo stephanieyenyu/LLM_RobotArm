@@ -2,12 +2,12 @@ using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
 // -----------------------------------------------------------------
-// ?惜?嗆??梁鞈?憿
-// 瘥?Layer 銋???I/O ?賜?ㄐ??record / class ?Ⅱ摰儔
+// 分層架構共用資料型別
+// 每個 Layer 之間的 I/O 都使用下列 record / class 明確定義
 // -----------------------------------------------------------------
 
 /// <summary>
-/// Layer 1 (PatternDesigner) ?撓?綽?canonical bitmap + 憿??
+/// Layer 1 (PatternDesigner) 的輸出：canonical bitmap + 方塊顏色
 /// </summary>
 public class CanonicalPattern
 {
@@ -17,15 +17,15 @@ public class CanonicalPattern
 }
 
 /// <summary>
-/// 撌乩??撖阡???嚗ayer 2 ?其???bitmap 摨扳?頧??漣璅?
+/// 工作區邊界設定，Layer 2 依此將 bitmap 映射為世界座標。
 /// </summary>
 public class WorkspaceBounds
 {
-    // ?箸??椰銝?? QR frame ?漣璅?bitmap row=last, col=0 撠??ㄐ嚗?
-    // ?曉??grid ?喃?閫?餈?QR2嚗?.622, 0嚗?
-    //   grid X 蝭?嚗?.42 ??0.42 + 4?0.05 = 0.62嚗銝??末鞎?QR2嚗?
-    //   grid Y 蝭?嚗?.03 ??0.03 + 4?0.05 = 0.23嚗 QR3 ?? 5 cm嚗?
-    // ????箏漣嚗R frame 蝝?0.32, 0.40嚗? 皜?撌虫?閫??
+    // 目標區左下角在 QR frame 的座標（bitmap 最後一列、第 0 欄的中心）。
+    // 現有 5x5 grid 必須避開 QR2 (0.622, 0)：
+    //   grid X 範圍：0.42 ～ 0.42 + 4*0.05 = 0.62，最右欄接近但不超過 QR2。
+    //   grid Y 範圍：0.03 ～ 0.03 + 4*0.05 = 0.23，距離 QR3 保留 5 cm。
+    // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
     public double TargetOriginX { get; set; } = 0.42;
     public double TargetOriginY { get; set; } = 0.03;
     public double CellSize { get; set; } = 0.05;
@@ -35,7 +35,7 @@ public class WorkspaceBounds
 }
 
 /// <summary>
-/// Layer 2 (LayoutRealizer) ?撓?綽?瘥??澆?????漣璅?+ ????piece 撅祆扼?
+/// Layer 2 (LayoutRealizer) 的輸出：每個要填滿的世界座標與預期方塊資訊。
 /// </summary>
 public class TargetCell
 {
@@ -46,26 +46,26 @@ public class TargetCell
     public double WorldZ { get; set; }
     public string ExpectedShape { get; set; } = "cube";     // "cube" or "domino"
     public string ExpectedColor { get; set; } = "yellow";
-    public string? ExpectedOrientation { get; set; }         // domino ??
-    // 撠?domino嚗???蝚砌??潘??賊 (row, col+1) ??(row+1, col)嚗?
+    public string? ExpectedOrientation { get; set; }         // domino 方向
+    // 若為 domino，第二個覆蓋格為 (row, col+1) 或 (row+1, col)。
     public int? SecondRow { get; set; }
     public int? SecondCol { get; set; }
 }
 
 /// <summary>
-/// Layer 3 (TaskAssigner) ?撓?綽??憿?supply ???芸?target??獢?
-/// ?瘥?甇亦?甇?策 executor ??撠雿?
+/// Layer 3 (TaskAssigner) 的輸出：將一個 supply 配對至一個 target 的任務。
+/// 一次只產生一筆，方便 executor 執行與驗證。
 /// </summary>
 public class Assignment
 {
     public int StepId { get; set; }
-    public SceneObject? Source { get; set; }                 // 敺?perception ???supply
+    public SceneObject? Source { get; set; }                 // perception 偵測到的 supply
     public TargetCell? Target { get; set; }
-    public string Reasoning { get; set; } = "";              // debug log ??
+    public string Reasoning { get; set; } = "";              // debug log 用
 }
 
 /// <summary>
-/// Layer 4 (Executor) ?瑁?摰?蝯?嚗nity 蝡臬神??step_done.json嚗?
+/// Layer 4 (Executor) 執行結果，由 Unity 寫入 step_done.json。
 /// </summary>
 public class ExecutionResult
 {
@@ -80,13 +80,13 @@ public class ExecutionResult
 }
 
 /// <summary>
-/// Layer 5 (Verifier) 撠甇交??湧??炎?亦???
+/// Layer 5 (Verifier) 對單步執行結果的驗證資訊。
 /// </summary>
 public class VerifyResult
 {
     public int StepId { get; set; }
-    public bool SourceRemoved { get; set; }                  // 鋆疏???? supply 瘨仃鈭?
-    public bool TargetOccupied { get; set; }                 // ?格?雿蔭?曉?镼踹?
+    public bool SourceRemoved { get; set; }                  // 原 supply 位置是否已清空
+    public bool TargetOccupied { get; set; }                 // 目標位置是否已有物件
     public bool ShapeMatch { get; set; }
     public bool ColorMatch { get; set; }
     public double PositionErrorMm { get; set; }
@@ -96,14 +96,14 @@ public class VerifyResult
 }
 
 /// <summary>
-/// ?策 Unity ?瑁???per-step 瑼??澆?嚗神??current_step.json嚗?
+/// 傳給 Unity 執行的單步資料，寫入 current_step.json。
 /// </summary>
 public class StepEnvelope
 {
     [JsonPropertyName("step_id")]
     public int StepId { get; set; }
     [JsonPropertyName("done")]
-    public bool Done { get; set; }                            // true = 隞餃?摰?嚗nity ??poll
+    public bool Done { get; set; }                            // true = 全部完成，Unity 停止 polling
     [JsonPropertyName("source_position")]
     public SceneObject? SourcePosition { get; set; }
     [JsonPropertyName("target_position")]

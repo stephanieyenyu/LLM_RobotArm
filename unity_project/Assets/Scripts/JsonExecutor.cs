@@ -9,13 +9,13 @@ using System.Text;
 using Assets.Scripts;
 
 // -----------------------------------------------------------------
-// Layer 4嚗xecutor嚗nity 蝡荔?
-// ?惜?嗆?銝?閫蝪∪?鈭?
-//   - ?? poll current_step.json
-//   - ?踹??step_id ??撅???12 甇?URScript ?瑁?
-//   - ?瑁?摰神 step_done.json ?蝯?
-//   - 霈??{"done": true} 撠勗? poll
-// 銝?銝甈∟? batch plan嚗?銝??閬? Space??
+// Layer 4（Executor）：Unity 端
+// 分層架構中的單步執行器：
+//   - 持續 poll current_step.json
+//   - 收到新的 step_id 後，依 action_sequence 執行 URScript
+//   - 執行完寫入 step_done.json 回報結果
+//   - 收到 {"done": true} 後停止該批任務
+// 不再載入整批 batch plan，也不需要按 Space 執行。
 // -----------------------------------------------------------------
 
 [System.Serializable]
@@ -66,7 +66,7 @@ public class StepDoneReport
 
 public class JsonExecutor : MonoBehaviour
 {
-    [Header("閮剖?")]
+    [Header("設定")]
     public string currentStepFile = "current_step.json";
     public string stepDoneFile = "step_done.json";
     public string urIP = "192.168.50.204";
@@ -75,10 +75,10 @@ public class JsonExecutor : MonoBehaviour
     [Header("Perception Server")]
     public string perceptionModeUrl = "http://localhost:5000/scene/mode";
 
-    [Header("UI嚗?潮＊蝷箄??荔??舐?蝛綽?")]
+    [Header("UI（保留既有按鈕相容性）")]
     public UIManager uiManager;
 
-    // QR1 ??UR3 ?箏漣摨扳?蝟餌?雿蔭嚗each Pendant ?葫?潘??桐??砍偕嚗?
+    // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     private const float QR1_X = -0.36552f;
     private const float QR1_Y = -0.40836f;
     private const float QR1_Z = 0.035f;
@@ -88,14 +88,14 @@ public class JsonExecutor : MonoBehaviour
     private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.15f;
     private const float SKEW_SIGN = 1f;
 
-    // Home 憪踵???蝭閫漲嚗ad嚗?[base, shoulder, elbow, wrist1, wrist2, wrist3]
-    // ?寥?銵停??敶梢??甇亦??? home???I ??Home??
+    // Home 關節角度，單位為 rad：[base, shoulder, elbow, wrist1, wrist2, wrist3]
+    // 若實機姿勢不符，請由 Teach Pendant 讀取 home 姿勢後更新此值。
     private const string HOME_MOVEJ_CMD = "movej([-1.5708, -1.5708, 0, -1.5708, 0, 0], a=1.2, v=0.8)";
 
     private URPackageListener urListener;
     private int lastExecutedStepId = -1;
 
-    // 餈質馱?桀?頝? ExecuteStep coroutine 頝?step_id嚗? Home ???賭葉??
+    // 保存目前執行中的 ExecuteStep coroutine 與 step_id，供 Home 按鈕中止。
     private Coroutine currentStepCoroutine;
     private int currentStepId = -1;
 
@@ -103,7 +103,7 @@ public class JsonExecutor : MonoBehaviour
     {
         urListener = new URPackageListener();
         urListener.Connect(urIP);
-        Debug.Log("?岫?????" + urIP);
+        Debug.Log("嘗試連線至 UR：" + urIP);
 
         StartCoroutine(PollLoop());
     }
@@ -113,47 +113,47 @@ public class JsonExecutor : MonoBehaviour
         urListener?.Close();
     }
 
-    // ?詨捆??UIManager ?征 stub嚗?嗆?銝?Executor ?航??poll???閬??孛?潦?
-    // UIManager ?嗅?lan 瑼?整??舀??澆??雿祕?銵 PollLoop 撽???
+    // 保留給 UIManager 呼叫的相容 stub；分層 Executor 啟動後會自行 polling。
+    // UIManager 寫入 plan 後不需要主動觸發，PollLoop 會自動偵測新步驟。
     public void LoadAndExecute()
     {
-        Debug.Log("[Executor] LoadAndExecute() 撌脩雿嚗?撅斗瑽? executor ?芸? poll current_step.json嚗?);
+        Debug.Log("[Executor] LoadAndExecute() 已停用；分層 executor 會自動 poll current_step.json");
     }
 
     // -----------------------------------------------------------
-    // UI ???批??嚗???冗?芥冗蝺冗?芥? home
+    // UI 按鈕相容介面：release、grip、home
     // -----------------------------------------------------------
     public void ReleaseGripper()
     {
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR ?芷??嚗elease 敹賜");
+            Debug.LogWarning("[Executor] UR 未連線，release 失敗");
             return;
         }
         urListener.SendCommand("set_standard_digital_out(4, False)");
-        Debug.Log("[Executor] ??擛?憭曄");
+        Debug.Log("[Executor] 已送出夾爪釋放指令");
     }
 
     public void GripGripper()
     {
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR ?芷??嚗rip 敹賜");
+            Debug.LogWarning("[Executor] UR 未連線，grip 失敗");
             return;
         }
         urListener.SendCommand("set_standard_digital_out(4, True)");
-        Debug.Log("[Executor] ??憭曄?憭曄");
+        Debug.Log("[Executor] 已送出夾爪閉合指令");
     }
 
     public void GoHome()
     {
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR ?芷??嚗ome 敹賜");
+            Debug.LogWarning("[Executor] UR 未連線，home 失敗");
             return;
         }
 
-        // 1. ??甇?頝? ExecuteStep嚗???嚗?銝血??梢郊憭望?蝯?csharp_server
+        // 1. 若正在執行 ExecuteStep，先中止並寫入失敗回報，避免 csharp_server 一直等待。
         if (currentStepCoroutine != null)
         {
             int abortedStepId = currentStepId;
@@ -161,19 +161,19 @@ public class JsonExecutor : MonoBehaviour
             currentStepCoroutine = null;
             currentStepId = -1;
             WriteStepDone(abortedStepId, false, "aborted by user (GoHome)", 0f);
-            Debug.LogWarning($"[Executor] 銝剜 step {abortedStepId}嚗蝙?刻? Home嚗?);
+            Debug.LogWarning($"[Executor] 已中止 step {abortedStepId}，改為返回 Home");
 
-            // perception ?? idle嚗? SceneSyncer ?臭誑?瑟
+            // 將 perception 切回 idle，讓 SceneSyncer 恢復更新。
             StartCoroutine(SetPerceptionMode("idle"));
         }
 
-        // 2. ??home ?誘嚗????嗡?隞颱? movej嚗?
+        // 2. 送出 home 指令（使用關節角 movej）。
         string homeCmd = HOME_MOVEJ_CMD;
         urListener.SendCommand(homeCmd);
-        Debug.Log("[Executor] ????home: " + homeCmd);
+        Debug.Log("[Executor] 已送出 home：" + homeCmd);
     }
 
-    // --- 銝?poll loop嚗? current_step.json ??? step_id ---
+    // --- 主 poll loop：監看 current_step.json 的新 step_id ---
     IEnumerator PollLoop()
     {
         while (true)
@@ -198,14 +198,14 @@ public class JsonExecutor : MonoBehaviour
 
             if (env.done)
             {
-                Debug.Log($"[Executor] ?嗅 done 靽∟? (step {env.step_id})嚗遙????);
+                Debug.Log($"[Executor] 收到 done 訊號 (step {env.step_id})，等待下一批任務");
                 lastExecutedStepId = env.step_id;
                 continue;
             }
 
             if (env.source_position == null || env.target_position == null)
             {
-                Debug.LogWarning($"[Executor] step {env.step_id} 蝻?source/target");
+                Debug.LogWarning($"[Executor] step {env.step_id} 缺少 source/target");
                 continue;
             }
 
@@ -218,12 +218,12 @@ public class JsonExecutor : MonoBehaviour
         }
     }
 
-    // --- ?瑁??桐? step嚗?雿?摨 LLM Motion Planner ??robot functions 瘙箏? ---
+    // --- 執行單一步驟：依序解讀 LLM Motion Planner 的 robot functions ---
     IEnumerator ExecuteStep(StepEnvelope env)
     {
-        Debug.Log($"????Step {env.step_id} ???? {env.comment}");
+        Debug.Log($"═══ Step {env.step_id} ═══ {env.comment}");
 
-        // 蝑??
+        // 等待連線
         float waited = 0f;
         while (!urListener.Connected && waited < 3f)
         {
@@ -232,15 +232,15 @@ public class JsonExecutor : MonoBehaviour
         }
         if (!urListener.Connected)
         {
-            Debug.LogError("?⊥??????UR");
-            WriteStepDone(env.step_id, false, "UR ?芷??", 0f);
+            Debug.LogError("無法連線到 UR");
+            WriteStepDone(env.step_id, false, "UR 未連線", 0f);
             yield break;
         }
 
-        // ? perception ?脣 executing ??SceneSyncer ???恍
+        // 通知 perception 進入 executing，讓 SceneSyncer 凍結畫面。
         yield return StartCoroutine(SetPerceptionMode("executing"));
 
-        // 摨扳???嚗R 撟喲 ??UR3 base
+        // 座標換算：QR 平面 → UR3 base
         float ox = QR1_X + env.source_position.x;
         float oy = QR1_Y + env.source_position.y;
         float oz = QR1_Z + env.source_position.z + Z_CORRECTION;
@@ -312,15 +312,15 @@ public class JsonExecutor : MonoBehaviour
             }
         }
 
-        // ? perception idle ??SceneSyncer ??甈⊥??啣??
+        // 通知 perception 回到 idle，讓 SceneSyncer 擷取最新場景。
         yield return StartCoroutine(SetPerceptionMode("idle"));
 
-        // 蝑?perception ?????唳??啁???stabilize ?閬嗾撟嚗?
+        // 等待 perception 取得足夠影格以穩定偵測結果。
         yield return new WaitForSeconds(1.5f);
 
         float duration = Time.realtimeSinceStartup - t0;
         WriteStepDone(env.step_id, true, null, duration);
-        Debug.Log($"????Step {env.step_id} 摰? ({duration:F1}s) ????);
+        Debug.Log($"═══ Step {env.step_id} 完成 ({duration:F1}s) ═══");
     }
 
     IEnumerator SendMove(float x, float y, float z, string orientation, float skewDeg, string tag)
@@ -374,7 +374,7 @@ public class JsonExecutor : MonoBehaviour
             req.timeout = 3;
             yield return req.SendWebRequest();
             if (req.result != UnityWebRequest.Result.Success)
-                Debug.LogWarning($"[perception mode] {mode} 憭望?嚗req.error}");
+                Debug.LogWarning($"[perception mode] {mode} 失敗：{req.error}");
         }
     }
 
