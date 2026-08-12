@@ -4,14 +4,58 @@
 /// </summary>
 public static class MotionPlanValidator
 {
+    private const double MinX = 0.00;
+    private const double MaxX = 0.72;
+    private const double MinY = 0.00;
+    private const double MaxY = 0.45;
+    private const double MinTravelClearanceM = 0.08;
+    private const double ObstacleClearanceM = 0.03;
+    private const double MaxTransferDistanceM = 0.70;
+    private const double OccupancyRadiusM = 0.020;
     private static readonly HashSet<string> Allowed = new()
     {
         "move_above", "descend", "grasp", "release", "lift", "wait", "go_home"
     };
 
-    public static bool TryValidate(MotionPlan? plan, out string error)
+    public static bool TryValidate(
+        MotionPlan? plan,
+        Assignment assignment,
+        IReadOnlyList<SceneObject> scene,
+        out string error)
     {
         error = "";
+        if (assignment.Source == null || assignment.Target == null)
+            return Fail("assignment is missing source or target", out error);
+
+        var source = assignment.Source;
+        var target = assignment.Target;
+        if (!InsideWorkspace(source.X, source.Y) || !InsideWorkspace(target.WorldX, target.WorldY))
+            return Fail("source or target is outside the validated QR workspace", out error);
+
+        double transferDistance = Distance2D(source.X, source.Y, target.WorldX, target.WorldY);
+        if (transferDistance > MaxTransferDistanceM)
+            return Fail($"transfer distance {transferDistance:F3} m exceeds {MaxTransferDistanceM:F2} m", out error);
+
+        // An occupied target is only legal when the requested target Z is above the
+        // perceived obstacle top (stacking). This prevents placing through another block.
+        foreach (var obstacle in scene.Where(o => !ReferenceEquals(o, source)))
+        {
+            if (Distance2D(obstacle.X, obstacle.Y, target.WorldX, target.WorldY) > OccupancyRadiusM)
+                continue;
+            if (target.WorldZ + 0.003 < obstacle.Z + Math.Max(source.Z, 0.005))
+                return Fail($"target overlaps {obstacle.Name} without a safe stacking height", out error);
+        }
+
+        double highestObstacle = scene.Count == 0 ? 0.0 : scene.Max(o => Math.Max(0.0, o.Z));
+        double requiredSourceLift = Math.Clamp(
+            highestObstacle + ObstacleClearanceM - source.Z,
+            MinTravelClearanceM,
+            0.15);
+        double requiredTargetLift = Math.Clamp(
+            highestObstacle + ObstacleClearanceM - target.WorldZ,
+            MinTravelClearanceM,
+            0.15);
+
         if (plan == null || plan.ActionSequence.Count == 0)
             return Fail("empty action_sequence", out error);
         if (plan.ActionSequence.Count > 20)
@@ -33,6 +77,12 @@ public static class MotionPlanValidator
                     return Fail($"call {i}: {a.Function} requires source/target", out error);
                 if (a.HeightM is < 0.05 or > 0.15 || a.HeightM == null)
                     return Fail($"call {i}: height_m must be 0.05..0.15", out error);
+
+                double required = a.Location == "source" ? requiredSourceLift : requiredTargetLift;
+                if (a.HeightM.Value + 1e-6 < required)
+                    return Fail(
+                        $"call {i}: height_m {a.HeightM.Value:F3} is below collision clearance {required:F3}",
+                        out error);
             }
             if (a.Function == "descend" && a.Location is not ("source" or "target"))
                 return Fail($"call {i}: descend requires source/target", out error);
@@ -81,6 +131,16 @@ public static class MotionPlanValidator
         if (!released || holding || phase != "home")
             return Fail("plan must release, retreat, and finish at home", out error);
         return true;
+    }
+
+    private static bool InsideWorkspace(double x, double y) =>
+        x >= MinX && x <= MaxX && y >= MinY && y <= MaxY;
+
+    private static double Distance2D(double x1, double y1, double x2, double y2)
+    {
+        double dx = x1 - x2;
+        double dy = y1 - y2;
+        return Math.Sqrt(dx * dx + dy * dy);
     }
 
     private static bool Fail(string message, out string error)

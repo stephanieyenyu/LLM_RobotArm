@@ -245,7 +245,7 @@ async Task RunPatternTaskAsync(string userCommand)
                 motionPlan = null;
                 continue;
             }
-            if (MotionPlanValidator.TryValidate(motionPlan, out validationError)) break;
+            if (MotionPlanValidator.TryValidate(motionPlan, assignment, beforeSnap, out validationError)) break;
             Console.WriteLine($"[Layer 4A] 第 {planAttempt} 次規劃未通過安全驗證：{validationError}");
             motionPlan = null;
         }
@@ -381,7 +381,7 @@ async Task RunSingleObjectTaskAsync(RoutedCommand routed, List<SceneObject> init
                 continue;
             }
 
-            if (MotionPlanValidator.TryValidate(motionPlan, out validationError))
+            if (MotionPlanValidator.TryValidate(motionPlan, assignment, beforeSnap, out validationError))
                 break;
             Console.WriteLine($"[MotionPlanner] Attempt {planAttempt} rejected: {validationError}");
             motionPlan = null;

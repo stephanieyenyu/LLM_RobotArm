@@ -26,9 +26,11 @@ public class WorkspaceBounds
     //   grid X 範圍：0.42 ～ 0.42 + 4*0.05 = 0.62，最右欄接近但不超過 QR2。
     //   grid Y 範圍：0.03 ～ 0.03 + 4*0.05 = 0.23，距離 QR3 保留 5 cm。
     // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
-    public double TargetOriginX { get; set; } = 0.42;
-    public double TargetOriginY { get; set; } = 0.03;
-    public double CellSize { get; set; } = 0.05;
+    // Keep the complete 5x5 placement area away from the UR base while using
+    // 5.5 cm center spacing (about 3 cm clear gap for a 2.5 cm cube).
+    public double TargetOriginX { get; set; } = 0.48;
+    public double TargetOriginY { get; set; } = 0.00;
+    public double CellSize { get; set; } = 0.06;
     public double DefaultBlockZ { get; set; } = 0.025;
     public int MaxRows { get; set; } = 5;
     public int MaxCols { get; set; } = 5;

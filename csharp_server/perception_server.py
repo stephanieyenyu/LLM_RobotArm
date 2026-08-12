@@ -38,12 +38,17 @@ BASE_DIR = Path(__file__).resolve().parent
 # --- Intel RealSense D435i ---
 # USB 2.1 上限：depth 480x270 + color 640x480 @ 6fps（其他組合啟動失敗）
 # 換到 USB 3 之後可以升到 1280x720
-CAMERA_WIDTH = 1280              # color 解析度
-CAMERA_HEIGHT = 720
-DEPTH_WIDTH = 848               # depth 解析度（會 align 到 color 座標）
+CAMERA_WIDTH = 1920              # color 解析度
+CAMERA_HEIGHT = 1080
+DEPTH_WIDTH = 640               # depth 解析度（會 align 到 color 座標）
 DEPTH_HEIGHT = 480
-CAMERA_FPS = 30
+CAMERA_FPS = 15
 CAMERA_BRIGHTNESS_MIN = 15.0
+#CAMERA_WIDTH = 640
+#CAMERA_HEIGHT = 480
+#DEPTH_WIDTH = 480
+#DEPTH_HEIGHT = 270
+#CAMERA_FPS = 6
 
 DETECT_INTERVAL_SEC = 0.2       # 目標偵測間隔（0.2s = 5 FPS）
 SERVER_HOST = "127.0.0.1"        # 只綁 loopback（同機 csharp_server 用），避免暴露到 LAN
@@ -72,10 +77,14 @@ ARUCO_ID_TO_NAME = {1: "QR1", 2: "QR2", 3: "QR3", 4: "QR4"}
 QR_MASK_DILATION_PX = 30        # QR bbox 向外擴幾個像素，避免邊緣殘影誤判成立方體（1280x720 用 30；640x480 用 15）
 
 # --- HSV 立方體遮罩參數 ---
-YELLOW_HSV_LOW = np.array([18, 100, 100])
+YELLOW_HSV_LOW = np.array([10, 100, 100])
 YELLOW_HSV_HIGH = np.array([38, 255, 255])
 BLACK_HSV_LOW = np.array([0, 0, 0])
-BLACK_HSV_HIGH = np.array([180, 80, 60])
+# Black cardboard is not pixel-black under the current RealSense exposure;
+# highlights on its faces often exceed V=60. Keep hue unrestricted and allow
+# moderate saturation/brightness, while contour area/shape and workspace ROI
+# continue filtering table holes, QR markers, and large shadows.
+BLACK_HSV_HIGH = np.array([180, 120, 110])
 # HSV 形狀偵測參數
 # 目前支援兩種積木：
 #   cube   = 2.5 × 2.5 × 2.5 cm（正方形俯視）
@@ -87,15 +96,18 @@ CUBE_RATIO_MAX = 1.35           # 長短邊比 <= 這個 → 視為 cube
 
 DOMINO_MIN_AREA_PX = 1400       # domino 面積約 cube 的 2 倍
 DOMINO_MAX_AREA_PX = 12000
-DOMINO_RATIO_MIN = 1.65         # 長短邊比在這區間 → 視為 domino
-DOMINO_RATIO_MAX = 2.40
+DOMINO_RATIO_MIN = 1.65  # 長短邊比在這區間 → 視為 domino
+DOMINO_RATIO_MAX = 2.4
+# Perspective can shorten a real 2:1 domino to roughly 1.45 in the image.
+# Area, solidity, and watershed checks still apply after this threshold.
+DOMINO_RATIO_MIN = 1.45
 DOMINO_ORIENTATION_TOL_DEG = 22.5   # 長軸偏離 X/Y 軸多少度內視為對齊；超過則當「斜擺」拒絕
 
 SOLIDITY_MIN = 0.80             # 小物件輪廓比較毛，稍微放寬
 
 # --- 多幀穩定濾波（減少 orientation / 面積門檻邊緣物件的閃爍）---
 STABILITY_WINDOW = 5            # 檢查過去這麼多幀
-STABILITY_MIN_HITS = 3          # 至少在 N 幀中出現這麼多次才回報
+STABILITY_MIN_HITS = 1          # 至少在 N 幀中出現這麼多次才回報
 STABILITY_MATCH_PX = 25         # 中心點差 < 這個像素就當作「同一顆物件」
 _recent_frames = deque(maxlen=STABILITY_WINDOW)
 
@@ -109,6 +121,14 @@ ROI_MIN_QRS = 3
 ROI_MARGIN_PX = 10
 
 CUBE_SKEW_TOL_DEG = 6.0
+
+# --- Touching-cube watershed split ---
+# Only contours that already look like a domino are considered. The split is
+# accepted only when it yields exactly two similarly sized, near-square parts.
+WATERSHED_PEAK_RATIO = 0.52
+WATERSHED_CUBE_RATIO_MAX = 1.50
+WATERSHED_AREA_BALANCE_MIN = 0.65
+WATERSHED_MIN_PART_AREA_FACTOR = 0.45
 
 # --- Part B: QR + solvePnP 3D 座標對應 ---
 QR_SIZE_M = 0.073                    # ArUco 實際邊長，公尺
@@ -246,6 +266,100 @@ def detect_qrcodes(image_bgr):
     return qrcodes, qr_mask
 
 
+def split_touching_cubes(image_bgr, binary_mask, contour):
+    """Try to split one domino-like contour into two touching cube contours."""
+    x, y, w, h = cv2.boundingRect(contour)
+    if w < 3 or h < 3:
+        return []
+
+    roi_image = image_bgr[y:y + h, x:x + w].copy()
+    roi_mask = binary_mask[y:y + h, x:x + w].copy()
+
+    contour_mask = np.zeros((h, w), dtype=np.uint8)
+    shifted = contour.copy()
+    shifted[:, 0, 0] -= x
+    shifted[:, 0, 1] -= y
+    cv2.drawContours(contour_mask, [shifted], -1, 255, -1)
+    roi_mask = cv2.bitwise_and(roi_mask, contour_mask)
+
+    distance = cv2.distanceTransform(roi_mask, cv2.DIST_L2, 5)
+    max_distance = float(distance.max())
+    if max_distance <= 0:
+        return []
+
+    sure_foreground = np.uint8(
+        distance >= WATERSHED_PEAK_RATIO * max_distance
+    ) * 255
+    component_count, markers = cv2.connectedComponents(sure_foreground)
+    # One background plus exactly two object seeds.
+    if component_count != 3:
+        return []
+
+    sure_background = cv2.dilate(
+        roi_mask, np.ones((3, 3), np.uint8), iterations=1
+    )
+    unknown = cv2.subtract(sure_background, sure_foreground)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+    markers = cv2.watershed(roi_image, markers)
+
+    parts = []
+    part_areas = []
+    for marker_id in np.unique(markers):
+        if marker_id <= 1:
+            continue
+        part_mask = np.uint8(markers == marker_id) * 255
+        contours, _ = cv2.findContours(
+            part_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            continue
+        part = max(contours, key=cv2.contourArea)
+        part_area = float(cv2.contourArea(part))
+        if part_area < CUBE_MIN_AREA_PX * WATERSHED_MIN_PART_AREA_FACTOR:
+            continue
+
+        (_, _), (part_w, part_h), _ = cv2.minAreaRect(part)
+        if part_w < 1 or part_h < 1:
+            continue
+        part_ratio = max(part_w, part_h) / min(part_w, part_h)
+        if part_ratio > WATERSHED_CUBE_RATIO_MAX:
+            continue
+
+        part[:, 0, 0] += x
+        part[:, 0, 1] += y
+        parts.append(part)
+        part_areas.append(part_area)
+
+    if len(parts) != 2:
+        return []
+    area_balance = min(part_areas) / max(part_areas)
+    if area_balance < WATERSHED_AREA_BALANCE_MIN:
+        return []
+    return parts
+
+
+def append_cube_detection(detections, contour, color_name, confidence, source):
+    """Append one cube detection generated from an HSV or watershed contour."""
+    (cx, cy), (_, _), angle = cv2.minAreaRect(contour)
+    raw_skew = angle % 90
+    if raw_skew > 45:
+        raw_skew -= 90
+    skew_deg = 0.0 if abs(raw_skew) < CUBE_SKEW_TOL_DEG else round(raw_skew, 2)
+    x, y, w, h = cv2.boundingRect(contour)
+    detections.append({
+        "name": f"{color_name}_cube",
+        "confidence": round(confidence, 3),
+        "bbox": [round(float(x), 2), round(float(y), 2),
+                 round(float(x + w), 2), round(float(y + h), 2)],
+        "center_pixel": [round(float(cx), 2), round(float(cy), 2)],
+        "source": source,
+        "shape": "cube",
+        "orientation": None,
+        "skew_deg": skew_deg,
+    })
+
+
 def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None):
     """
     對單一顏色 HSV 範圍找 cube（2.5×2.5）或 domino（5×2.5）兩種形狀。
@@ -267,7 +381,9 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
     # 3x3 kernel：2.5 cm cube 在畫面上只有 ~20x20 px，5x5 open 會侵蝕太多
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # Do not apply MORPH_CLOSE here. Closing bridges narrow background gaps and
+    # makes two adjacent cubes look like one 2:1 domino contour. Keeping the gap
+    # intact lets findContours return two independent cube detections.
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -302,6 +418,15 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
             orientation = None
         elif (DOMINO_RATIO_MIN <= ratio <= DOMINO_RATIO_MAX
               and DOMINO_MIN_AREA_PX <= area <= DOMINO_MAX_AREA_PX):
+            split_parts = split_touching_cubes(image_bgr, mask, cnt)
+            if len(split_parts) == 2:
+                for part in split_parts:
+                    append_cube_detection(
+                        detections, part, color_name, solidity,
+                        "cube_hsv_watershed"
+                    )
+                continue
+
             shape = "domino"
             # 長軸角度 normalize 到 [0, 180)：0=沿 X（水平）、90=沿 Y（垂直）
             long_angle = angle if rw >= rh else angle + 90

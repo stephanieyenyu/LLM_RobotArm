@@ -79,14 +79,17 @@ public class JsonExecutor : MonoBehaviour
     public UIManager uiManager;
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
-    private const float QR1_X = -0.36552f;
-    private const float QR1_Y = -0.40836f;
-    private const float QR1_Z = 0.035f;
+    private const float QR1_X = -0.36226f;
+    private const float QR1_Y = -0.36136f;
+    private const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;
     private const float Z_CORRECTION = 0.02f;
-    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.15f;
+    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.22f;
     private const float SKEW_SIGN = 1f;
+    // Reject TCP targets too close to the base axis. Reaching into this cylinder
+    // requires a tightly folded arm and can make adjacent UR3e links collide.
+    private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
 
     // Home 關節角度，單位為 rad：[base, shoulder, elbow, wrist1, wrist2, wrist3]
     // 若實機姿勢不符，請由 Teach Pendant 讀取 home 姿勢後更新此值。
@@ -249,6 +252,17 @@ public class JsonExecutor : MonoBehaviour
         float tz = QR1_Z + env.target_position.z + Z_CORRECTION;
         float travelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
 
+        if (InsideBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty))
+        {
+            string error = $"unsafe target near UR base: source radius={Mathf.Sqrt(ox * ox + oy * oy):F3}m, " +
+                           $"target radius={Mathf.Sqrt(tx * tx + ty * ty):F3}m, " +
+                           $"minimum={BASE_EXCLUSION_RADIUS_M:F3}m";
+            Debug.LogError("[Executor] " + error);
+            WriteStepDone(env.step_id, false, error, 0f);
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            yield break;
+        }
+
         string srcOri = env.source_position.orientation ?? "";
         string tgtOri = env.target_position.orientation ?? "";
         float srcSkew = env.source_position.skew_deg;
@@ -282,11 +296,11 @@ public class JsonExecutor : MonoBehaviour
                 case "move_above":
                     // Use the configured travel plane for lateral motion, then the LLM-selected
                     // safe height. This preserves collision clearance while allowing variable plans.
-                    yield return SendMove(x, y, travelZ, orientation, skew, tag + " travel");
-                    yield return SendMove(x, y, z + height, orientation, skew, tag + " above");
+                    yield return SendMove(x, y, travelZ, orientation, skew, tag + " travel", false);
+                    yield return SendMove(x, y, z + height, orientation, skew, tag + " above", true);
                     break;
                 case "descend":
-                    yield return SendMove(x, y, z, orientation, skew, tag);
+                    yield return SendMove(x, y, z, orientation, skew, tag, true);
                     break;
                 case "grasp":
                     yield return SendGrasp();
@@ -295,7 +309,9 @@ public class JsonExecutor : MonoBehaviour
                     yield return SendRelease();
                     break;
                 case "lift":
-                    yield return SendMove(x, y, z + height, orientation, skew, tag);
+                    // A lift must be Cartesian-linear. movej can change IK branch and
+                    // swing/fold the links even when only TCP Z changes.
+                    yield return SendMove(x, y, z + height, orientation, skew, tag, true);
                     break;
                 case "wait":
                     yield return new WaitForSeconds(Mathf.Clamp(action.seconds > 0f ? action.seconds : 0.5f, 0.1f, 3f));
@@ -323,12 +339,31 @@ public class JsonExecutor : MonoBehaviour
         Debug.Log($"═══ Step {env.step_id} 完成 ({duration:F1}s) ═══");
     }
 
-    IEnumerator SendMove(float x, float y, float z, string orientation, float skewDeg, string tag)
+    IEnumerator SendMove(
+        float x, float y, float z, string orientation, float skewDeg, string tag, bool linear)
     {
-        string cmd = BuildMovejLine(x, y, z, orientation, skewDeg);
+        string cmd = linear
+            ? BuildMovelLine(x, y, z, orientation, skewDeg)
+            : BuildMovejLine(x, y, z, orientation, skewDeg);
         Debug.Log($"  [{tag}] SEND: {cmd}");
         urListener.SendCommand(cmd);
         yield return new WaitForSeconds(3f);
+    }
+
+    bool InsideBaseExclusion(float x, float y)
+    {
+        return (x * x + y * y) < BASE_EXCLUSION_RADIUS_M * BASE_EXCLUSION_RADIUS_M;
+    }
+
+    string BuildMovelLine(float x, float y, float z, string orientation, float skewDeg)
+    {
+        bool rotate = orientation != "horizontal";
+        float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
+        float totalRad = totalDeg * Mathf.Deg2Rad;
+        string pose = Mathf.Abs(totalDeg) > 0.01f
+            ? $"pose_trans(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], p[0, 0, 0, 0, 0, {totalRad:F4}])"
+            : $"p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0]";
+        return $"movel({pose}, a=0.3, v=0.10)";
     }
 
     IEnumerator SendGrasp()
@@ -351,9 +386,10 @@ public class JsonExecutor : MonoBehaviour
         float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
         float totalRad = totalDeg * Mathf.Deg2Rad;
 
-        string qnear = rotate
-            ? "[0, -1.5708, 1.5708, -1.5708, -1.5708, 1.5708]"
-            : "[0, -1.5708, 1.5708, -1.5708, -1.5708, 0]";
+        // Keep the current elbow/wrist configuration as the IK seed. A fixed qnear
+        // can select the folded-back branch and make the forearm collide with the
+        // upper arm even though the requested TCP pose itself is reachable.
+        const string qnear = "get_actual_joint_positions()";
 
         if (Mathf.Abs(totalDeg) > 0.01f)
         {

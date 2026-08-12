@@ -57,6 +57,11 @@ public sealed class MotionPlanner
                 4. Finish with go_home.
                 5. height_m must be between 0.05 and 0.15.
                 6. Use no more than 20 function calls.
+                7. Use at least 0.08 m clearance above both endpoints. Increase it when
+                   the perceived scene contains taller blocks, stacks, or obstacles.
+                8. Never plan a lateral move while the tool is descended. Never place
+                   through an occupied target; an occupied target is legal only for a
+                   stack whose target Z is above the perceived lower object.
                 Return only schema-valid JSON.
                 """),
             new UserChatMessage($$"""
