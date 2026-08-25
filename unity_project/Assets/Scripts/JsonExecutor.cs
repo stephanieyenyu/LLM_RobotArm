@@ -79,8 +79,8 @@ public class JsonExecutor : MonoBehaviour
     public UIManager uiManager;
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
-    private const float QR1_X = -0.36226f;
-    private const float QR1_Y = -0.36136f;
+    private const float QR1_X = -0.38631f;
+    private const float QR1_Y = -0.35502f;
     private const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;

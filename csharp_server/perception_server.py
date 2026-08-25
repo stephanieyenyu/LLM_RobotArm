@@ -86,10 +86,14 @@ BLACK_HSV_LOW = np.array([0, 0, 0])
 # continue filtering table holes, QR markers, and large shadows.
 BLACK_HSV_HIGH = np.array([180, 120, 110])
 
-GREEN_MARKER_HSV_LOW = np.array([40, 80, 80])
-GREEN_MARKER_HSV_HIGH = np.array([85, 255, 255])
-GREEN_MARKER_MIN_AREA_PX = 20
-GREEN_MARKER_MAX_AREA_PX = 800
+# Fluorescent-green center sticker on each domino. OpenCV hue uses 0..179.
+# These bounds intentionally require high saturation so the white table and
+# yellow blocks are excluded. Tune H only if the live debug view misses it.
+DOMINO_MARKER_HSV_LOW = np.array([35, 100, 80])
+DOMINO_MARKER_HSV_HIGH = np.array([95, 255, 255])
+DOMINO_MARKER_MIN_AREA_PX = 20
+DOMINO_MARKER_MAX_AREA_PX = 1800
+DOMINO_MARKER_MIN_CIRCULARITY = 0.50
 # HSV 形狀偵測參數
 # 目前支援兩種積木：
 #   cube   = 2.5 × 2.5 × 2.5 cm（正方形俯視）
@@ -365,7 +369,56 @@ def append_cube_detection(detections, contour, color_name, confidence, source):
     })
 
 
-def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None):
+def detect_domino_markers(image_bgr, exclude_mask=None):
+    """Return fluorescent-green circular sticker centers in pixel coordinates."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, DOMINO_MARKER_HSV_LOW, DOMINO_MARKER_HSV_HIGH)
+    if exclude_mask is not None:
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(exclude_mask))
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    markers = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < DOMINO_MARKER_MIN_AREA_PX or area > DOMINO_MARKER_MAX_AREA_PX:
+            continue
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 0:
+            continue
+        circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+        if circularity < DOMINO_MARKER_MIN_CIRCULARITY:
+            continue
+        moments = cv2.moments(contour)
+        if moments["m00"] == 0:
+            continue
+        cx = float(moments["m10"] / moments["m00"])
+        cy = float(moments["m01"] / moments["m00"])
+        markers.append({
+            "center": [cx, cy],
+            "area": area,
+            "circularity": circularity,
+        })
+    return markers
+
+
+def marker_for_contour(markers, contour, fallback_center):
+    """Choose the marker inside a domino contour and nearest its visual center."""
+    inside = []
+    fx, fy = fallback_center
+    for marker in markers:
+        mx, my = marker["center"]
+        if cv2.pointPolygonTest(contour, (float(mx), float(my)), False) >= 0:
+            distance_sq = (mx - fx) ** 2 + (my - fy) ** 2
+            inside.append((distance_sq, marker))
+    return min(inside, key=lambda item: item[0])[1] if inside else None
+
+
+def hsv_shape_detect(
+        image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None,
+        domino_markers=None):
     """
     對單一顏色 HSV 範圍找 cube（2.5×2.5）或 domino（5×2.5）兩種形狀。
     用旋轉最小外接矩形（minAreaRect）取長短邊，比軸對齊 boundingRect 準——
@@ -452,6 +505,14 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
         else:
             continue
 
+        # Dominoes use the fluorescent sticker as the true grasp center. Cubes
+        # continue using minAreaRect, so their existing calibration is unchanged.
+        marker = None
+        if shape == "domino" and domino_markers:
+            marker = marker_for_contour(domino_markers, cnt, (rcx, rcy))
+            if marker is not None:
+                rcx, rcy = marker["center"]
+
         # 軸對齊 bbox 保留給 depth 讀取跟 workspace polygon 判定用，跟原本一致
         x, y, w, h = cv2.boundingRect(cnt)
         center_x, center_y = rcx, rcy
@@ -478,7 +539,7 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
             if marker_candidates:
                 _, center_x, center_y = max(marker_candidates, key=lambda item: item[0])
 
-        detections.append({
+        detection = {
             "name": f"{color_name}_{shape}",
             "confidence": round(solidity, 3),
             "bbox": [round(float(x), 2), round(float(y), 2),
@@ -488,7 +549,13 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
             "shape": shape,
             "orientation": orientation,
             "skew_deg": skew_deg,
-        })
+            "center_source": "green_marker" if marker is not None else "min_area_rect",
+        }
+        if marker is not None:
+            detection["marker_center_pixel"] = [
+                round(float(rcx), 2), round(float(rcy), 2)
+            ]
+        detections.append(detection)
     return detections
 
 
@@ -931,12 +998,19 @@ def detect_all(image_bgr, depth_image=None):
 
     qrcodes, qr_mask = detect_qrcodes(image_bgr)
     workspace_polygon = build_workspace_polygon(qrcodes)
+    domino_markers = detect_domino_markers(image_bgr, qr_mask)
 
     yolo_dets = yolo_detect_np(YOLO11N, image_bgr, COCO_TARGETS, "yolo_coco", YOLO_CONF)
     # 一次找 cube + domino（每個顏色都會回傳兩種形狀混合的清單）
     cube_dets = (
-        hsv_shape_detect(image_bgr, YELLOW_HSV_LOW, YELLOW_HSV_HIGH, "yellow", qr_mask)
-        + hsv_shape_detect(image_bgr, BLACK_HSV_LOW, BLACK_HSV_HIGH, "black", qr_mask)
+        hsv_shape_detect(
+            image_bgr, YELLOW_HSV_LOW, YELLOW_HSV_HIGH, "yellow", qr_mask,
+            domino_markers
+        )
+        + hsv_shape_detect(
+            image_bgr, BLACK_HSV_LOW, BLACK_HSV_HIGH, "black", qr_mask,
+            domino_markers
+        )
     )
 
     # 只保留在 QR 圍出的工作區內的偵測 → 手臂本體、桌邊雜物都會被濾掉
@@ -1179,6 +1253,7 @@ def endpoint_frame():
         "yolo_coco": (0, 255, 0),
         "yolo_pliers": (0, 0, 255),
         "cube_hsv": (0, 255, 255),
+        "cube_hsv_watershed": (255, 255, 0),
     }
     for obj in objects:
         x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
@@ -1188,6 +1263,12 @@ def endpoint_frame():
         cv2.circle(frame, (int(cx), int(cy)), 6, (0, 0, 255), -1)
         cv2.putText(frame, f"{obj['name']} {obj['confidence']:.2f}",
                     (x1, max(y1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2)
+        marker = obj.get("marker_center_pixel")
+        if marker is not None:
+            mx, my = [int(v) for v in marker]
+            cv2.circle(frame, (mx, my), 7, (0, 255, 0), 2)
+            cv2.drawMarker(frame, (mx, my), (255, 255, 255),
+                           cv2.MARKER_CROSS, 12, 2)
     for qr in qrs:
         cx, cy = qr["center_pixel"]
         cv2.circle(frame, (int(cx), int(cy)), 8, (0, 0, 255), -1)

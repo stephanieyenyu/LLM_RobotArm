@@ -72,6 +72,7 @@ if (File.Exists(currentStepPath)) File.Delete(currentStepPath);
 if (File.Exists(stepDonePath)) File.Delete(stepDonePath);
 
 int globalStepId = 0;
+const double UNITY_STEP_TIMEOUT_SEC = 600;
 
 while (true)
 {
@@ -277,7 +278,8 @@ async Task RunPatternTaskAsync(string userCommand)
         WriteStepFile(envelope);
 
         Console.WriteLine($"[Layer 4] 送出 step {assignment.StepId}，等待 Unity 執行...");
-        var execResult = await WaitForStepDoneAsync(assignment.StepId, timeoutSec: 90);
+        var execResult = await WaitForStepDoneAsync(
+            assignment.StepId, timeoutSec: UNITY_STEP_TIMEOUT_SEC);
         if (execResult == null || !execResult.Completed)
         {
             Console.WriteLine($"[Layer 4] 執行 timeout 或失敗：{execResult?.Error}");
@@ -420,7 +422,8 @@ async Task RunSingleObjectTaskAsync(RoutedCommand routed, List<SceneObject> init
 
         WriteStepFile(envelope);
         Console.WriteLine($"[Executor] Sent step {assignment.StepId}; waiting for Unity...");
-        var execResult = await WaitForStepDoneAsync(assignment.StepId, timeoutSec: 90);
+        var execResult = await WaitForStepDoneAsync(
+            assignment.StepId, timeoutSec: UNITY_STEP_TIMEOUT_SEC);
         if (execResult == null || !execResult.Completed)
         {
             feedback = execResult?.Error ?? "Unity execution timeout";
