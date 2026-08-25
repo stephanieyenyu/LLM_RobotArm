@@ -85,6 +85,11 @@ BLACK_HSV_LOW = np.array([0, 0, 0])
 # moderate saturation/brightness, while contour area/shape and workspace ROI
 # continue filtering table holes, QR markers, and large shadows.
 BLACK_HSV_HIGH = np.array([180, 120, 110])
+
+GREEN_MARKER_HSV_LOW = np.array([40, 80, 80])
+GREEN_MARKER_HSV_HIGH = np.array([85, 255, 255])
+GREEN_MARKER_MIN_AREA_PX = 20
+GREEN_MARKER_MAX_AREA_PX = 800
 # HSV 形狀偵測參數
 # 目前支援兩種積木：
 #   cube   = 2.5 × 2.5 × 2.5 cm（正方形俯視）
@@ -347,6 +352,29 @@ def append_cube_detection(detections, contour, color_name, confidence, source):
         raw_skew -= 90
     skew_deg = 0.0 if abs(raw_skew) < CUBE_SKEW_TOL_DEG else round(raw_skew, 2)
     x, y, w, h = cv2.boundingRect(contour)
+    center_x, center_y = rcx, rcy
+
+if shape == "domino":
+    roi = image_bgr[y:y+h, x:x+w]
+    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(hsv_roi, GREEN_MARKER_HSV_LOW, GREEN_MARKER_HSV_HIGH)
+
+    green_contours, _ = cv2.findContours(
+        green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    marker_candidates = []
+    for gc in green_contours:
+        marker_area = cv2.contourArea(gc)
+        if GREEN_MARKER_MIN_AREA_PX <= marker_area <= GREEN_MARKER_MAX_AREA_PX:
+            M = cv2.moments(gc)
+            if M["m00"] != 0:
+                mx = x + M["m10"] / M["m00"]
+                my = y + M["m01"] / M["m00"]
+                marker_candidates.append((marker_area, mx, my))
+
+    if marker_candidates:
+        _, center_x, center_y = max(marker_candidates, key=lambda item: item[0])
     detections.append({
         "name": f"{color_name}_cube",
         "confidence": round(confidence, 3),
