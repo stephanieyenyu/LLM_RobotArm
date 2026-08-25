@@ -1184,6 +1184,8 @@ def endpoint_frame():
         x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
         c = color_map.get(obj["source"], (255, 255, 255))
         cv2.rectangle(frame, (x1, y1), (x2, y2), c, 3)
+        cx, cy = obj["center_pixel"]
+        cv2.circle(frame, (int(cx), int(cy)), 6, (0, 0, 255), -1)
         cv2.putText(frame, f"{obj['name']} {obj['confidence']:.2f}",
                     (x1, max(y1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2)
     for qr in qrs:
