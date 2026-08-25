@@ -352,29 +352,6 @@ def append_cube_detection(detections, contour, color_name, confidence, source):
         raw_skew -= 90
     skew_deg = 0.0 if abs(raw_skew) < CUBE_SKEW_TOL_DEG else round(raw_skew, 2)
     x, y, w, h = cv2.boundingRect(contour)
-    center_x, center_y = rcx, rcy
-
-if shape == "domino":
-    roi = image_bgr[y:y+h, x:x+w]
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    green_mask = cv2.inRange(hsv_roi, GREEN_MARKER_HSV_LOW, GREEN_MARKER_HSV_HIGH)
-
-    green_contours, _ = cv2.findContours(
-        green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    marker_candidates = []
-    for gc in green_contours:
-        marker_area = cv2.contourArea(gc)
-        if GREEN_MARKER_MIN_AREA_PX <= marker_area <= GREEN_MARKER_MAX_AREA_PX:
-            M = cv2.moments(gc)
-            if M["m00"] != 0:
-                mx = x + M["m10"] / M["m00"]
-                my = y + M["m01"] / M["m00"]
-                marker_candidates.append((marker_area, mx, my))
-
-    if marker_candidates:
-        _, center_x, center_y = max(marker_candidates, key=lambda item: item[0])
     detections.append({
         "name": f"{color_name}_cube",
         "confidence": round(confidence, 3),
@@ -477,13 +454,36 @@ def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None
 
         # 軸對齊 bbox 保留給 depth 讀取跟 workspace polygon 判定用，跟原本一致
         x, y, w, h = cv2.boundingRect(cnt)
+        center_x, center_y = rcx, rcy
+
+        if shape == "domino":
+            roi = image_bgr[y:y+h, x:x+w]
+            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            green_mask = cv2.inRange(hsv_roi, GREEN_MARKER_HSV_LOW, GREEN_MARKER_HSV_HIGH)
+
+            green_contours, _ = cv2.findContours(
+                green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            marker_candidates = []
+            for gc in green_contours:
+                marker_area = cv2.contourArea(gc)
+                if GREEN_MARKER_MIN_AREA_PX <= marker_area <= GREEN_MARKER_MAX_AREA_PX:
+                    M = cv2.moments(gc)
+                    if M["m00"] != 0:
+                        mx = x + M["m10"] / M["m00"]
+                        my = y + M["m01"] / M["m00"]
+                        marker_candidates.append((marker_area, mx, my))
+
+            if marker_candidates:
+                _, center_x, center_y = max(marker_candidates, key=lambda item: item[0])
 
         detections.append({
             "name": f"{color_name}_{shape}",
             "confidence": round(solidity, 3),
             "bbox": [round(float(x), 2), round(float(y), 2),
                      round(float(x + w), 2), round(float(y + h), 2)],
-            "center_pixel": [round(float(rcx), 2), round(float(rcy), 2)],   # 旋轉 bbox 中心較準
+            "center_pixel": [round(float(center_x), 2), round(float(center_y), 2)],
             "source": "cube_hsv",
             "shape": shape,
             "orientation": orientation,
