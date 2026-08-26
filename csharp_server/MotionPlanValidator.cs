@@ -8,6 +8,10 @@ public static class MotionPlanValidator
     private const double MaxX = 0.72;
     private const double MinY = 0.00;
     private const double MaxY = 0.45;
+    // QR pose and object centers can jitter by several millimetres near an edge.
+    // Permit a small measurement tolerance without disabling the independent UR
+    // base exclusion, transfer-distance, occupancy, and clearance checks.
+    private const double WorkspaceMeasurementToleranceM = 0.015;
     private const double MinTravelClearanceM = 0.08;
     private const double ObstacleClearanceM = 0.03;
     private const double MaxTransferDistanceM = 0.70;
@@ -30,7 +34,15 @@ public static class MotionPlanValidator
         var source = assignment.Source;
         var target = assignment.Target;
         if (!InsideWorkspace(source.X, source.Y) || !InsideWorkspace(target.WorldX, target.WorldY))
-            return Fail("source or target is outside the validated QR workspace", out error);
+            return Fail(
+                $"source or target is outside the validated QR workspace " +
+                $"(source=({source.X:F3},{source.Y:F3}), " +
+                $"target=({target.WorldX:F3},{target.WorldY:F3}), " +
+                $"allowed X={MinX - WorkspaceMeasurementToleranceM:F3}.." +
+                $"{MaxX + WorkspaceMeasurementToleranceM:F3}, " +
+                $"Y={MinY - WorkspaceMeasurementToleranceM:F3}.." +
+                $"{MaxY + WorkspaceMeasurementToleranceM:F3})",
+                out error);
 
         double transferDistance = Distance2D(source.X, source.Y, target.WorldX, target.WorldY);
         if (transferDistance > MaxTransferDistanceM)
@@ -134,7 +146,10 @@ public static class MotionPlanValidator
     }
 
     private static bool InsideWorkspace(double x, double y) =>
-        x >= MinX && x <= MaxX && y >= MinY && y <= MaxY;
+        x >= MinX - WorkspaceMeasurementToleranceM &&
+        x <= MaxX + WorkspaceMeasurementToleranceM &&
+        y >= MinY - WorkspaceMeasurementToleranceM &&
+        y <= MaxY + WorkspaceMeasurementToleranceM;
 
     private static double Distance2D(double x1, double y1, double x2, double y2)
     {

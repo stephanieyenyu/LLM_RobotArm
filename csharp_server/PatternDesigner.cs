@@ -51,14 +51,27 @@ var messages = new List<ChatMessage>
                  - 目前可用 domino 數量：{{dominoBudget}}
                  - 一顆 cube 可覆蓋 bitmap 中 1 格
                  - 一顆 domino 可覆蓋 bitmap 中相鄰的 2 格
+                 - 積木不足時不要硬生成簡化版，應該回報無法完成
                  - 請根據可用積木數量自行決定 bitmap 的 rows 和 columns
                  - 不一定要用滿最大尺寸；積木較少時，請生成較小但仍可辨識的圖案
                  - 對稱字母（H、O、X、I、A、T、U、V、W、M、Y）必須完全對稱
                  - 筆劃寬度統一為 1 格
+                 - 產生 bitmap 前，必須先判斷在目前尺寸與積木數量限制下，
+                   一般人是否能只看 bitmap 清楚辨識使用者要求的圖案
+                 - 不可以只因為使用者要求就勉強生成，也不可以只靠 pattern_id
+                   宣稱成功，但 bitmap 實際看起來像其他文字、數字或圖案
+                 - 複雜中文字、人物、動物或圖示若在 {{_maxRows}}×{{_maxCols}}
+                   與最多 {{maxCoveredCells}} 格內無法保留主要辨識特徵，必須拒絕
+                 - 例如「龍」若畫出來容易被看成數字 4，就必須回傳 feasible=false，
+                   不可用近似的 4 代替龍
+                 - feasible=false 時：bitmap 必須是空陣列，failure_reason 說明原因，
+                   並提供建議的最小 rows、columns 與 occupied cells
+                 - feasible=true 時：failure_reason 必須是空字串，bitmap 才能包含圖案
                  - 生成後你必須在 self_verification 欄位裡：
                      a) 檢查對稱性（水平 / 垂直是否對稱）
                      b) render ASCII 圖（■ 代表 1、□ 代表 0）
-                     c) 有問題就重畫再輸出
+                     c) 檢查圖案是否可辨識，以及最可能被誤認成什麼
+                     d) 有問題就重畫；仍無法辨識就回傳 feasible=false
                  只輸出符合 JSON schema 的 JSON，不加解釋文字。
                 """
             ),
@@ -77,8 +90,23 @@ var messages = new List<ChatMessage>
         var raw = JsonSerializer.Deserialize<LlmPatternResult>(json)
                   ?? throw new InvalidOperationException("Pattern LLM response parse failed.");
 
+        if (!raw.Feasible)
+        {
+            throw new InvalidOperationException(
+                $"目前限制下無法清楚排出此圖案：{raw.FailureReason} " +
+                $"建議至少 {raw.SuggestedRows}×{raw.SuggestedCols}、" +
+                $"可覆蓋 {raw.SuggestedOccupiedCells} 格。");
+        }
+
         if (raw.Bitmap == null || raw.Bitmap.Count == 0)
             throw new InvalidOperationException("Pattern LLM returned empty bitmap.");
+
+        if (raw.SelfVerification is { Recognizable: false })
+        {
+            throw new InvalidOperationException(
+                $"LLM 自我驗證認為圖案不可辨識；可能被誤認為：" +
+                $"{raw.SelfVerification.PossibleConfusion}");
+        }
 
      int[,] bitmap = BitmapParser.Parse(raw.Bitmap);
 
@@ -107,6 +135,11 @@ var messages = new List<ChatMessage>
             ["properties"] = new Dictionary<string, object?>
             {
                 ["pattern_id"] = new Dictionary<string, object?> { ["type"] = "string" },
+                ["feasible"] = new Dictionary<string, object?> { ["type"] = "boolean" },
+                ["failure_reason"] = new Dictionary<string, object?> { ["type"] = "string" },
+                ["suggested_rows"] = new Dictionary<string, object?> { ["type"] = "integer" },
+                ["suggested_cols"] = new Dictionary<string, object?> { ["type"] = "integer" },
+                ["suggested_occupied_cells"] = new Dictionary<string, object?> { ["type"] = "integer" },
                 ["bitmap"] = new Dictionary<string, object?>
                 {
                     ["type"] = "array",
@@ -120,12 +153,22 @@ var messages = new List<ChatMessage>
                     {
                         ["vertical_symmetric"] = new Dictionary<string, object?> { ["type"] = "boolean" },
                         ["horizontal_symmetric"] = new Dictionary<string, object?> { ["type"] = "boolean" },
+                        ["recognizable"] = new Dictionary<string, object?> { ["type"] = "boolean" },
+                        ["possible_confusion"] = new Dictionary<string, object?> { ["type"] = "string" },
                         ["ascii_render"] = new Dictionary<string, object?> { ["type"] = "string" },
                     },
-                    ["required"] = new[] { "vertical_symmetric", "horizontal_symmetric", "ascii_render" }
+                    ["required"] = new[]
+                    {
+                        "vertical_symmetric", "horizontal_symmetric", "recognizable",
+                        "possible_confusion", "ascii_render"
+                    }
                 }
             },
-            ["required"] = new[] { "pattern_id", "bitmap", "self_verification" }
+            ["required"] = new[]
+            {
+                "pattern_id", "feasible", "failure_reason", "suggested_rows",
+                "suggested_cols", "suggested_occupied_cells", "bitmap", "self_verification"
+            }
         };
         return JsonSerializer.Serialize(schema);
     }
@@ -135,10 +178,43 @@ var messages = new List<ChatMessage>
         [System.Text.Json.Serialization.JsonPropertyName("pattern_id")]
         public string? PatternId { get; set; }
 
+        [System.Text.Json.Serialization.JsonPropertyName("feasible")]
+        public bool Feasible { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("failure_reason")]
+        public string FailureReason { get; set; } = "";
+
+        [System.Text.Json.Serialization.JsonPropertyName("suggested_rows")]
+        public int SuggestedRows { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("suggested_cols")]
+        public int SuggestedCols { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("suggested_occupied_cells")]
+        public int SuggestedOccupiedCells { get; set; }
+
         [System.Text.Json.Serialization.JsonPropertyName("bitmap")]
         public List<string>? Bitmap { get; set; }
 
         [System.Text.Json.Serialization.JsonPropertyName("self_verification")]
-        public JsonElement? SelfVerification { get; set; }
+        public PatternSelfVerification? SelfVerification { get; set; }
+    }
+
+    private class PatternSelfVerification
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("vertical_symmetric")]
+        public bool VerticalSymmetric { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("horizontal_symmetric")]
+        public bool HorizontalSymmetric { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("recognizable")]
+        public bool Recognizable { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("possible_confusion")]
+        public string PossibleConfusion { get; set; } = "";
+
+        [System.Text.Json.Serialization.JsonPropertyName("ascii_render")]
+        public string AsciiRender { get; set; } = "";
     }
 }

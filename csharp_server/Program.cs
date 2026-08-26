@@ -71,7 +71,9 @@ if (File.Exists(inputPath)) File.WriteAllText(inputPath, "");
 if (File.Exists(currentStepPath)) File.Delete(currentStepPath);
 if (File.Exists(stepDonePath)) File.Delete(stepDonePath);
 
-int globalStepId = 0;
+// Keep step IDs unique when dotnet is restarted while Unity remains in Play
+// Mode; otherwise Unity can mistake a new Step 1/2/... for an old command.
+int globalStepId = checked((int)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 const double UNITY_STEP_TIMEOUT_SEC = 600;
 
 while (true)
@@ -208,10 +210,18 @@ async Task RunPatternTaskAsync(string userCommand)
     int retryCountThisStep = 0;
     string? motionFeedback = null;
     const int MAX_RETRY = 2;
+    const int MAX_NO_PROGRESS_ROUNDS = 5;
+    int noProgressRounds = 0;
+    int previousMatchedCount = -1;
+    int recoveryRound = 0;
+    bool recoveryMode = false;
 
-    // Layer 3/4/5 閉環
-    while (remainingTargets.Count > 0)
+    // Layer 3/4/5 閉環。每一輪執行完都做全局驗證；若仍有未匹配
+    // target，就用最新場景重建待辦並進入 recovery。
+    while (true)
     {
+      while (remainingTargets.Count > 0)
+      {
         globalStepId++;
         Console.WriteLine();
         Console.WriteLine($"─── Step {globalStepId} ───");
@@ -219,7 +229,12 @@ async Task RunPatternTaskAsync(string userCommand)
         // 每步重新掃描一次（Layer 3 需要最新 supply 狀況）
         var beforeSnap = await FetchSceneAsync();
 
-        var assignment = TaskAssigner.Assign(remainingTargets, beforeSnap, globalStepId);
+        var assignment = TaskAssigner.Assign(
+            remainingTargets,
+            beforeSnap,
+            globalStepId,
+            recoveryMode,
+            placedTargets);
         if (assignment == null)
         {
             Console.WriteLine("[Layer 3] 沒有可執行的 assignment（supply 用完或不足）");
@@ -323,6 +338,51 @@ async Task RunPatternTaskAsync(string userCommand)
         }
 
         Console.WriteLine($"       剩餘 targets: {remainingTargets.Count}");
+      }
+
+      // 一輪結束後不直接宣告任務完成；重新掃描整個場景，僅保留未匹配目標。
+      var roundSnap = await FetchSceneAsync();
+      var roundResults = Verifier.CheckOverall(realize.Targets, roundSnap);
+      int roundMatched = roundResults.Count(r => r.matched);
+
+      Console.WriteLine();
+      Console.WriteLine(recoveryMode
+          ? $"=== Recovery {recoveryRound} 驗證：{roundMatched}/{roundResults.Count} ==="
+          : $"=== 第一輪全局驗證：{roundMatched}/{roundResults.Count} ===");
+
+      if (roundMatched == roundResults.Count)
+      {
+          Console.WriteLine("所有目標位置均已匹配。");
+          break;
+      }
+
+      if (roundMatched > previousMatchedCount)
+          noProgressRounds = 0;
+      else
+          noProgressRounds++;
+      previousMatchedCount = roundMatched;
+
+      if (noProgressRounds >= MAX_NO_PROGRESS_ROUNDS)
+      {
+          Console.WriteLine(
+              $"連續 {MAX_NO_PROGRESS_ROUNDS} 輪沒有進展，停止自動恢復；" +
+              "請檢查積木是否掉出視野、辨識錯誤或供應不足。");
+          break;
+      }
+
+      placedTargets.Clear();
+      placedTargets.AddRange(roundResults.Where(r => r.matched).Select(r => r.target));
+      remainingTargets = roundResults.Where(r => !r.matched).Select(r => r.target).ToList();
+
+      recoveryMode = true;
+      recoveryRound++;
+      retryCountThisStep = 0;
+      motionFeedback = "全局驗證未匹配；重新掃描並回收放偏或掉落的同色同形積木。";
+
+      Console.WriteLine(
+          $"[Recovery {recoveryRound}] 將重新處理 {remainingTargets.Count} 個未匹配位置；" +
+          $"連續無進展 {noProgressRounds}/{MAX_NO_PROGRESS_ROUNDS} 輪。");
+      await Task.Delay(1000);
     }
 
     TaskDone:

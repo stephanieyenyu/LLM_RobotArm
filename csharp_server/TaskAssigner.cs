@@ -26,7 +26,9 @@ public static class TaskAssigner
     public static Assignment? Assign(
         List<TargetCell> remainingTargets,
         List<SceneObject> supplies,
-        int nextStepId)
+        int nextStepId,
+        bool recoveryMode = false,
+        IReadOnlyList<TargetCell>? protectedTargets = null)
     {
         if (remainingTargets == null || remainingTargets.Count == 0)
             return null;
@@ -41,11 +43,13 @@ public static class TaskAssigner
         {
             string expectedName = $"{target.ExpectedColor}_{target.ExpectedShape}";
 
-            // Step B：從 supply 池挑對應形狀 + 顏色的
+            // Step B：一般執行只從補貨區取料。Recovery 時允許回收掉在
+            // 工作區其他位置的同色同形積木，但不得移走已驗證成功的積木。
             var candidates = supplies
                 .Where(s => s != null
                             && string.Equals(s.Name, expectedName, StringComparison.Ordinal)
-                            && s.X < SUPPLY_ZONE_X_MAX)
+                            && (recoveryMode || s.X < SUPPLY_ZONE_X_MAX)
+                            && !OccupiesProtectedTarget(s, protectedTargets))
                 .ToList();
 
             if (candidates.Count == 0)
@@ -56,7 +60,22 @@ public static class TaskAssigner
                 .OrderBy(s => Dist2DSquared(s, target))
                 .First();
 
-            // Target 的 Z 用 source 實測（同種積木高度一致）
+            // RealSense can underestimate the top surface by several millimetres.
+            // Use at least the nominal target height, while preserving larger
+            // measurements for genuinely taller objects.
+            double safeBlockZ = Math.Max(chosen.Z, target.WorldZ);
+            var sourceWithSafeZ = new SceneObject
+            {
+                Name = chosen.Name,
+                X = chosen.X,
+                Y = chosen.Y,
+                Z = safeBlockZ,
+                Shape = chosen.Shape,
+                Orientation = chosen.Orientation,
+                SkewDeg = chosen.SkewDeg,
+            };
+
+            // Use the same safe height for the source and target descents.
             var targetWithMeasuredZ = new TargetCell
             {
                 Row = target.Row,
@@ -65,7 +84,7 @@ public static class TaskAssigner
                 SecondCol = target.SecondCol,
                 WorldX = target.WorldX,
                 WorldY = target.WorldY,
-                WorldZ = chosen.Z,
+                WorldZ = safeBlockZ,
                 ExpectedShape = target.ExpectedShape,
                 ExpectedColor = target.ExpectedColor,
                 ExpectedOrientation = target.ExpectedOrientation,
@@ -74,9 +93,12 @@ public static class TaskAssigner
             return new Assignment
             {
                 StepId = nextStepId,
-                Source = chosen,
+                Source = sourceWithSafeZ,
                 Target = targetWithMeasuredZ,
-                Reasoning = $"far-first target r{target.Row}c{target.Col} → nearest {expectedName} at ({chosen.X:F3},{chosen.Y:F3})",
+                Reasoning = $"{(recoveryMode ? "recovery" : "far-first")} target " +
+                            $"r{target.Row}c{target.Col} → nearest {expectedName} " +
+                            $"at ({chosen.X:F3},{chosen.Y:F3}); measured Z={chosen.Z:F3}, " +
+                            $"command Z={safeBlockZ:F3}",
             };
         }
 
@@ -89,5 +111,22 @@ public static class TaskAssigner
         double dx = a.X - b.WorldX;
         double dy = a.Y - b.WorldY;
         return dx * dx + dy * dy;
+    }
+
+    private static bool OccupiesProtectedTarget(
+        SceneObject candidate,
+        IReadOnlyList<TargetCell>? protectedTargets)
+    {
+        if (protectedTargets == null || protectedTargets.Count == 0)
+            return false;
+
+        const double protectedRadiusM = 0.025;
+        double radiusSquared = protectedRadiusM * protectedRadiusM;
+        return protectedTargets.Any(t =>
+        {
+            double dx = candidate.X - t.WorldX;
+            double dy = candidate.Y - t.WorldY;
+            return dx * dx + dy * dy < radiusSquared;
+        });
     }
 }

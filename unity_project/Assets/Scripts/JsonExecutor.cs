@@ -79,17 +79,24 @@ public class JsonExecutor : MonoBehaviour
     public UIManager uiManager;
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
-    private const float QR1_X = -0.38631f;
-    private const float QR1_Y = -0.35502f;
+    private const float QR1_X = -0.38824f;
+    private const float QR1_Y = -0.35973f+0.005f;
     private const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;
     private const float Z_CORRECTION = 0.02f;
     private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.22f;
-    private const float SKEW_SIGN = 1f;
+    // Fine-angle correction is intentionally disabled. We retain only the two
+    // discrete gripper directions: horizontal = 0 degrees, vertical = 90 degrees.
+    // private const float SKEW_SIGN = 1f;
     // Reject TCP targets too close to the base axis. Reaching into this cylinder
     // requires a tightly folded arm and can make adjacent UR3e links collide.
     private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
+    // Secondary-interface Cartesian feedback is not reliable on every UR setup.
+    // Use conservative command delays so a long reach to the right side finishes
+    // before descend/grasp is allowed to continue.
+    private const float JOINT_MOVE_WAIT_SEC = 6f;
+    private const float LINEAR_MOVE_WAIT_SEC = 5f;
 
     // Home 關節角度，單位為 rad：[base, shoulder, elbow, wrist1, wrist2, wrist3]
     // 若實機姿勢不符，請由 Teach Pendant 讀取 home 姿勢後更新此值。
@@ -97,6 +104,11 @@ public class JsonExecutor : MonoBehaviour
 
     private URPackageListener urListener;
     private int lastExecutedStepId = -1;
+    // C# step IDs restart when dotnet run is restarted while Unity may remain in
+    // the same Play Mode. Deduplicate by the complete JSON payload instead of
+    // step_id alone, otherwise a new task reusing Step 1/2/... is silently skipped.
+    private string lastProcessedStepJson = "";
+    private DateTime lastProcessedStepWriteTimeUtc = DateTime.MinValue;
 
     // 保存目前執行中的 ExecuteStep coroutine 與 step_id，供 Home 按鈕中止。
     private Coroutine currentStepCoroutine;
@@ -187,9 +199,15 @@ public class JsonExecutor : MonoBehaviour
             if (!File.Exists(path)) continue;
 
             StepEnvelope env;
+            string stepJson;
+            DateTime stepWriteTimeUtc;
             try
             {
-                env = JsonUtility.FromJson<StepEnvelope>(File.ReadAllText(path));
+                stepWriteTimeUtc = File.GetLastWriteTimeUtc(path);
+                stepJson = File.ReadAllText(path);
+                if (stepJson == lastProcessedStepJson &&
+                    stepWriteTimeUtc <= lastProcessedStepWriteTimeUtc) continue;
+                env = JsonUtility.FromJson<StepEnvelope>(stepJson);
             }
             catch (Exception ex)
             {
@@ -197,7 +215,9 @@ public class JsonExecutor : MonoBehaviour
                 continue;
             }
 
-            if (env == null || env.step_id == lastExecutedStepId) continue;
+            if (env == null) continue;
+            lastProcessedStepJson = stepJson;
+            lastProcessedStepWriteTimeUtc = stepWriteTimeUtc;
 
             if (env.done)
             {
@@ -265,8 +285,11 @@ public class JsonExecutor : MonoBehaviour
 
         string srcOri = env.source_position.orientation ?? "";
         string tgtOri = env.target_position.orientation ?? "";
-        float srcSkew = env.source_position.skew_deg;
-        float tgtSkew = env.target_position.skew_deg;
+        // Disable camera-estimated fine skew. It was causing noisy wrist rotation.
+        // float srcSkew = env.source_position.skew_deg;
+        // float tgtSkew = env.target_position.skew_deg;
+        float srcSkew = 0f;
+        float tgtSkew = 0f;
 
         var t0 = Time.realtimeSinceStartup;
 
@@ -326,6 +349,7 @@ public class JsonExecutor : MonoBehaviour
                     yield return StartCoroutine(SetPerceptionMode("idle"));
                     yield break;
             }
+
         }
 
         // 通知 perception 回到 idle，讓 SceneSyncer 擷取最新場景。
@@ -347,7 +371,7 @@ public class JsonExecutor : MonoBehaviour
             : BuildMovejLine(x, y, z, orientation, skewDeg);
         Debug.Log($"  [{tag}] SEND: {cmd}");
         urListener.SendCommand(cmd);
-        yield return new WaitForSeconds(3f);
+        yield return new WaitForSeconds(linear ? LINEAR_MOVE_WAIT_SEC : JOINT_MOVE_WAIT_SEC);
     }
 
     bool InsideBaseExclusion(float x, float y)
@@ -357,8 +381,14 @@ public class JsonExecutor : MonoBehaviour
 
     string BuildMovelLine(float x, float y, float z, string orientation, float skewDeg)
     {
+        // Keep horizontal/vertical grasp support, but ignore the detected skewDeg.
+        // Cubes have no orientation (null/empty) and are square, so use the same
+        // known-safe 90-degree wrist direction as vertical dominos. Only an
+        // explicitly horizontal domino uses 0 degrees.
+        // bool rotate = orientation != "horizontal";
+        // float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
         bool rotate = orientation != "horizontal";
-        float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
+        float totalDeg = rotate ? 90f : 0f;
         float totalRad = totalDeg * Mathf.Deg2Rad;
         string pose = Mathf.Abs(totalDeg) > 0.01f
             ? $"pose_trans(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], p[0, 0, 0, 0, 0, {totalRad:F4}])"
@@ -382,8 +412,14 @@ public class JsonExecutor : MonoBehaviour
 
     string BuildMovejLine(float x, float y, float z, string orientation, float skewDeg)
     {
+        // Keep horizontal/vertical grasp support, but ignore the detected skewDeg.
+        // Cubes have no orientation (null/empty) and are square, so use the same
+        // known-safe 90-degree wrist direction as vertical dominos. Only an
+        // explicitly horizontal domino uses 0 degrees.
+        // bool rotate = orientation != "horizontal";
+        // float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
         bool rotate = orientation != "horizontal";
-        float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
+        float totalDeg = rotate ? 90f : 0f;
         float totalRad = totalDeg * Mathf.Deg2Rad;
 
         // Keep the current elbow/wrist configuration as the IK seed. A fixed qnear

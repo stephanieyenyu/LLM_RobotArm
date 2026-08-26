@@ -84,7 +84,7 @@ BLACK_HSV_LOW = np.array([0, 0, 0])
 # highlights on its faces often exceed V=60. Keep hue unrestricted and allow
 # moderate saturation/brightness, while contour area/shape and workspace ROI
 # continue filtering table holes, QR markers, and large shadows.
-BLACK_HSV_HIGH = np.array([180, 120, 110])
+BLACK_HSV_HIGH = np.array([180, 100, 75])
 
 # Fluorescent-green center sticker on each domino. OpenCV hue uses 0..179.
 # These bounds intentionally require high saturation so the white table and
@@ -505,55 +505,34 @@ def hsv_shape_detect(
         else:
             continue
 
-        # Dominoes use the fluorescent sticker as the true grasp center. Cubes
-        # continue using minAreaRect, so their existing calibration is unchanged.
+        # Detect the fluorescent sticker for diagnostics, but keep robot XY on
+        # the geometric center until a measured marker offset is calibrated.
         marker = None
         if shape == "domino" and domino_markers:
             marker = marker_for_contour(domino_markers, cnt, (rcx, rcy))
-            if marker is not None:
-                rcx, rcy = marker["center"]
 
         # 軸對齊 bbox 保留給 depth 讀取跟 workspace polygon 判定用，跟原本一致
         x, y, w, h = cv2.boundingRect(cnt)
-        center_x, center_y = rcx, rcy
-
-        if shape == "domino":
-            roi = image_bgr[y:y+h, x:x+w]
-            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            green_mask = cv2.inRange(hsv_roi, GREEN_MARKER_HSV_LOW, GREEN_MARKER_HSV_HIGH)
-
-            green_contours, _ = cv2.findContours(
-                green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            marker_candidates = []
-            for gc in green_contours:
-                marker_area = cv2.contourArea(gc)
-                if GREEN_MARKER_MIN_AREA_PX <= marker_area <= GREEN_MARKER_MAX_AREA_PX:
-                    M = cv2.moments(gc)
-                    if M["m00"] != 0:
-                        mx = x + M["m10"] / M["m00"]
-                        my = y + M["m01"] / M["m00"]
-                        marker_candidates.append((marker_area, mx, my))
-
-            if marker_candidates:
-                _, center_x, center_y = max(marker_candidates, key=lambda item: item[0])
 
         detection = {
             "name": f"{color_name}_{shape}",
             "confidence": round(solidity, 3),
             "bbox": [round(float(x), 2), round(float(y), 2),
                      round(float(x + w), 2), round(float(y + h), 2)],
-            "center_pixel": [round(float(center_x), 2), round(float(center_y), 2)],
+            "center_pixel": [round(float(rcx), 2), round(float(rcy), 2)],
             "source": "cube_hsv",
             "shape": shape,
             "orientation": orientation,
             "skew_deg": skew_deg,
-            "center_source": "green_marker" if marker is not None else "min_area_rect",
+            # The marker is diagnostic only. A sticker can be a few millimetres
+            # off-center and perspective amplifies that error, so robot XY keeps
+            # using the geometric minAreaRect center until marker calibration exists.
+            "center_source": "min_area_rect",
         }
         if marker is not None:
+            marker_x, marker_y = marker["center"]
             detection["marker_center_pixel"] = [
-                round(float(rcx), 2), round(float(rcy), 2)
+                round(float(marker_x), 2), round(float(marker_y), 2)
             ]
         detections.append(detection)
     return detections
@@ -1259,8 +1238,6 @@ def endpoint_frame():
         x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
         c = color_map.get(obj["source"], (255, 255, 255))
         cv2.rectangle(frame, (x1, y1), (x2, y2), c, 3)
-        cx, cy = obj["center_pixel"]
-        cv2.circle(frame, (int(cx), int(cy)), 6, (0, 0, 255), -1)
         cv2.putText(frame, f"{obj['name']} {obj['confidence']:.2f}",
                     (x1, max(y1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2)
         marker = obj.get("marker_center_pixel")
