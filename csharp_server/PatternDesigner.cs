@@ -24,7 +24,12 @@ public class PatternDesigner
         _maxCols = maxCols;
     }
 
-    public async Task<CanonicalPattern> DesignAsync(string userCommand, string blockColor = "yellow", int cubeBudget = 0, int dominoBudget = 0)
+    public async Task<CanonicalPattern> DesignAsync(
+        string userCommand,
+        string blockColor = "yellow",
+        int cubeBudget = 0,
+        int dominoBudget = 0,
+        string? verifierFeedback = null)
     {
         if (string.IsNullOrWhiteSpace(userCommand))
             throw new ArgumentException("User command is empty.", nameof(userCommand));
@@ -80,6 +85,7 @@ var messages = new List<ChatMessage>
                 使用者指令：{userCommand}
 
                 目前積木顏色是「{blockColor}」。請根據指令生成 bitmap。
+                {BuildVerifierFeedbackPrompt(verifierFeedback)}
                 """
             )
         };
@@ -124,6 +130,19 @@ var messages = new List<ChatMessage>
             Bitmap = bitmap,
             BlockColor = blockColor,
         };
+    }
+
+    private static string BuildVerifierFeedbackPrompt(string? verifierFeedback)
+    {
+        if (string.IsNullOrWhiteSpace(verifierFeedback)) return "";
+
+        return $"""
+
+                上一次生成被 PatternVerifier 判定不符合需求，原因如下：
+                {verifierFeedback}
+
+                請根據這個 feedback 重新生成，不要重複同樣錯誤。
+                """;
     }
 
     private string BuildSchema()

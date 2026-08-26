@@ -63,6 +63,7 @@ Console.WriteLine();
 // 建立各 layer instance
 var workspace = new WorkspaceBounds();
 var patternDesigner = new PatternDesigner(workspace.MaxRows, workspace.MaxCols);
+var patternVerifier = new PatternVerifier();
 var motionPlanner = new MotionPlanner();
 var commandRouter = new CommandRouter();
 
@@ -144,6 +145,48 @@ async Task RunTaskAsync(string userCommand)
     }
 }
 
+async Task<CanonicalPattern> DesignAndVerifyPatternAsync(
+    string userCommand,
+    string blockColor,
+    int cubeBudget,
+    int dominoBudget)
+{
+    const int MAX_PATTERN_ATTEMPTS = 3;
+    string? verifierFeedback = null;
+
+    for (int attempt = 1; attempt <= MAX_PATTERN_ATTEMPTS; attempt++)
+    {
+        Console.WriteLine($"[Layer 1] Pattern attempt {attempt}/{MAX_PATTERN_ATTEMPTS}");
+
+        var pattern = await patternDesigner.DesignAsync(
+            userCommand,
+            blockColor,
+            cubeBudget,
+            dominoBudget,
+            verifierFeedback);
+
+        var verification = await patternVerifier.VerifyAsync(userCommand, pattern);
+        Console.WriteLine(
+            $"[Layer 1V] verify={(verification.IsCorrect ? "pass" : "fail")}, " +
+            $"confidence={verification.Confidence:F2}, recognized_as={verification.RecognizedAs}");
+
+        if (verification.IsCorrect)
+        {
+            return pattern;
+        }
+
+        verifierFeedback =
+            $"Verifier reason: {verification.Reason}\n" +
+            $"Recognized as: {verification.RecognizedAs}\n" +
+            $"Fix instruction: {verification.Feedback}";
+
+        Console.WriteLine($"[Layer 1V] feedback: {verification.Feedback}");
+    }
+
+    throw new InvalidOperationException(
+        $"PatternVerifier 連續 {MAX_PATTERN_ATTEMPTS} 次判定 bitmap 不符合使用者指令。");
+}
+
 async Task RunPatternTaskAsync(string userCommand)
 {
     // 先掃一次，取得 supplies 與 block color 的決策依據
@@ -162,7 +205,7 @@ async Task RunPatternTaskAsync(string userCommand)
     CanonicalPattern pattern;
     try
     {
-        pattern = await patternDesigner.DesignAsync(userCommand, blockColor, cubeBudget, dominoBudget);
+        pattern = await DesignAndVerifyPatternAsync(userCommand, blockColor, cubeBudget, dominoBudget);
     }
     catch (Exception ex)
     {
