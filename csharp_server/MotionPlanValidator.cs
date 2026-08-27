@@ -16,6 +16,8 @@ public static class MotionPlanValidator
     private const double ObstacleClearanceM = 0.03;
     private const double MaxTransferDistanceM = 0.70;
     private const double OccupancyRadiusM = 0.020;
+    private const double SourceIdentityRadiusM = 0.030;
+    private const double StackHeightMeasurementToleranceM = 0.012;
     private static readonly HashSet<string> Allowed = new()
     {
         "move_above", "descend", "grasp", "release", "lift", "wait", "go_home"
@@ -48,14 +50,25 @@ public static class MotionPlanValidator
         if (transferDistance > MaxTransferDistanceM)
             return Fail($"transfer distance {transferDistance:F3} m exceeds {MaxTransferDistanceM:F2} m", out error);
 
-        // An occupied target is only legal when the requested target Z is above the
-        // perceived obstacle top (stacking). This prevents placing through another block.
-        foreach (var obstacle in scene.Where(o => !ReferenceEquals(o, source)))
+        // Scene snapshots create new SceneObject instances, so ReferenceEquals cannot
+        // identify the source. Exclude it by name and position instead.
+        bool isStackCommand = target.WorldZ > source.Z + 0.005;
+        foreach (var obstacle in scene.Where(o =>
+                     !(o.Name == source.Name &&
+                       Distance2D(o.X, o.Y, source.X, source.Y) < SourceIdentityRadiusM)))
         {
             if (Distance2D(obstacle.X, obstacle.Y, target.WorldX, target.WorldY) > OccupancyRadiusM)
                 continue;
-            if (target.WorldZ + 0.003 < obstacle.Z + Math.Max(source.Z, 0.005))
-                return Fail($"target overlaps {obstacle.Name} without a safe stacking height", out error);
+
+            double requiredStackTopZ = obstacle.Z + Math.Max(source.Z, 0.005);
+            double tolerance = isStackCommand ? StackHeightMeasurementToleranceM : 0.003;
+            if (target.WorldZ + tolerance < requiredStackTopZ)
+                return Fail(
+                    $"target overlaps {obstacle.Name} without a safe stacking height " +
+                    $"(target Z={target.WorldZ:F3}, obstacle top={obstacle.Z:F3}, " +
+                    $"source height={source.Z:F3}, required={requiredStackTopZ:F3}, " +
+                    $"tolerance={tolerance:F3})",
+                    out error);
         }
 
         double highestObstacle = scene.Count == 0 ? 0.0 : scene.Max(o => Math.Max(0.0, o.Z));

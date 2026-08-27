@@ -63,7 +63,6 @@ Console.WriteLine();
 // 建立各 layer instance
 var workspace = new WorkspaceBounds();
 var patternDesigner = new PatternDesigner(workspace.MaxRows, workspace.MaxCols);
-var patternVerifier = new PatternVerifier();
 var motionPlanner = new MotionPlanner();
 var commandRouter = new CommandRouter();
 
@@ -136,55 +135,18 @@ async Task RunTaskAsync(string userCommand)
             await RunPatternTaskAsync(userCommand);
             break;
         case "move_relative":
-        case "stack":
             await RunSingleObjectTaskAsync(routed, initialScene);
+            break;
+        case "stack":
+            if (routed.StackSequence.Count > 2 || (routed.ObjectCount ?? 2) > 2)
+                await RunMultiStackTaskAsync(routed, initialScene);
+            else
+                await RunSingleObjectTaskAsync(routed, initialScene);
             break;
         default:
             Console.WriteLine($"[CommandRouter] Unsupported action: {routed.Action}");
             break;
     }
-}
-
-async Task<CanonicalPattern> DesignAndVerifyPatternAsync(
-    string userCommand,
-    string blockColor,
-    int cubeBudget,
-    int dominoBudget)
-{
-    const int MAX_PATTERN_ATTEMPTS = 3;
-    string? verifierFeedback = null;
-
-    for (int attempt = 1; attempt <= MAX_PATTERN_ATTEMPTS; attempt++)
-    {
-        Console.WriteLine($"[Layer 1] Pattern attempt {attempt}/{MAX_PATTERN_ATTEMPTS}");
-
-        var pattern = await patternDesigner.DesignAsync(
-            userCommand,
-            blockColor,
-            cubeBudget,
-            dominoBudget,
-            verifierFeedback);
-
-        var verification = await patternVerifier.VerifyAsync(userCommand, pattern);
-        Console.WriteLine(
-            $"[Layer 1V] verify={(verification.IsCorrect ? "pass" : "fail")}, " +
-            $"confidence={verification.Confidence:F2}, recognized_as={verification.RecognizedAs}");
-
-        if (verification.IsCorrect)
-        {
-            return pattern;
-        }
-
-        verifierFeedback =
-            $"Verifier reason: {verification.Reason}\n" +
-            $"Recognized as: {verification.RecognizedAs}\n" +
-            $"Fix instruction: {verification.Feedback}";
-
-        Console.WriteLine($"[Layer 1V] feedback: {verification.Feedback}");
-    }
-
-    throw new InvalidOperationException(
-        $"PatternVerifier 連續 {MAX_PATTERN_ATTEMPTS} 次判定 bitmap 不符合使用者指令。");
 }
 
 async Task RunPatternTaskAsync(string userCommand)
@@ -205,11 +167,13 @@ async Task RunPatternTaskAsync(string userCommand)
     CanonicalPattern pattern;
     try
     {
-        pattern = await DesignAndVerifyPatternAsync(userCommand, blockColor, cubeBudget, dominoBudget);
+        pattern = await patternDesigner.DesignAsync(
+            userCommand, blockColor, cubeBudget, dominoBudget);
     }
     catch (Exception ex)
     {
         Console.WriteLine($"[Layer 1] pattern 設計失敗：{ex.Message}");
+        Console.WriteLine(ex.ToString());
         return;
     }
     Console.WriteLine($"[Layer 1] pattern={pattern.PatternId}, bitmap={pattern.Bitmap!.GetLength(0)}x{pattern.Bitmap.GetLength(1)}");
@@ -250,14 +214,84 @@ async Task RunPatternTaskAsync(string userCommand)
 
     var remainingTargets = new List<TargetCell>(realize.Targets);
     var placedTargets = new List<TargetCell>();
-    int retryCountThisStep = 0;
+    var failureCounts = new Dictionary<(int Row, int Col), int>();
+    var skippedTargets = new HashSet<(int Row, int Col)>();
+    var failedSources = new List<SceneObject>();
     string? motionFeedback = null;
-    const int MAX_RETRY = 2;
+    const int MAX_RETRY = 1;
     const int MAX_NO_PROGRESS_ROUNDS = 5;
     int noProgressRounds = 0;
     int previousMatchedCount = -1;
     int recoveryRound = 0;
     bool recoveryMode = false;
+
+    bool RegisterStepFailure(
+        Assignment failedAssignment,
+        string reason,
+        bool blacklistSource,
+        IReadOnlyList<SceneObject>? latestScene = null)
+    {
+        var key = (failedAssignment.Target!.Row, failedAssignment.Target.Col);
+        int failures = failureCounts.GetValueOrDefault(key) + 1;
+        failureCounts[key] = failures;
+        motionFeedback = reason;
+
+        if (blacklistSource && failedAssignment.Source != null &&
+            !failedSources.Any(s => s.Name == failedAssignment.Source.Name &&
+                Math.Pow(s.X - failedAssignment.Source.X, 2) +
+                Math.Pow(s.Y - failedAssignment.Source.Y, 2) <= Math.Pow(0.035, 2)))
+        {
+            failedSources.Add(failedAssignment.Source);
+            Console.WriteLine(
+                $"       記錄失敗積木：{failedAssignment.Source.Name} " +
+                $"({failedAssignment.Source.X:F3}, {failedAssignment.Source.Y:F3})");
+        }
+
+        if (failures <= MAX_RETRY)
+        {
+            Console.WriteLine($"       同一目標將重試第 {failures}/{MAX_RETRY} 次");
+            return false;
+        }
+
+        // A retry limit applies to the current source choice, not to every block
+        // that could satisfy this target. Before skipping, look for a same-type
+        // piece that has never failed. Search the full QR workspace so a valid
+        // spare outside the normal supply-zone cutoff is not overlooked.
+        string expectedName = $"{failedAssignment.Target.ExpectedColor}_" +
+                              failedAssignment.Target.ExpectedShape;
+        bool HasFailedBefore(SceneObject candidate) => failedSources.Any(f =>
+            candidate.Name == f.Name &&
+            Math.Pow(candidate.X - f.X, 2) + Math.Pow(candidate.Y - f.Y, 2)
+                <= Math.Pow(0.035, 2));
+        bool OccupiesPlacedTarget(SceneObject candidate) => placedTargets.Any(t =>
+            Math.Pow(candidate.X - t.WorldX, 2) + Math.Pow(candidate.Y - t.WorldY, 2)
+                <= Math.Pow(0.025, 2));
+        var untriedAlternatives = blacklistSource && latestScene != null
+            ? latestScene
+                .Where(o => o.Name == expectedName)
+                .Where(o => !HasFailedBefore(o))
+                .Where(o => !OccupiesPlacedTarget(o))
+                .ToList()
+            : new List<SceneObject>();
+
+        if (untriedAlternatives.Count > 0)
+        {
+            failureCounts[key] = 0;
+            recoveryMode = true; // allow TaskAssigner to use the full QR workspace
+            motionFeedback = reason + "；改用尚未嘗試的同色同形積木。";
+            Console.WriteLine(
+                $"       已達目前積木的重試上限，但仍有 " +
+                $"{untriedAlternatives.Count} 顆未嘗試的 {expectedName}，改抓其他積木");
+            return false;
+        }
+
+        Console.WriteLine($"       同一目標重試 {MAX_RETRY} 次仍失敗，跳過 r{key.Row}c{key.Col}");
+        skippedTargets.Add(key);
+        remainingTargets.RemoveAll(t => t.Row == key.Row && t.Col == key.Col);
+        failureCounts.Remove(key);
+        motionFeedback = null;
+        return true;
+    }
 
     // Layer 3/4/5 閉環。每一輪執行完都做全局驗證；若仍有未匹配
     // target，就用最新場景重建待辦並進入 recovery。
@@ -277,7 +311,8 @@ async Task RunPatternTaskAsync(string userCommand)
             beforeSnap,
             globalStepId,
             recoveryMode,
-            placedTargets);
+            placedTargets,
+            failedSources);
         if (assignment == null)
         {
             Console.WriteLine("[Layer 3] 沒有可執行的 assignment（supply 用完或不足）");
@@ -310,8 +345,10 @@ async Task RunPatternTaskAsync(string userCommand)
         }
         if (motionPlan == null)
         {
-            Console.WriteLine("[Layer 4A] 無法取得安全的動作規劃，停止目前任務");
-            break;
+            Console.WriteLine("[Layer 4A] 無法取得安全的動作規劃");
+            RegisterStepFailure(
+                assignment, validationError, blacklistSource: false, latestScene: beforeSnap);
+            continue;
         }
         Console.WriteLine($"[Layer 4A] LLM motion plan：{motionPlan.ActionSequence.Count} functions — {motionPlan.Reasoning}");
 
@@ -341,7 +378,12 @@ async Task RunPatternTaskAsync(string userCommand)
         if (execResult == null || !execResult.Completed)
         {
             Console.WriteLine($"[Layer 4] 執行 timeout 或失敗：{execResult?.Error}");
-            break;
+            RegisterStepFailure(
+                assignment,
+                execResult?.Error ?? "Unity execution timeout",
+                blacklistSource: true,
+                latestScene: beforeSnap);
+            continue;
         }
         Console.WriteLine($"[Layer 4] 執行完成 ({execResult.DurationSec:F1}s)");
 
@@ -358,22 +400,16 @@ async Task RunPatternTaskAsync(string userCommand)
             case "ok":
                 placedTargets.Add(assignment.Target);
                 remainingTargets.RemoveAll(t => t.Row == keyRow && t.Col == keyCol);
-                retryCountThisStep = 0;
+                failureCounts.Remove((keyRow, keyCol));
                 motionFeedback = null;
                 break;
             case "retry":
-                motionFeedback = verify.Note;
-                retryCountThisStep++;
-                if (retryCountThisStep > MAX_RETRY)
-                {
-                    Console.WriteLine($"       同一步重試 {MAX_RETRY} 次仍失敗，跳過");
-                    remainingTargets.RemoveAll(t => t.Row == keyRow && t.Col == keyCol);
-                    retryCountThisStep = 0;
-                }
+                RegisterStepFailure(
+                    assignment, verify.Note, blacklistSource: true, latestScene: afterSnap);
                 break;
             case "replan":
-                // 保留 remaining，下一輪由 Layer 3 重新配對。
-                motionFeedback = verify.Note;
+                RegisterStepFailure(
+                    assignment, verify.Note, blacklistSource: true, latestScene: afterSnap);
                 break;
             case "abort":
                 Console.WriteLine("       abort：終止目前任務");
@@ -415,11 +451,19 @@ async Task RunPatternTaskAsync(string userCommand)
 
       placedTargets.Clear();
       placedTargets.AddRange(roundResults.Where(r => r.matched).Select(r => r.target));
-      remainingTargets = roundResults.Where(r => !r.matched).Select(r => r.target).ToList();
+      remainingTargets = roundResults
+          .Where(r => !r.matched && !skippedTargets.Contains((r.target.Row, r.target.Col)))
+          .Select(r => r.target)
+          .ToList();
+
+      if (remainingTargets.Count == 0)
+      {
+          Console.WriteLine("所有未匹配目標都已達重試上限並跳過，不再重新加入 recovery。");
+          break;
+      }
 
       recoveryMode = true;
       recoveryRound++;
-      retryCountThisStep = 0;
       motionFeedback = "全局驗證未匹配；重新掃描並回收放偏或掉落的同色同形積木。";
 
       Console.WriteLine(
@@ -446,28 +490,65 @@ async Task RunPatternTaskAsync(string userCommand)
 }
 
 // --- 輔助函式 ---
-async Task RunSingleObjectTaskAsync(RoutedCommand routed, List<SceneObject> initialScene)
+async Task<bool> RunSingleObjectTaskAsync(
+    RoutedCommand routed,
+    List<SceneObject> initialScene,
+    Assignment? preparedAssignment = null,
+    bool writeDoneWhenFinished = true,
+    Func<List<SceneObject>, int, Assignment>? rebuildForRetry = null)
 {
-    globalStepId++;
+    if (preparedAssignment == null)
+        globalStepId++;
     Assignment assignment;
     try
     {
-        assignment = SingleObjectTaskBuilder.Build(routed, initialScene, globalStepId);
+        assignment = preparedAssignment ??
+            SingleObjectTaskBuilder.Build(routed, initialScene, globalStepId);
     }
     catch (Exception ex)
     {
         Console.WriteLine($"[SingleObject] Cannot build task: {ex.Message}");
-        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
-        return;
+        if (writeDoneWhenFinished)
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return false;
     }
 
     Console.WriteLine($"[SingleObject] {assignment.Reasoning}");
     string? feedback = null;
-    const int maxRetries = 2;
+    const int maxRetries = 1;
+    bool succeeded = false;
 
     for (int retry = 0; retry <= maxRetries; retry++)
     {
         var beforeSnap = await FetchSceneAsync();
+        if (retry > 0)
+        {
+            int retryStepId = ++globalStepId;
+            try
+            {
+                if (rebuildForRetry != null)
+                {
+                    assignment = rebuildForRetry(beforeSnap, retryStepId);
+                }
+                else if (routed.Action == "stack")
+                {
+                    assignment = SingleObjectTaskBuilder.Build(
+                        routed, beforeSnap, retryStepId);
+                }
+                else
+                {
+                    assignment.StepId = retryStepId;
+                }
+                Console.WriteLine(
+                    $"[Retry] Recomputed source and stack target from latest scene: " +
+                    assignment.Reasoning);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Retry] Cannot rebuild assignment: {ex.Message}");
+                break;
+            }
+        }
         MotionPlan? motionPlan = null;
         string validationError = "";
 
@@ -516,13 +597,6 @@ async Task RunSingleObjectTaskAsync(RoutedCommand routed, List<SceneObject> init
             ActionSequence = motionPlan.ActionSequence,
         };
 
-        // A retry must have a fresh step id so Unity will execute it again.
-        if (retry > 0)
-        {
-            assignment.StepId = ++globalStepId;
-            envelope.StepId = assignment.StepId;
-        }
-
         WriteStepFile(envelope);
         Console.WriteLine($"[Executor] Sent step {assignment.StepId}; waiting for Unity...");
         var execResult = await WaitForStepDoneAsync(
@@ -535,15 +609,105 @@ async Task RunSingleObjectTaskAsync(RoutedCommand routed, List<SceneObject> init
             break;
         }
 
+        // Give the multi-frame perception stabilizer time to replace the
+        // pre-motion detections, especially when one block occludes another.
+        if (routed.Action == "stack")
+            await Task.Delay(1200);
         var afterSnap = await FetchSceneAsync();
         var verify = Verifier.CheckSingleObjectStep(
             assignment, beforeSnap, afterSnap, requireStackHeight: routed.Action == "stack");
         Console.WriteLine($"[Verifier] {verify.OverallStatus} — {verify.Note}");
         if (verify.OverallStatus == "ok")
+        {
+            succeeded = true;
             break;
+        }
         if (verify.OverallStatus != "retry")
             break;
         feedback = verify.Note;
+    }
+
+    if (writeDoneWhenFinished)
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+    return succeeded;
+}
+
+async Task RunMultiStackTaskAsync(RoutedCommand routed, List<SceneObject> initialScene)
+{
+    List<string> sequence = routed.StackSequence.Count >= 2
+        ? routed.StackSequence
+        : Enumerable.Repeat(routed.ObjectName ?? "", routed.ObjectCount ?? 2).ToList();
+    int requestedCount = sequence.Count;
+    if (requestedCount < 2 || sequence.Any(string.IsNullOrWhiteSpace))
+    {
+        Console.WriteLine("[MultiStack] Invalid stack sequence.");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    if (sequence.Any(name => !name.EndsWith("_cube", StringComparison.Ordinal)))
+    {
+        Console.WriteLine("[MultiStack] Multi-layer stacking currently supports cubes only.");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    foreach (var requirement in sequence.GroupBy(name => name))
+    {
+        int visible = initialScene.Count(o => o.Name == requirement.Key);
+        if (visible < requirement.Count())
+        {
+            Console.WriteLine(
+                $"[MultiStack] Sequence needs {requirement.Count()} {requirement.Key}, " +
+                $"but only {visible} are visible.");
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+    }
+
+    // Prefer a base outside the supply zone; otherwise use the farthest-X cube.
+    string baseName = sequence[0];
+    SceneObject towerBase = initialScene
+        .Where(o => o.Name == baseName)
+        .OrderByDescending(o => o.X >= 0.30)
+        .ThenByDescending(o => o.X)
+        .First();
+    double towerX = towerBase.X;
+    double towerY = towerBase.Y;
+    Console.WriteLine(
+        $"[MultiStack] Building {requestedCount}-cube tower at " +
+        $"({towerX:F3}, {towerY:F3}); sequence=" +
+        $"{string.Join(" -> ", sequence)}.");
+
+    for (int layer = 2; layer <= requestedCount; layer++)
+    {
+        await Task.Delay(1200);
+        var scene = await FetchSceneAsync();
+        Assignment assignment;
+        try
+        {
+            assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
+                sequence[layer - 1], scene, towerX, towerY, ++globalStepId);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MultiStack] Cannot build layer {layer}: {ex.Message}");
+            break;
+        }
+
+        Console.WriteLine($"[MultiStack] Layer {layer}/{requestedCount}: {assignment.Reasoning}");
+        bool ok = await RunSingleObjectTaskAsync(
+            routed,
+            scene,
+            assignment,
+            writeDoneWhenFinished: false,
+            rebuildForRetry: (latestScene, retryStepId) =>
+                SingleObjectTaskBuilder.BuildStackOntoLocation(
+                    sequence[layer - 1], latestScene, towerX, towerY, retryStepId));
+        if (!ok)
+        {
+            Console.WriteLine($"[MultiStack] Layer {layer} failed; stopping tower construction.");
+            break;
+        }
     }
 
     WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });

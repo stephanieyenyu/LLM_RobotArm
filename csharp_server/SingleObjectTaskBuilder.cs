@@ -10,6 +10,10 @@ public static class SingleObjectTaskBuilder
     // perception Z (top surface height) is also its measured physical height.
     private const double MinMeasuredObjectHeightM = 0.005;
     private const double MaxMeasuredObjectHeightM = 0.100;
+    // Do not command hard contact with the lower block. Release this far above
+    // the ideal stacked pose so RealSense/TCP calibration error cannot drive the
+    // gripper or held block into the support and trigger a protective stop.
+    private const double StackReleaseClearanceM = 0.008;
     private const double MinX = 0.00;
     private const double MaxX = 0.65;
     private const double MinY = 0.00;
@@ -26,6 +30,48 @@ public static class SingleObjectTaskBuilder
             "move_relative" => BuildRelative(command, source, stepId),
             "stack" => BuildStack(command, scene, source, stepId),
             _ => throw new InvalidOperationException($"Unsupported single-object action: {command.Action}")
+        };
+    }
+
+    /// <summary>
+    /// Builds one layer of a multi-block tower. The tower location remains fixed,
+    /// but its visible top and Z are reacquired from every fresh scene.
+    /// </summary>
+    public static Assignment BuildStackOntoLocation(
+        string objectName,
+        List<SceneObject> scene,
+        double towerX,
+        double towerY,
+        int stepId)
+    {
+        const double towerMatchRadiusM = 0.045;
+        SceneObject reference = scene
+            .Where(x => Distance2D(x.X, x.Y, towerX, towerY) < towerMatchRadiusM)
+            .OrderByDescending(x => x.Z)
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException("Tower top is not visible in the latest scene.");
+
+        SceneObject source = scene
+            .Where(x => x.Name == objectName)
+            .Where(x => Distance2D(x.X, x.Y, towerX, towerY) >= towerMatchRadiusM)
+            .Where(x => x.Z >= MinMeasuredObjectHeightM && x.Z <= MaxMeasuredObjectHeightM)
+            .OrderBy(x => x.Z)
+            .ThenBy(x => Distance2D(x.X, x.Y, towerX, towerY))
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"No separate '{objectName}' remains for the next tower layer.");
+
+        ValidateWorkspace(reference.X, reference.Y);
+        double idealStackTopZ = reference.Z + source.Z;
+        double targetZ = idealStackTopZ + StackReleaseClearanceM;
+        return new Assignment
+        {
+            StepId = stepId,
+            Source = source,
+            Target = MakeTarget(source, reference.X, reference.Y, targetZ),
+            Reasoning = $"multi-stack {source.Name} height {source.Z:F3} m on visible tower " +
+                        $"top Z {reference.Z:F3} m; ideal top Z {idealStackTopZ:F3} m; " +
+                        $"release clearance {StackReleaseClearanceM:F3} m; target Z {targetZ:F3} m"
         };
     }
 
@@ -94,14 +140,18 @@ public static class SingleObjectTaskBuilder
 
         // Both values are measured in the QR work-plane frame:
         // reference.Z = top of lower object, source.Z = height of source on the table.
-        double targetZ = reference.Z + measuredSourceHeight;
+        double idealStackTopZ = reference.Z + measuredSourceHeight;
+        double targetZ = idealStackTopZ + StackReleaseClearanceM;
         return new Assignment
         {
             StepId = stepId,
             Source = source,
             Target = MakeTarget(source, reference.X, reference.Y, targetZ),
             Reasoning = $"stack {source.Name} (measured height {measuredSourceHeight:F3} m) " +
-                        $"on {reference.Name} top Z {reference.Z:F3} m; target Z {targetZ:F3} m"
+                        $"on {reference.Name} top Z {reference.Z:F3} m; " +
+                        $"ideal stack top Z {idealStackTopZ:F3} m; " +
+                        $"release clearance {StackReleaseClearanceM:F3} m; " +
+                        $"command target Z {targetZ:F3} m"
         };
     }
 
@@ -144,5 +194,12 @@ public static class SingleObjectTaskBuilder
         double dx = a.X - b.X;
         double dy = a.Y - b.Y;
         return dx * dx + dy * dy;
+    }
+
+    private static double Distance2D(double x1, double y1, double x2, double y2)
+    {
+        double dx = x1 - x2;
+        double dy = y1 - y2;
+        return Math.Sqrt(dx * dx + dy * dy);
     }
 }

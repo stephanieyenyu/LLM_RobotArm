@@ -28,7 +28,8 @@ public static class TaskAssigner
         List<SceneObject> supplies,
         int nextStepId,
         bool recoveryMode = false,
-        IReadOnlyList<TargetCell>? protectedTargets = null)
+        IReadOnlyList<TargetCell>? protectedTargets = null,
+        IReadOnlyList<SceneObject>? failedSources = null)
     {
         if (remainingTargets == null || remainingTargets.Count == 0)
             return null;
@@ -54,6 +55,22 @@ public static class TaskAssigner
 
             if (candidates.Count == 0)
                 continue;   // 這個 target 的形狀沒 supply，看下一個
+
+            // Only blacklist a source when there are more usable pieces of this
+            // color/shape than the remaining targets require. This avoids getting
+            // stuck on one bad piece without causing a false "out of supply" when
+            // every available piece is genuinely needed.
+            int requiredCount = remainingTargets.Count(t =>
+                string.Equals($"{t.ExpectedColor}_{t.ExpectedShape}", expectedName,
+                    StringComparison.Ordinal));
+            if (candidates.Count > requiredCount && failedSources is { Count: > 0 })
+            {
+                var alternatives = candidates
+                    .Where(c => !MatchesFailedSource(c, failedSources))
+                    .ToList();
+                if (alternatives.Count > 0)
+                    candidates = alternatives;
+            }
 
             // Step C：挑距離 target 最近的
             var chosen = candidates
@@ -127,6 +144,21 @@ public static class TaskAssigner
             double dx = candidate.X - t.WorldX;
             double dy = candidate.Y - t.WorldY;
             return dx * dx + dy * dy < radiusSquared;
+        });
+    }
+
+    private static bool MatchesFailedSource(
+        SceneObject candidate,
+        IReadOnlyList<SceneObject> failedSources)
+    {
+        const double samePieceRadiusM = 0.035;
+        double radiusSquared = samePieceRadiusM * samePieceRadiusM;
+        return failedSources.Any(f =>
+        {
+            if (!string.Equals(candidate.Name, f.Name, StringComparison.Ordinal)) return false;
+            double dx = candidate.X - f.X;
+            double dy = candidate.Y - f.Y;
+            return dx * dx + dy * dy <= radiusSquared;
         });
     }
 }

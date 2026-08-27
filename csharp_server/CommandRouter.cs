@@ -54,6 +54,16 @@ public sealed class CommandRouter
                 - If move distance is omitted, use 5 cm.
                 - For stack, object_name is the block being moved and reference_object_name is the lower block.
                 - For stack, direction and distance are null.
+                - object_count is the total number of blocks in the requested stack. For a normal
+                  "put A on B" command use 2. For "stack three yellow cubes together" use 3,
+                  object_name=yellow_cube and reference_object_name=yellow_cube.
+                - For non-stack actions object_count is null.
+                - stack_sequence lists every block from bottom to top. Examples:
+                  "put black on yellow" => [yellow_cube, black_cube].
+                  "stack three yellow cubes" => [yellow_cube, yellow_cube, yellow_cube].
+                  "put black and then yellow on any yellow cube" =>
+                  [yellow_cube, black_cube, yellow_cube].
+                - For non-stack actions stack_sequence must be an empty array.
                 - Never output coordinates or robot motions.
                 Return only schema-valid JSON.
                 """),
@@ -98,11 +108,28 @@ public sealed class CommandRouter
                     ["enum"] = new object?[] { "left", "right", "forward", "backward", null }
                 },
                 ["distance_cm"] = new Dictionary<string, object?> { ["type"] = new[] { "number", "null" } },
+                ["object_count"] = new Dictionary<string, object?>
+                {
+                    ["type"] = new[] { "integer", "null" },
+                    ["minimum"] = 2,
+                    ["maximum"] = 10
+                },
+                ["stack_sequence"] = new Dictionary<string, object?>
+                {
+                    ["type"] = "array",
+                    ["items"] = new Dictionary<string, object?>
+                    {
+                        ["type"] = "string",
+                        ["enum"] = objectNames
+                    },
+                    ["maxItems"] = 10
+                },
                 ["reasoning"] = new Dictionary<string, object?> { ["type"] = "string" }
             },
             ["required"] = new[]
             {
-                "action", "object_name", "reference_object_name", "direction", "distance_cm", "reasoning"
+                "action", "object_name", "reference_object_name", "direction", "distance_cm",
+                "object_count", "stack_sequence", "reasoning"
             }
         };
         return JsonSerializer.Serialize(schema);
@@ -125,6 +152,12 @@ public sealed class RoutedCommand
 
     [JsonPropertyName("distance_cm")]
     public double? DistanceCm { get; set; }
+
+    [JsonPropertyName("object_count")]
+    public int? ObjectCount { get; set; }
+
+    [JsonPropertyName("stack_sequence")]
+    public List<string> StackSequence { get; set; } = new();
 
     [JsonPropertyName("reasoning")]
     public string Reasoning { get; set; } = "";

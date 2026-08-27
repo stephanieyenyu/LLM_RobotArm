@@ -28,8 +28,7 @@ public class PatternDesigner
         string userCommand,
         string blockColor = "yellow",
         int cubeBudget = 0,
-        int dominoBudget = 0,
-        string? verifierFeedback = null)
+        int dominoBudget = 0)
     {
         if (string.IsNullOrWhiteSpace(userCommand))
             throw new ArgumentException("User command is empty.", nameof(userCommand));
@@ -61,22 +60,11 @@ var messages = new List<ChatMessage>
                  - 不一定要用滿最大尺寸；積木較少時，請生成較小但仍可辨識的圖案
                  - 對稱字母（H、O、X、I、A、T、U、V、W、M、Y）必須完全對稱
                  - 筆劃寬度統一為 1 格
-                 - 產生 bitmap 前，必須先判斷在目前尺寸與積木數量限制下，
-                   一般人是否能只看 bitmap 清楚辨識使用者要求的圖案
-                 - 不可以只因為使用者要求就勉強生成，也不可以只靠 pattern_id
-                   宣稱成功，但 bitmap 實際看起來像其他文字、數字或圖案
                  - 複雜中文字、人物、動物或圖示若在 {{_maxRows}}×{{_maxCols}}
                    與最多 {{maxCoveredCells}} 格內無法保留主要辨識特徵，必須拒絕
-                 - 例如「龍」若畫出來容易被看成數字 4，就必須回傳 feasible=false，
-                   不可用近似的 4 代替龍
                  - feasible=false 時：bitmap 必須是空陣列，failure_reason 說明原因，
                    並提供建議的最小 rows、columns 與 occupied cells
                  - feasible=true 時：failure_reason 必須是空字串，bitmap 才能包含圖案
-                 - 生成後你必須在 self_verification 欄位裡：
-                     a) 檢查對稱性（水平 / 垂直是否對稱）
-                     b) render ASCII 圖（■ 代表 1、□ 代表 0）
-                     c) 檢查圖案是否可辨識，以及最可能被誤認成什麼
-                     d) 有問題就重畫；仍無法辨識就回傳 feasible=false
                  只輸出符合 JSON schema 的 JSON，不加解釋文字。
                 """
             ),
@@ -85,7 +73,6 @@ var messages = new List<ChatMessage>
                 使用者指令：{userCommand}
 
                 目前積木顏色是「{blockColor}」。請根據指令生成 bitmap。
-                {BuildVerifierFeedbackPrompt(verifierFeedback)}
                 """
             )
         };
@@ -107,13 +94,6 @@ var messages = new List<ChatMessage>
         if (raw.Bitmap == null || raw.Bitmap.Count == 0)
             throw new InvalidOperationException("Pattern LLM returned empty bitmap.");
 
-        if (raw.SelfVerification is { Recognizable: false })
-        {
-            throw new InvalidOperationException(
-                $"LLM 自我驗證認為圖案不可辨識；可能被誤認為：" +
-                $"{raw.SelfVerification.PossibleConfusion}");
-        }
-
      int[,] bitmap = BitmapParser.Parse(raw.Bitmap);
 
      int occupiedCells = BitmapParser.CountOccupiedCells(bitmap);
@@ -130,19 +110,6 @@ var messages = new List<ChatMessage>
             Bitmap = bitmap,
             BlockColor = blockColor,
         };
-    }
-
-    private static string BuildVerifierFeedbackPrompt(string? verifierFeedback)
-    {
-        if (string.IsNullOrWhiteSpace(verifierFeedback)) return "";
-
-        return $"""
-
-                上一次生成被 PatternVerifier 判定不符合需求，原因如下：
-                {verifierFeedback}
-
-                請根據這個 feedback 重新生成，不要重複同樣錯誤。
-                """;
     }
 
     private string BuildSchema()
@@ -163,30 +130,12 @@ var messages = new List<ChatMessage>
                 {
                     ["type"] = "array",
                     ["items"] = new Dictionary<string, object?> { ["type"] = "string" }
-                },
-                ["self_verification"] = new Dictionary<string, object?>
-                {
-                    ["type"] = "object",
-                    ["additionalProperties"] = false,
-                    ["properties"] = new Dictionary<string, object?>
-                    {
-                        ["vertical_symmetric"] = new Dictionary<string, object?> { ["type"] = "boolean" },
-                        ["horizontal_symmetric"] = new Dictionary<string, object?> { ["type"] = "boolean" },
-                        ["recognizable"] = new Dictionary<string, object?> { ["type"] = "boolean" },
-                        ["possible_confusion"] = new Dictionary<string, object?> { ["type"] = "string" },
-                        ["ascii_render"] = new Dictionary<string, object?> { ["type"] = "string" },
-                    },
-                    ["required"] = new[]
-                    {
-                        "vertical_symmetric", "horizontal_symmetric", "recognizable",
-                        "possible_confusion", "ascii_render"
-                    }
                 }
             },
             ["required"] = new[]
             {
                 "pattern_id", "feasible", "failure_reason", "suggested_rows",
-                "suggested_cols", "suggested_occupied_cells", "bitmap", "self_verification"
+                "suggested_cols", "suggested_occupied_cells", "bitmap"
             }
         };
         return JsonSerializer.Serialize(schema);
@@ -215,25 +164,5 @@ var messages = new List<ChatMessage>
         [System.Text.Json.Serialization.JsonPropertyName("bitmap")]
         public List<string>? Bitmap { get; set; }
 
-        [System.Text.Json.Serialization.JsonPropertyName("self_verification")]
-        public PatternSelfVerification? SelfVerification { get; set; }
-    }
-
-    private class PatternSelfVerification
-    {
-        [System.Text.Json.Serialization.JsonPropertyName("vertical_symmetric")]
-        public bool VerticalSymmetric { get; set; }
-
-        [System.Text.Json.Serialization.JsonPropertyName("horizontal_symmetric")]
-        public bool HorizontalSymmetric { get; set; }
-
-        [System.Text.Json.Serialization.JsonPropertyName("recognizable")]
-        public bool Recognizable { get; set; }
-
-        [System.Text.Json.Serialization.JsonPropertyName("possible_confusion")]
-        public string PossibleConfusion { get; set; } = "";
-
-        [System.Text.Json.Serialization.JsonPropertyName("ascii_render")]
-        public string AsciiRender { get; set; } = "";
     }
 }

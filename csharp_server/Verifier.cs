@@ -18,6 +18,12 @@ public static class Verifier
     // 源位置附近多遠算「還在原地」（沒被夾走）
     private const double SOURCE_MATCH_M = 0.030;
 
+    // A top-down camera sees the upper block at a slightly shifted image centre,
+    // while the lower block can be fully occluded. Stack verification therefore
+    // uses a wider XY gate and the measured top-surface height.
+    private const double STACK_POSITION_TOLERANCE_M = 0.040;
+    private const double STACK_HEIGHT_TOLERANCE_M = 0.015;
+
     /// <summary>
     /// 對剛執行完的一步做檢查。
     /// </summary>
@@ -144,33 +150,58 @@ public static class Verifier
             Distance2D(o.X, o.Y, step.Source.X, step.Source.Y) < SOURCE_MATCH_M);
         result.SourceRemoved = !sourceStillThere;
 
+        double targetTolerance = requireStackHeight
+            ? STACK_POSITION_TOLERANCE_M
+            : POSITION_TOLERANCE_M;
+
         var movedAtTarget = afterSnapshot
             .Where(o => o.Name == step.Source.Name)
             .Where(o => Distance2D(o.X, o.Y, step.Target.WorldX, step.Target.WorldY)
-                        < POSITION_TOLERANCE_M)
+                        < targetTolerance)
             .OrderBy(o => Distance2D(o.X, o.Y, step.Target.WorldX, step.Target.WorldY))
             .ThenBy(o => Math.Abs(o.Z - step.Target.WorldZ))
             .FirstOrDefault();
 
+        // When stacked, YOLO may label only one visible box because the lower
+        // object is hidden. An object at the stack XY whose top surface reaches
+        // the expected combined height is sufficient geometric evidence. Prefer
+        // the source identity when it is visible; otherwise use the elevated box.
+        SceneObject? stackHeightEvidence = null;
+        if (requireStackHeight)
+        {
+            stackHeightEvidence = afterSnapshot
+                .Where(o => Distance2D(o.X, o.Y, step.Target.WorldX, step.Target.WorldY)
+                            < STACK_POSITION_TOLERANCE_M)
+                .Where(o => Math.Abs(o.Z - step.Target.WorldZ)
+                            <= STACK_HEIGHT_TOLERANCE_M)
+                .OrderBy(o => o.Name == step.Source.Name ? 0 : 1)
+                .ThenBy(o => Math.Abs(o.Z - step.Target.WorldZ))
+                .FirstOrDefault();
+            movedAtTarget ??= stackHeightEvidence;
+        }
+
         if (movedAtTarget != null)
         {
             result.TargetOccupied = true;
-            result.ShapeMatch = movedAtTarget.Shape == step.Target.ExpectedShape;
-            result.ColorMatch = movedAtTarget.Name.Contains(step.Target.ExpectedColor);
+            bool inferredOccludedStack = requireStackHeight && stackHeightEvidence != null;
+            result.ShapeMatch = inferredOccludedStack ||
+                                movedAtTarget.Shape == step.Target.ExpectedShape;
+            result.ColorMatch = inferredOccludedStack ||
+                                movedAtTarget.Name.Contains(step.Target.ExpectedColor);
             result.PositionErrorMm = Distance2D(
                 movedAtTarget.X, movedAtTarget.Y, step.Target.WorldX, step.Target.WorldY) * 1000.0;
             result.OrientationErrorDeg = Math.Abs(movedAtTarget.SkewDeg);
         }
 
-        bool heightMatches = !requireStackHeight ||
-            (movedAtTarget != null && Math.Abs(movedAtTarget.Z - step.Target.WorldZ) <= 0.030);
+        bool heightMatches = !requireStackHeight || stackHeightEvidence != null;
 
         if (result.SourceRemoved && result.TargetOccupied && result.ShapeMatch &&
             result.ColorMatch && heightMatches)
         {
             result.OverallStatus = "ok";
             result.Note = requireStackHeight
-                ? $"Stack verified; XY error {result.PositionErrorMm:F1} mm."
+                ? $"Stack verified from visible top/elevated height; lower object may be occluded. " +
+                  $"XY error {result.PositionErrorMm:F1} mm, top Z {movedAtTarget!.Z:F3} m."
                 : $"Relative move verified; XY error {result.PositionErrorMm:F1} mm.";
         }
         else if (!result.SourceRemoved && !result.TargetOccupied)
