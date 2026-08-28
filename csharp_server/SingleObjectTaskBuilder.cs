@@ -42,7 +42,9 @@ public static class SingleObjectTaskBuilder
         List<SceneObject> scene,
         double towerX,
         double towerY,
-        int stepId)
+        double expectedTowerTopZ,
+        int stepId,
+        IReadOnlyList<SceneObject>? failedSources = null)
     {
         const double towerMatchRadiusM = 0.045;
         SceneObject reference = scene
@@ -54,23 +56,35 @@ public static class SingleObjectTaskBuilder
         SceneObject source = scene
             .Where(x => x.Name == objectName)
             .Where(x => Distance2D(x.X, x.Y, towerX, towerY) >= towerMatchRadiusM)
+            .Where(x => failedSources == null || !failedSources.Any(f =>
+                f.Name == x.Name && Distance2D(f.X, f.Y, x.X, x.Y) < 0.035))
             .Where(x => x.Z >= MinMeasuredObjectHeightM && x.Z <= MaxMeasuredObjectHeightM)
             .OrderBy(x => x.Z)
             .ThenBy(x => Distance2D(x.X, x.Y, towerX, towerY))
             .FirstOrDefault()
             ?? throw new InvalidOperationException(
-                $"No separate '{objectName}' remains for the next tower layer.");
+                $"No untried separate '{objectName}' remains for the next tower layer.");
 
-        ValidateWorkspace(reference.X, reference.Y);
-        double idealStackTopZ = reference.Z + source.Z;
+        // Keep every layer on the original tower axis.  A higher layer's
+        // camera contour shifts under perspective (and can even resemble a
+        // domino), so its measured X/Y is not a stable stacking target.  The
+        // fresh detection is used only for the current top-surface height.
+        ValidateWorkspace(towerX, towerY);
+        // The visible tower silhouette may be classified as a domino and its
+        // depth can drift as layers occlude one another.  Use the accumulated
+        // heights of successfully placed source blocks for commanded Z; the
+        // fresh reference detection only proves that a tower is still present.
+        double idealStackTopZ = expectedTowerTopZ + source.Z;
         double targetZ = idealStackTopZ + StackReleaseClearanceM;
         return new Assignment
         {
             StepId = stepId,
             Source = source,
-            Target = MakeTarget(source, reference.X, reference.Y, targetZ),
+            Target = MakeTarget(source, towerX, towerY, targetZ),
             Reasoning = $"multi-stack {source.Name} height {source.Z:F3} m on visible tower " +
-                        $"top Z {reference.Z:F3} m; ideal top Z {idealStackTopZ:F3} m; " +
+                        $"observed top Z {reference.Z:F3} m; accumulated top Z " +
+                        $"{expectedTowerTopZ:F3} m; ideal top Z {idealStackTopZ:F3} m; " +
+                        $"fixed tower XY ({towerX:F3}, {towerY:F3}); " +
                         $"release clearance {StackReleaseClearanceM:F3} m; target Z {targetZ:F3} m"
         };
     }

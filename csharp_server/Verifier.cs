@@ -23,6 +23,12 @@ public static class Verifier
     // uses a wider XY gate and the measured top-surface height.
     private const double STACK_POSITION_TOLERANCE_M = 0.040;
     private const double STACK_HEIGHT_TOLERANCE_M = 0.015;
+    // A tall stack's image centre shifts under the oblique camera. Track the
+    // visible tower between the before/after frames instead of requiring both
+    // observations to remain close to the original table-plane XY.
+    private const double STACK_TOWER_SEARCH_M = 0.080;
+    private const double STACK_FRAME_TRACK_M = 0.060;
+    private const double STACK_MIN_HEIGHT_INCREASE_M = 0.008;
 
     /// <summary>
     /// 對剛執行完的一步做檢查。
@@ -167,6 +173,8 @@ public static class Verifier
         // the expected combined height is sufficient geometric evidence. Prefer
         // the source identity when it is visible; otherwise use the elevated box.
         SceneObject? stackHeightEvidence = null;
+        SceneObject? mergedStackSilhouetteEvidence = null;
+        SceneObject? trackedHeightIncreaseEvidence = null;
         if (requireStackHeight)
         {
             stackHeightEvidence = afterSnapshot
@@ -177,13 +185,60 @@ public static class Verifier
                 .OrderBy(o => o.Name == step.Source.Name ? 0 : 1)
                 .ThenBy(o => Math.Abs(o.Z - step.Target.WorldZ))
                 .FirstOrDefault();
-            movedAtTarget ??= stackHeightEvidence;
+
+            // First locate the visible tower in the pre-motion frame. For a
+            // second/third layer its measured XY can be displaced from the
+            // fixed tower axis by perspective. Then follow that same visible
+            // tower into the post-motion frame and require an actual Z rise.
+            SceneObject? beforeTower = beforeSnapshot
+                .Where(o => Distance2D(o.X, o.Y,
+                                      step.Target.WorldX, step.Target.WorldY)
+                            < STACK_TOWER_SEARCH_M)
+                .Where(o => Distance2D(o.X, o.Y,
+                                      step.Source.X, step.Source.Y)
+                            >= SOURCE_MATCH_M)
+                .OrderByDescending(o => o.Z)
+                .FirstOrDefault();
+            if (result.SourceRemoved && beforeTower != null)
+            {
+                trackedHeightIncreaseEvidence = afterSnapshot
+                    .Where(o => o.Name.Contains(step.Target.ExpectedColor))
+                    .Where(o => Distance2D(o.X, o.Y,
+                                          beforeTower.X, beforeTower.Y)
+                                < STACK_FRAME_TRACK_M)
+                    .Where(o => o.Z >= beforeTower.Z + STACK_MIN_HEIGHT_INCREASE_M)
+                    .OrderByDescending(o => o.Z)
+                    .FirstOrDefault();
+            }
+
+            // Two vertically stacked cubes can merge into one long HSV contour
+            // and be labelled as a domino. In that case RealSense may also keep
+            // reporting roughly one-layer Z. If the picked cube disappeared and
+            // a same-colour domino silhouette remains on the fixed tower axis,
+            // treat that contour as occlusion evidence for the stack. This rule
+            // is stack-only and never changes normal pattern/move verification.
+            if (result.SourceRemoved)
+            {
+                mergedStackSilhouetteEvidence = afterSnapshot
+                    .Where(o => Distance2D(o.X, o.Y,
+                                          step.Target.WorldX, step.Target.WorldY)
+                                < STACK_POSITION_TOLERANCE_M)
+                    .Where(o => o.Shape == "domino")
+                    .Where(o => o.Name.Contains(step.Target.ExpectedColor))
+                    .OrderBy(o => Distance2D(o.X, o.Y,
+                                             step.Target.WorldX, step.Target.WorldY))
+                    .FirstOrDefault();
+            }
+            movedAtTarget ??= stackHeightEvidence ?? trackedHeightIncreaseEvidence ??
+                              mergedStackSilhouetteEvidence;
         }
 
         if (movedAtTarget != null)
         {
             result.TargetOccupied = true;
-            bool inferredOccludedStack = requireStackHeight && stackHeightEvidence != null;
+            bool inferredOccludedStack = requireStackHeight &&
+                (stackHeightEvidence != null || trackedHeightIncreaseEvidence != null ||
+                 mergedStackSilhouetteEvidence != null);
             result.ShapeMatch = inferredOccludedStack ||
                                 movedAtTarget.Shape == step.Target.ExpectedShape;
             result.ColorMatch = inferredOccludedStack ||
@@ -193,15 +248,24 @@ public static class Verifier
             result.OrientationErrorDeg = Math.Abs(movedAtTarget.SkewDeg);
         }
 
-        bool heightMatches = !requireStackHeight || stackHeightEvidence != null;
+        bool heightMatches = !requireStackHeight || stackHeightEvidence != null ||
+                             trackedHeightIncreaseEvidence != null ||
+                             mergedStackSilhouetteEvidence != null;
 
         if (result.SourceRemoved && result.TargetOccupied && result.ShapeMatch &&
             result.ColorMatch && heightMatches)
         {
             result.OverallStatus = "ok";
             result.Note = requireStackHeight
-                ? $"Stack verified from visible top/elevated height; lower object may be occluded. " +
-                  $"XY error {result.PositionErrorMm:F1} mm, top Z {movedAtTarget!.Z:F3} m."
+                ? trackedHeightIncreaseEvidence != null && stackHeightEvidence == null
+                    ? $"Stack verified by frame-to-frame tower tracking: top Z increased to " +
+                      $"{trackedHeightIncreaseEvidence.Z:F3} m; tracked XY shift " +
+                      $"{Distance2D(trackedHeightIncreaseEvidence.X, trackedHeightIncreaseEvidence.Y, step.Target.WorldX, step.Target.WorldY) * 1000.0:F1} mm."
+                : mergedStackSilhouetteEvidence != null && stackHeightEvidence == null
+                    ? $"Stack inferred from source removal and merged same-colour domino silhouette; " +
+                      $"XY error {result.PositionErrorMm:F1} mm. Commanded tower height remains cumulative."
+                    : $"Stack verified from visible top/elevated height; lower object may be occluded. " +
+                      $"XY error {result.PositionErrorMm:F1} mm, top Z {movedAtTarget!.Z:F3} m."
                 : $"Relative move verified; XY error {result.PositionErrorMm:F1} mm.";
         }
         else if (!result.SourceRemoved && !result.TargetOccupied)

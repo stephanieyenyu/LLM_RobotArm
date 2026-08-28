@@ -15,7 +15,7 @@ perception_server (Python + Flask)
    └─ 每 200ms 更新場景，回傳 3D 世界座標
    ↓
 LLM CommandRouter（arrange_pattern / move_relative / stack）
-   ├─ PatternDesigner：自然語言 → bitmap
+   ├─ PatternDesigner：OpenAI + Gemini 獨立生成 bitmap 並交叉評審
    └─ SingleObjectTaskBuilder：方向/距離或疊放目標 → 實際座標
    ↓
 LLM MotionPlanner → MotionPlanValidator
@@ -31,7 +31,7 @@ UR3e
 - `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP
 - `Program.cs` — 監聽 user_input.txt、路由任務、執行感知/規劃/驗證閉環
 - `CommandRouter.cs` — LLM 判斷排圖、相對移動或疊放
-- `PatternDesigner.cs` — LLM 將排圖指令轉成 bitmap
+- `PatternDesigner.cs` — OpenAI 與 Gemini 各自生成 bitmap、互審對方候選後選出結果
 - `SingleObjectTaskBuilder.cs` — 用確定性幾何計算相對移動與疊放座標
 - `MotionPlanner.cs` — LLM 使用白名單 robot functions 規劃動作
 - `MotionPlanValidator.cs` — 執行前安全狀態機驗證
@@ -52,6 +52,8 @@ UR3e
 - Unity 2022.3 LTS
 - Intel RealSense D435i（USB 3 直接接筆電）
 - `setx OPENAI_API_KEY "sk-你的-key"` 後重開 PowerShell
+- `setx GEMINI_API_KEY "你的-Gemini-key"` 後重開 PowerShell
+- 可選：`setx GEMINI_MODEL "gemini-3.1-flash-lite"` 指定有 Free Tier 的 Gemini 模型（程式預設值亦相同）
 - UR3e 或 URSim（Teach Pendant 切 Remote Control、TCP Z offset 設 0.170、速度滑桿 100%）
 - 工作台貼四張 ArUco（QR1 左下、QR2 右下、QR3 左上、QR4 右上）
 

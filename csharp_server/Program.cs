@@ -495,7 +495,8 @@ async Task<bool> RunSingleObjectTaskAsync(
     List<SceneObject> initialScene,
     Assignment? preparedAssignment = null,
     bool writeDoneWhenFinished = true,
-    Func<List<SceneObject>, int, Assignment>? rebuildForRetry = null)
+    Func<List<SceneObject>, int, Assignment>? rebuildForRetry = null,
+    List<SceneObject>? failedStackSources = null)
 {
     if (preparedAssignment == null)
         globalStepId++;
@@ -517,6 +518,22 @@ async Task<bool> RunSingleObjectTaskAsync(
     string? feedback = null;
     const int maxRetries = 1;
     bool succeeded = false;
+
+    void RememberFailedStackSource(Assignment failedAssignment)
+    {
+        if (routed.Action != "stack" || failedStackSources == null ||
+            failedAssignment.Source == null)
+            return;
+        SceneObject source = failedAssignment.Source;
+        bool alreadyRecorded = failedStackSources.Any(f =>
+            f.Name == source.Name &&
+            Math.Sqrt(Math.Pow(f.X - source.X, 2) + Math.Pow(f.Y - source.Y, 2)) < 0.035);
+        if (alreadyRecorded) return;
+        failedStackSources.Add(source);
+        Console.WriteLine(
+            $"[MultiStack] Blacklisted failed source {source.Name} " +
+            $"({source.X:F3}, {source.Y:F3}); retry will choose another block.");
+    }
 
     for (int retry = 0; retry <= maxRetries; retry++)
     {
@@ -622,7 +639,10 @@ async Task<bool> RunSingleObjectTaskAsync(
             succeeded = true;
             break;
         }
-        if (verify.OverallStatus != "retry")
+        RememberFailedStackSource(assignment);
+        if (retry >= maxRetries)
+            break;
+        if (verify.OverallStatus is not ("retry" or "replan" or "abort"))
             break;
         feedback = verify.Note;
     }
@@ -673,6 +693,8 @@ async Task RunMultiStackTaskAsync(RoutedCommand routed, List<SceneObject> initia
         .First();
     double towerX = towerBase.X;
     double towerY = towerBase.Y;
+    double towerTopZ = towerBase.Z;
+    var failedStackSources = new List<SceneObject>();
     Console.WriteLine(
         $"[MultiStack] Building {requestedCount}-cube tower at " +
         $"({towerX:F3}, {towerY:F3}); sequence=" +
@@ -686,7 +708,8 @@ async Task RunMultiStackTaskAsync(RoutedCommand routed, List<SceneObject> initia
         try
         {
             assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
-                sequence[layer - 1], scene, towerX, towerY, ++globalStepId);
+                sequence[layer - 1], scene, towerX, towerY, towerTopZ,
+                ++globalStepId, failedStackSources);
         }
         catch (Exception ex)
         {
@@ -702,12 +725,18 @@ async Task RunMultiStackTaskAsync(RoutedCommand routed, List<SceneObject> initia
             writeDoneWhenFinished: false,
             rebuildForRetry: (latestScene, retryStepId) =>
                 SingleObjectTaskBuilder.BuildStackOntoLocation(
-                    sequence[layer - 1], latestScene, towerX, towerY, retryStepId));
+                    sequence[layer - 1], latestScene, towerX, towerY,
+                    towerTopZ, retryStepId, failedStackSources),
+            failedStackSources: failedStackSources);
         if (!ok)
         {
             Console.WriteLine($"[MultiStack] Layer {layer} failed; stopping tower construction.");
             break;
         }
+        towerTopZ += assignment.Source!.Z;
+        Console.WriteLine(
+            $"[MultiStack] Accumulated tower top Z after layer {layer}: " +
+            $"{towerTopZ:F3} m");
     }
 
     WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });

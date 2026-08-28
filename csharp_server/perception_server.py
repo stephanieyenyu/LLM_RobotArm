@@ -86,14 +86,6 @@ BLACK_HSV_LOW = np.array([0, 0, 0])
 # continue filtering table holes, QR markers, and large shadows.
 BLACK_HSV_HIGH = np.array([180, 100, 75])
 
-# Fluorescent-green center sticker on each domino. OpenCV hue uses 0..179.
-# These bounds intentionally require high saturation so the white table and
-# yellow blocks are excluded. Tune H only if the live debug view misses it.
-DOMINO_MARKER_HSV_LOW = np.array([35, 100, 80])
-DOMINO_MARKER_HSV_HIGH = np.array([95, 255, 255])
-DOMINO_MARKER_MIN_AREA_PX = 20
-DOMINO_MARKER_MAX_AREA_PX = 1800
-DOMINO_MARKER_MIN_CIRCULARITY = 0.50
 # HSV 形狀偵測參數
 # 目前支援兩種積木：
 #   cube   = 2.5 × 2.5 × 2.5 cm（正方形俯視）
@@ -132,8 +124,8 @@ ROI_MARGIN_PX = 10
 CUBE_SKEW_TOL_DEG = 6.0
 
 # --- Touching-cube watershed split ---
-# Only contours that already look like a domino are considered. The split is
-# accepted only when it yields exactly two similarly sized, near-square parts.
+# Only accept a split when exactly two similarly sized, near-square regions
+# are found. Otherwise the original long contour remains a domino.
 WATERSHED_PEAK_RATIO = 0.52
 WATERSHED_CUBE_RATIO_MAX = 1.50
 WATERSHED_AREA_BALANCE_MIN = 0.65
@@ -276,80 +268,62 @@ def detect_qrcodes(image_bgr):
 
 
 def split_touching_cubes(image_bgr, binary_mask, contour):
-    """Try to split one domino-like contour into two touching cube contours."""
+    """Split one domino-like contour only when watershed finds two cube-like parts."""
     x, y, w, h = cv2.boundingRect(contour)
     if w < 3 or h < 3:
         return []
-
     roi_image = image_bgr[y:y + h, x:x + w].copy()
     roi_mask = binary_mask[y:y + h, x:x + w].copy()
-
     contour_mask = np.zeros((h, w), dtype=np.uint8)
     shifted = contour.copy()
     shifted[:, 0, 0] -= x
     shifted[:, 0, 1] -= y
     cv2.drawContours(contour_mask, [shifted], -1, 255, -1)
     roi_mask = cv2.bitwise_and(roi_mask, contour_mask)
-
     distance = cv2.distanceTransform(roi_mask, cv2.DIST_L2, 5)
     max_distance = float(distance.max())
     if max_distance <= 0:
         return []
-
-    sure_foreground = np.uint8(
-        distance >= WATERSHED_PEAK_RATIO * max_distance
-    ) * 255
+    sure_foreground = np.uint8(distance >= WATERSHED_PEAK_RATIO * max_distance) * 255
     component_count, markers = cv2.connectedComponents(sure_foreground)
-    # One background plus exactly two object seeds.
-    if component_count != 3:
+    if component_count != 3:  # background + exactly two object seeds
         return []
-
-    sure_background = cv2.dilate(
-        roi_mask, np.ones((3, 3), np.uint8), iterations=1
-    )
+    sure_background = cv2.dilate(roi_mask, np.ones((3, 3), np.uint8), iterations=1)
     unknown = cv2.subtract(sure_background, sure_foreground)
     markers = markers + 1
     markers[unknown == 255] = 0
     markers = cv2.watershed(roi_image, markers)
 
-    parts = []
-    part_areas = []
+    parts, part_areas = [], []
     for marker_id in np.unique(markers):
         if marker_id <= 1:
             continue
         part_mask = np.uint8(markers == marker_id) * 255
-        contours, _ = cv2.findContours(
-            part_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        contours, _ = cv2.findContours(part_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             continue
         part = max(contours, key=cv2.contourArea)
         part_area = float(cv2.contourArea(part))
         if part_area < CUBE_MIN_AREA_PX * WATERSHED_MIN_PART_AREA_FACTOR:
             continue
-
         (_, _), (part_w, part_h), _ = cv2.minAreaRect(part)
         if part_w < 1 or part_h < 1:
             continue
-        part_ratio = max(part_w, part_h) / min(part_w, part_h)
-        if part_ratio > WATERSHED_CUBE_RATIO_MAX:
+        if max(part_w, part_h) / min(part_w, part_h) > WATERSHED_CUBE_RATIO_MAX:
             continue
-
         part[:, 0, 0] += x
         part[:, 0, 1] += y
         parts.append(part)
         part_areas.append(part_area)
-
     if len(parts) != 2:
         return []
-    area_balance = min(part_areas) / max(part_areas)
-    if area_balance < WATERSHED_AREA_BALANCE_MIN:
+    if min(part_areas) / max(part_areas) < WATERSHED_AREA_BALANCE_MIN:
         return []
     return parts
 
 
 def append_cube_detection(detections, contour, color_name, confidence, source):
-    """Append one cube detection generated from an HSV or watershed contour."""
+    """Append one cube detection produced by watershed."""
     (cx, cy), (_, _), angle = cv2.minAreaRect(contour)
     raw_skew = angle % 90
     if raw_skew > 45:
@@ -366,59 +340,11 @@ def append_cube_detection(detections, contour, color_name, confidence, source):
         "shape": "cube",
         "orientation": None,
         "skew_deg": skew_deg,
+        "center_source": "min_area_rect",
     })
 
 
-def detect_domino_markers(image_bgr, exclude_mask=None):
-    """Return fluorescent-green circular sticker centers in pixel coordinates."""
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, DOMINO_MARKER_HSV_LOW, DOMINO_MARKER_HSV_HIGH)
-    if exclude_mask is not None:
-        mask = cv2.bitwise_and(mask, cv2.bitwise_not(exclude_mask))
-
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    markers = []
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if area < DOMINO_MARKER_MIN_AREA_PX or area > DOMINO_MARKER_MAX_AREA_PX:
-            continue
-        perimeter = float(cv2.arcLength(contour, True))
-        if perimeter <= 0:
-            continue
-        circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-        if circularity < DOMINO_MARKER_MIN_CIRCULARITY:
-            continue
-        moments = cv2.moments(contour)
-        if moments["m00"] == 0:
-            continue
-        cx = float(moments["m10"] / moments["m00"])
-        cy = float(moments["m01"] / moments["m00"])
-        markers.append({
-            "center": [cx, cy],
-            "area": area,
-            "circularity": circularity,
-        })
-    return markers
-
-
-def marker_for_contour(markers, contour, fallback_center):
-    """Choose the marker inside a domino contour and nearest its visual center."""
-    inside = []
-    fx, fy = fallback_center
-    for marker in markers:
-        mx, my = marker["center"]
-        if cv2.pointPolygonTest(contour, (float(mx), float(my)), False) >= 0:
-            distance_sq = (mx - fx) ** 2 + (my - fy) ** 2
-            inside.append((distance_sq, marker))
-    return min(inside, key=lambda item: item[0])[1] if inside else None
-
-
-def hsv_shape_detect(
-        image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None,
-        domino_markers=None):
+def hsv_shape_detect(image_bgr, hsv_low, hsv_high, color_name, exclude_mask=None):
     """
     對單一顏色 HSV 範圍找 cube（2.5×2.5）或 domino（5×2.5）兩種形狀。
     用旋轉最小外接矩形（minAreaRect）取長短邊，比軸對齊 boundingRect 準——
@@ -485,6 +411,9 @@ def hsv_shape_detect(
                     )
                 continue
 
+            # Watershed could not prove that this is two adjacent cubes, so the
+            # long contour remains a domino. No sticker/marker participates in
+            # classification or coordinates.
             shape = "domino"
             # 長軸角度 normalize 到 [0, 180)：0=沿 X（水平）、90=沿 Y（垂直）
             long_angle = angle if rw >= rh else angle + 90
@@ -505,12 +434,6 @@ def hsv_shape_detect(
         else:
             continue
 
-        # Detect the fluorescent sticker for diagnostics, but keep robot XY on
-        # the geometric center until a measured marker offset is calibrated.
-        marker = None
-        if shape == "domino" and domino_markers:
-            marker = marker_for_contour(domino_markers, cnt, (rcx, rcy))
-
         # 軸對齊 bbox 保留給 depth 讀取跟 workspace polygon 判定用，跟原本一致
         x, y, w, h = cv2.boundingRect(cnt)
 
@@ -524,16 +447,8 @@ def hsv_shape_detect(
             "shape": shape,
             "orientation": orientation,
             "skew_deg": skew_deg,
-            # The marker is diagnostic only. A sticker can be a few millimetres
-            # off-center and perspective amplifies that error, so robot XY keeps
-            # using the geometric minAreaRect center until marker calibration exists.
             "center_source": "min_area_rect",
         }
-        if marker is not None:
-            marker_x, marker_y = marker["center"]
-            detection["marker_center_pixel"] = [
-                round(float(marker_x), 2), round(float(marker_y), 2)
-            ]
         detections.append(detection)
     return detections
 
@@ -977,19 +892,12 @@ def detect_all(image_bgr, depth_image=None):
 
     qrcodes, qr_mask = detect_qrcodes(image_bgr)
     workspace_polygon = build_workspace_polygon(qrcodes)
-    domino_markers = detect_domino_markers(image_bgr, qr_mask)
 
     yolo_dets = yolo_detect_np(YOLO11N, image_bgr, COCO_TARGETS, "yolo_coco", YOLO_CONF)
     # 一次找 cube + domino（每個顏色都會回傳兩種形狀混合的清單）
     cube_dets = (
-        hsv_shape_detect(
-            image_bgr, YELLOW_HSV_LOW, YELLOW_HSV_HIGH, "yellow", qr_mask,
-            domino_markers
-        )
-        + hsv_shape_detect(
-            image_bgr, BLACK_HSV_LOW, BLACK_HSV_HIGH, "black", qr_mask,
-            domino_markers
-        )
+        hsv_shape_detect(image_bgr, YELLOW_HSV_LOW, YELLOW_HSV_HIGH, "yellow", qr_mask)
+        + hsv_shape_detect(image_bgr, BLACK_HSV_LOW, BLACK_HSV_HIGH, "black", qr_mask)
     )
 
     # 只保留在 QR 圍出的工作區內的偵測 → 手臂本體、桌邊雜物都會被濾掉
@@ -1240,12 +1148,6 @@ def endpoint_frame():
         cv2.rectangle(frame, (x1, y1), (x2, y2), c, 3)
         cv2.putText(frame, f"{obj['name']} {obj['confidence']:.2f}",
                     (x1, max(y1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2)
-        marker = obj.get("marker_center_pixel")
-        if marker is not None:
-            mx, my = [int(v) for v in marker]
-            cv2.circle(frame, (mx, my), 7, (0, 255, 0), 2)
-            cv2.drawMarker(frame, (mx, my), (255, 255, 255),
-                           cv2.MARKER_CROSS, 12, 2)
     for qr in qrs:
         cx, cy = qr["center_pixel"]
         cv2.circle(frame, (int(cx), int(cy)), 8, (0, 0, 255), -1)
