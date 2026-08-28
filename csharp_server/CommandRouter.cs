@@ -44,12 +44,13 @@ public sealed class CommandRouter
 
                 Supported actions:
                 - arrange_pattern: arrange blocks into a bitmap pattern, such as 排 H or 排一個十字。
+                - arrange_3d_pattern: build an upright three-dimensional voxel text/symbol when the user explicitly asks for 立體, 3D, upright, or vertical construction.
                 - move_relative: move one existing block left/right/forward/backward by a distance.
                 - stack: put one existing block on top of another existing block.
 
                 Rules:
                 - Select object_name and reference_object_name only from the supplied scene names.
-                - For arrange_pattern, all object/direction/distance fields must be null.
+                - For arrange_pattern and arrange_3d_pattern, all object/direction/distance fields must be null.
                 - For move_relative, object_name, direction and distance_cm are required; reference is null.
                 - If move distance is omitted, use 5 cm.
                 - For stack, object_name is the block being moved and reference_object_name is the lower block.
@@ -92,7 +93,7 @@ public sealed class CommandRouter
                 ["action"] = new Dictionary<string, object?>
                 {
                     ["type"] = "string",
-                    ["enum"] = new[] { "arrange_pattern", "move_relative", "stack" }
+                    ["enum"] = new[] { "arrange_pattern", "arrange_3d_pattern", "move_relative", "stack" }
                 },
                 ["object_name"] = new Dictionary<string, object?>
                 {

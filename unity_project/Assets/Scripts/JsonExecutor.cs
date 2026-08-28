@@ -66,6 +66,7 @@ public class StepDoneReport
 
 public class JsonExecutor : MonoBehaviour
 {
+    private static JsonExecutor activeInstance;
     [Header("設定")]
     public string currentStepFile = "current_step.json";
     public string stepDoneFile = "step_done.json";
@@ -92,11 +93,17 @@ public class JsonExecutor : MonoBehaviour
     // Reject TCP targets too close to the base axis. Reaching into this cylinder
     // requires a tightly folded arm and can make adjacent UR3e links collide.
     private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
-    // Secondary-interface Cartesian feedback is not reliable on every UR setup.
-    // Use conservative command delays so a long reach to the right side finishes
-    // before descend/grasp is allowed to continue.
-    private const float JOINT_MOVE_WAIT_SEC = 6f;
-    private const float LINEAR_MOVE_WAIT_SEC = 5f;
+    // Do not advance merely because a fixed delay elapsed.  Every motion is
+    // confirmed against the UR secondary-interface feedback first.
+    private const float MOTION_START_GRACE_SEC = 0.35f;
+    private const float MOTION_TIMEOUT_SEC = 180f;
+    private const float TCP_POSITION_TOLERANCE_M = 0.012f;
+    private const float HOME_JOINT_TOLERANCE_RAD = 0.04f;
+    private const float SAFETY_RECOVERY_TIMEOUT_SEC = 300f;
+    private const float SAFETY_STABLE_SEC = 1f;
+    // Only the emergency return-to-Home command may be sent again after a
+    // second manual unlock. The interrupted pick/place motion is never resent.
+    private const int MAX_MANUAL_HOME_RETRIES = 1;
 
     // Home 關節角度，單位為 rad：[base, shoulder, elbow, wrist1, wrist2, wrist3]
     // 若實機姿勢不符，請由 Teach Pendant 讀取 home 姿勢後更新此值。
@@ -113,9 +120,27 @@ public class JsonExecutor : MonoBehaviour
     // 保存目前執行中的 ExecuteStep coroutine 與 step_id，供 Home 按鈕中止。
     private Coroutine currentStepCoroutine;
     private int currentStepId = -1;
+    private bool lastMotionSucceeded;
+    private string lastMotionError;
+    private bool safetyRecoverySucceeded;
+    private long executionEpoch;
+
+    void Awake()
+    {
+        // A second executor would open another UR connection and could execute the
+        // same JSON concurrently. Keep exactly one command owner in the scene.
+        if (activeInstance != null && activeInstance != this)
+        {
+            Debug.LogError("[Executor] Duplicate JsonExecutor disabled; only one UR command owner is allowed.");
+            enabled = false;
+            return;
+        }
+        activeInstance = this;
+    }
 
     void Start()
     {
+        if (!enabled) return;
         urListener = new URPackageListener();
         urListener.Connect(urIP);
         Debug.Log("嘗試連線至 UR：" + urIP);
@@ -126,6 +151,7 @@ public class JsonExecutor : MonoBehaviour
     void OnDestroy()
     {
         urListener?.Close();
+        if (activeInstance == this) activeInstance = null;
     }
 
     // 保留給 UIManager 呼叫的相容 stub；分層 Executor 啟動後會自行 polling。
@@ -171,6 +197,7 @@ public class JsonExecutor : MonoBehaviour
         // 1. 若正在執行 ExecuteStep，先中止並寫入失敗回報，避免 csharp_server 一直等待。
         if (currentStepCoroutine != null)
         {
+            executionEpoch++;
             int abortedStepId = currentStepId;
             StopCoroutine(currentStepCoroutine);
             currentStepCoroutine = null;
@@ -221,6 +248,15 @@ public class JsonExecutor : MonoBehaviour
 
             if (env.done)
             {
+                // Invalidate any delayed child coroutine before accepting the end
+                // of a batch. A stale safety-recovery coroutine must never resume.
+                executionEpoch++;
+                if (currentStepCoroutine != null)
+                {
+                    StopCoroutine(currentStepCoroutine);
+                    currentStepCoroutine = null;
+                    currentStepId = -1;
+                }
                 Debug.Log($"[Executor] 收到 done 訊號 (step {env.step_id})，等待下一批任務");
                 lastExecutedStepId = env.step_id;
                 continue;
@@ -234,7 +270,8 @@ public class JsonExecutor : MonoBehaviour
 
             lastExecutedStepId = env.step_id;
             currentStepId = env.step_id;
-            currentStepCoroutine = StartCoroutine(ExecuteStep(env));
+            long stepEpoch = ++executionEpoch;
+            currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch));
             yield return currentStepCoroutine;
             currentStepCoroutine = null;
             currentStepId = -1;
@@ -242,7 +279,7 @@ public class JsonExecutor : MonoBehaviour
     }
 
     // --- 執行單一步驟：依序解讀 LLM Motion Planner 的 robot functions ---
-    IEnumerator ExecuteStep(StepEnvelope env)
+    IEnumerator ExecuteStep(StepEnvelope env, long stepEpoch)
     {
         Debug.Log($"═══ Step {env.step_id} ═══ {env.comment}");
 
@@ -258,6 +295,19 @@ public class JsonExecutor : MonoBehaviour
             Debug.LogError("無法連線到 UR");
             WriteStepDone(env.step_id, false, "UR 未連線", 0f);
             yield break;
+        }
+
+        if (IsRecoverableSafetyStop())
+        {
+            yield return WaitForManualSafetyRecovery(
+                "before executing the step", stepEpoch, env.step_id);
+            if (!safetyRecoverySucceeded)
+            {
+                string error = lastMotionError ?? "UR safety recovery failed";
+                WriteStepDone(env.step_id, false, error, 0f);
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                yield break;
+            }
         }
 
         // 通知 perception 進入 executing，讓 SceneSyncer 凍結畫面。
@@ -304,6 +354,12 @@ public class JsonExecutor : MonoBehaviour
         // are deliberately not part of the JSON contract.
         for (int i = 0; i < env.action_sequence.Count; i++)
         {
+            if (!IsExecutionCurrent(stepEpoch, env.step_id))
+            {
+                Debug.LogWarning($"[Executor] Stale step {env.step_id} cancelled before action {i + 1}.");
+                yield break;
+            }
+
             RobotFunctionCall action = env.action_sequence[i];
             string tag = $"{i + 1}/{env.action_sequence.Count} {action.function}";
             bool source = action.location == "source";
@@ -319,30 +375,33 @@ public class JsonExecutor : MonoBehaviour
                 case "move_above":
                     // Use the configured travel plane for lateral motion, then the LLM-selected
                     // safe height. This preserves collision clearance while allowing variable plans.
-                    yield return SendMove(x, y, travelZ, orientation, skew, tag + " travel", false);
-                    yield return SendMove(x, y, z + height, orientation, skew, tag + " above", true);
+                    yield return SendMove(x, y, travelZ, orientation, skew,
+                        tag + " travel", false, stepEpoch, env.step_id);
+                    if (!lastMotionSucceeded) break;
+                    yield return SendMove(x, y, z + height, orientation, skew,
+                        tag + " above", true, stepEpoch, env.step_id);
                     break;
                 case "descend":
-                    yield return SendMove(x, y, z, orientation, skew, tag, true);
+                    yield return SendMove(x, y, z, orientation, skew,
+                        tag, true, stepEpoch, env.step_id);
                     break;
                 case "grasp":
-                    yield return SendGrasp();
+                    yield return SendGrasp(stepEpoch, env.step_id);
                     break;
                 case "release":
-                    yield return SendRelease();
+                    yield return SendRelease(stepEpoch, env.step_id);
                     break;
                 case "lift":
                     // A lift must be Cartesian-linear. movej can change IK branch and
                     // swing/fold the links even when only TCP Z changes.
-                    yield return SendMove(x, y, z + height, orientation, skew, tag, true);
+                    yield return SendMove(x, y, z + height, orientation, skew,
+                        tag, true, stepEpoch, env.step_id);
                     break;
                 case "wait":
                     yield return new WaitForSeconds(Mathf.Clamp(action.seconds > 0f ? action.seconds : 0.5f, 0.1f, 3f));
                     break;
                 case "go_home":
-                    urListener.SendCommand(HOME_MOVEJ_CMD);
-                    Debug.Log($"  [{tag}] SEND: {HOME_MOVEJ_CMD}");
-                    yield return new WaitForSeconds(3f);
+                    yield return SendHome(tag, stepEpoch, env.step_id);
                     break;
                 default:
                     WriteStepDone(env.step_id, false, "unknown robot function: " + action.function, 0f);
@@ -350,13 +409,35 @@ public class JsonExecutor : MonoBehaviour
                     yield break;
             }
 
+
+            if (!lastMotionSucceeded &&
+                (action.function == "move_above" || action.function == "descend" ||
+                 action.function == "lift" || action.function == "go_home"))
+            {
+                float failedDuration = Time.realtimeSinceStartup - t0;
+                string error = string.IsNullOrEmpty(lastMotionError)
+                    ? $"UR motion failed at {tag}"
+                    : lastMotionError;
+                Debug.LogError($"[Executor] Step {env.step_id} stopped: {error}");
+                WriteStepDone(env.step_id, false, error, failedDuration);
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                yield break;
+            }
+
         }
 
         // 通知 perception 回到 idle，讓 SceneSyncer 擷取最新場景。
+        if (!IsExecutionCurrent(stepEpoch, env.step_id)) yield break;
         yield return StartCoroutine(SetPerceptionMode("idle"));
 
         // 等待 perception 取得足夠影格以穩定偵測結果。
         yield return new WaitForSeconds(1.5f);
+
+        if (!IsExecutionCurrent(stepEpoch, env.step_id))
+        {
+            Debug.LogWarning($"[Executor] Suppressed stale completion for step {env.step_id}.");
+            yield break;
+        }
 
         float duration = Time.realtimeSinceStartup - t0;
         WriteStepDone(env.step_id, true, null, duration);
@@ -364,14 +445,260 @@ public class JsonExecutor : MonoBehaviour
     }
 
     IEnumerator SendMove(
-        float x, float y, float z, string orientation, float skewDeg, string tag, bool linear)
+        float x, float y, float z, string orientation, float skewDeg, string tag,
+        bool linear, long stepEpoch, int stepId)
     {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
         string cmd = linear
             ? BuildMovelLine(x, y, z, orientation, skewDeg)
             : BuildMovejLine(x, y, z, orientation, skewDeg);
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+
+        if (!IsExecutionCurrent(stepEpoch, stepId))
+        {
+            lastMotionError = $"stale step {stepId} cancelled during {tag}";
+            yield break;
+        }
         Debug.Log($"  [{tag}] SEND: {cmd}");
         urListener.SendCommand(cmd);
-        yield return new WaitForSeconds(linear ? LINEAR_MOVE_WAIT_SEC : JOINT_MOVE_WAIT_SEC);
+
+        // Give the controller a brief chance to start the program, then require
+        // actual Cartesian feedback to reach the commanded translation.
+        yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
+        float startedAt = Time.realtimeSinceStartup;
+        bool protectiveStopDetected = false;
+        while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
+        {
+            if (!IsExecutionCurrent(stepEpoch, stepId))
+            {
+                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                yield break;
+            }
+            if (!urListener.Connected)
+            {
+                lastMotionError = $"UR disconnected during {tag}";
+                yield break;
+            }
+            if (IsEmergencyStop())
+            {
+                lastMotionError = $"UR emergency stop during {tag}; automatic resume is disabled";
+                yield break;
+            }
+            if (IsRecoverableSafetyStop())
+            {
+                protectiveStopDetected = true;
+                break;
+            }
+
+            var tcp = urListener.CartesianInfo;
+            float dx = (float)tcp.X - x;
+            float dy = (float)tcp.Y - y;
+            float dz = (float)tcp.Z - z;
+            float distance = Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
+            if (distance <= TCP_POSITION_TOLERANCE_M &&
+                !urListener.RobotModeData.isProgramRunning)
+            {
+                lastMotionSucceeded = true;
+                Debug.Log($"  [{tag}] REACHED: TCP error {distance * 1000f:F1} mm");
+                yield break;
+            }
+            yield return new WaitForSeconds(0.05f);
+        }
+
+        if (protectiveStopDetected)
+        {
+            yield return WaitForManualSafetyRecovery(tag, stepEpoch, stepId);
+            if (!safetyRecoverySucceeded)
+                yield break;
+
+            Debug.LogWarning(
+                $"[Executor] Protective Stop recovery at {tag}: interrupted motion will NOT be retried; returning Home.");
+            yield return SendHome(tag + " safety return_home", stepEpoch, stepId);
+            bool homeSucceeded = lastMotionSucceeded;
+            string homeFailure = lastMotionError;
+            if (homeSucceeded)
+            {
+                // The stop may have happened after grasping. Reset the gripper at
+                // Home so the server can safely assign a different source cube.
+                Debug.LogWarning(
+                    "[Executor] Safety Home reached; releasing the gripper before selecting another cube.");
+                yield return SendRelease(stepEpoch, stepId);
+            }
+            lastMotionSucceeded = false; // The pick/place step itself still failed.
+            lastMotionError = homeSucceeded
+                ? $"UR protective stop during {tag}; returned Home without retrying the interrupted motion"
+                : $"UR protective stop during {tag}; Home recovery failed: {homeFailure}";
+            yield break;
+        }
+
+        var finalTcp = urListener.CartesianInfo;
+        float finalDx = (float)finalTcp.X - x;
+        float finalDy = (float)finalTcp.Y - y;
+        float finalDz = (float)finalTcp.Z - z;
+        float finalDistance = Mathf.Sqrt(finalDx * finalDx + finalDy * finalDy + finalDz * finalDz);
+        lastMotionError = $"UR motion timeout during {tag}: TCP remained {finalDistance * 1000f:F1} mm from target";
+    }
+
+    IEnumerator SendHome(string tag, long stepEpoch, int stepId)
+    {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+        float[] target = { -1.5708f, -1.5708f, 0f, -1.5708f, 0f, 0f };
+
+        for (int safetyAttempt = 0;
+             safetyAttempt <= MAX_MANUAL_HOME_RETRIES;
+             safetyAttempt++)
+        {
+            if (!IsExecutionCurrent(stepEpoch, stepId))
+            {
+                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                yield break;
+            }
+            string retryLabel = safetyAttempt == 0 ? "" : " (manual safety retry)";
+            Debug.Log($"  [{tag}] SEND{retryLabel}: {HOME_MOVEJ_CMD}");
+            urListener.SendCommand(HOME_MOVEJ_CMD);
+            yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
+
+            float startedAt = Time.realtimeSinceStartup;
+            bool protectiveStopDetected = false;
+            while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
+            {
+                if (!IsExecutionCurrent(stepEpoch, stepId))
+                {
+                    lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                    yield break;
+                }
+                if (!urListener.Connected)
+                {
+                    lastMotionError = $"UR disconnected during {tag}";
+                    yield break;
+                }
+                if (IsEmergencyStop())
+                {
+                    lastMotionError = $"UR emergency stop during {tag}; automatic resume is disabled";
+                    yield break;
+                }
+                if (IsRecoverableSafetyStop())
+                {
+                    protectiveStopDetected = true;
+                    break;
+                }
+
+                var joints = urListener.JointData.AsArray;
+                float maxError = 0f;
+                for (int i = 0; i < target.Length; i++)
+                {
+                    float actual = (float)joints[i].q_actual;
+                    float error = Mathf.Abs(Mathf.DeltaAngle(actual * Mathf.Rad2Deg,
+                        target[i] * Mathf.Rad2Deg)) * Mathf.Deg2Rad;
+                    maxError = Mathf.Max(maxError, error);
+                }
+                if (maxError <= HOME_JOINT_TOLERANCE_RAD &&
+                    !urListener.RobotModeData.isProgramRunning)
+                {
+                    lastMotionSucceeded = true;
+                    Debug.Log($"  [{tag}] REACHED: max joint error {maxError * Mathf.Rad2Deg:F2} deg");
+                    yield break;
+                }
+                yield return new WaitForSeconds(0.05f);
+            }
+
+            if (!protectiveStopDetected)
+                break;
+            if (safetyAttempt >= MAX_MANUAL_HOME_RETRIES)
+            {
+                lastMotionError = $"UR protective stop repeated during {tag}; retry limit reached";
+                yield break;
+            }
+
+            yield return WaitForManualSafetyRecovery(tag, stepEpoch, stepId);
+            if (!safetyRecoverySucceeded)
+                yield break;
+        }
+
+        lastMotionError = $"UR motion timeout during {tag}: home was not reached";
+    }
+
+    IEnumerator WaitForManualSafetyRecovery(
+        string context, long stepEpoch, int stepId)
+    {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+        safetyRecoverySucceeded = false;
+        Debug.LogWarning(
+            $"[Executor] Protective Stop at {context}. No more commands will be sent. " +
+            "Clear the obstruction, unlock the protective stop, and enable the robot on the teach pendant.");
+
+        float startedAt = Time.realtimeSinceStartup;
+        float stableSince = -1f;
+        while (Time.realtimeSinceStartup - startedAt < SAFETY_RECOVERY_TIMEOUT_SEC)
+        {
+            if (!IsExecutionCurrent(stepEpoch, stepId))
+            {
+                lastMotionError = $"stale step {stepId} cancelled while waiting at {context}";
+                yield break;
+            }
+            if (!urListener.Connected)
+            {
+                lastMotionError = $"UR disconnected while waiting for manual safety recovery at {context}";
+                yield break;
+            }
+            if (IsEmergencyStop())
+            {
+                lastMotionError = $"UR emergency stop at {context}; automatic resume is disabled";
+                yield break;
+            }
+
+            bool ready = !IsRecoverableSafetyStop() &&
+                         urListener.RobotModeData.isRobotPowerOn &&
+                         urListener.RobotModeData.isRealRobotEnabled &&
+                         !urListener.RobotModeData.isProgramRunning;
+            if (ready)
+            {
+                if (stableSince < 0f) stableSince = Time.realtimeSinceStartup;
+                if (Time.realtimeSinceStartup - stableSince >= SAFETY_STABLE_SEC)
+                {
+                    safetyRecoverySucceeded = true;
+                    Debug.LogWarning(
+                        $"[Executor] Manual safety recovery confirmed at {context}; " +
+                        "the controller is ready for the caller's recovery action.");
+                    yield break;
+                }
+            }
+            else
+            {
+                stableSince = -1f;
+            }
+            yield return new WaitForSeconds(0.1f);
+        }
+
+        lastMotionError = $"Timed out waiting for manual safety recovery at {context}";
+    }
+
+    bool IsExecutionCurrent(long stepEpoch, int stepId)
+    {
+        return enabled && activeInstance == this &&
+               executionEpoch == stepEpoch && currentStepId == stepId;
+    }
+
+    bool IsEmergencyStop()
+    {
+        SafetyMode mode = urListener.MasterboardData.safetyMode;
+        return urListener.RobotModeData.isEmergencyStopped ||
+               mode == SafetyMode.RobotEmergencyStop ||
+               mode == SafetyMode.SystemEmergencyStop;
+    }
+
+    bool IsRecoverableSafetyStop()
+    {
+        SafetyMode mode = urListener.MasterboardData.safetyMode;
+        return urListener.RobotModeData.isProtectiveStopped ||
+               mode == SafetyMode.ProtectiveStop ||
+               mode == SafetyMode.SafeguardStop ||
+               mode == SafetyMode.Recovery ||
+               mode == SafetyMode.Violation ||
+               mode == SafetyMode.Fault;
     }
 
     bool InsideBaseExclusion(float x, float y)
@@ -396,15 +723,17 @@ public class JsonExecutor : MonoBehaviour
         return $"movel({pose}, a=0.3, v=0.10)";
     }
 
-    IEnumerator SendGrasp()
+    IEnumerator SendGrasp(long stepEpoch, int stepId)
     {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
         Debug.Log("  [grasp] SEND: set_standard_digital_out(4, True)");
         urListener.SendCommand("set_standard_digital_out(4, True)");
         yield return new WaitForSeconds(1.5f);
     }
 
-    IEnumerator SendRelease()
+    IEnumerator SendRelease(long stepEpoch, int stepId)
     {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
         Debug.Log("  [release] SEND: set_standard_digital_out(4, False)");
         urListener.SendCommand("set_standard_digital_out(4, False)");
         yield return new WaitForSeconds(1.5f);

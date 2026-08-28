@@ -7,6 +7,7 @@ using OpenAI.Chat;
 /// </summary>
 public sealed class MotionPlanner
 {
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(180);
     private readonly ChatClient _client;
 
     public MotionPlanner(string model = "gpt-5")
@@ -76,7 +77,37 @@ public sealed class MotionPlanner
                 """)
         };
 
-        ChatCompletion completion = await _client.CompleteChatAsync(messages, options);
+        ChatCompletion completion;
+        using (var timeout = new CancellationTokenSource(RequestTimeout))
+        {
+            try
+            {
+                var requestTask = _client.CompleteChatAsync(
+                    messages, options, timeout.Token);
+                int reportedSeconds = 0;
+                while (!requestTask.IsCompleted && !timeout.IsCancellationRequested)
+                {
+                    Task finished = await Task.WhenAny(
+                        requestTask,
+                        Task.Delay(TimeSpan.FromSeconds(10), timeout.Token));
+                    if (finished == requestTask || timeout.IsCancellationRequested)
+                        break;
+
+                    reportedSeconds += 10;
+                    Console.WriteLine(
+                        $"[MotionPlanner] LLM 仍在規劃，已等待 " +
+                        $"{reportedSeconds}/{RequestTimeout.TotalSeconds:F0} 秒...");
+                }
+
+                completion = await requestTask;
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"Motion Planner 逾時：LLM 在 " +
+                    $"{RequestTimeout.TotalSeconds:F0} 秒內沒有回應。");
+            }
+        }
         return JsonSerializer.Deserialize<MotionPlan>(completion.Content[0].Text)
                ?? throw new InvalidOperationException("Motion planner response parse failed.");
     }

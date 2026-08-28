@@ -34,7 +34,7 @@ public class SceneSyncer : MonoBehaviour
     [Header("補貨區 / 擺放區邊界（跟 PlacementPlanner 常數對齊）")]
     public float supplyZoneXMax = 0.30f;
     public float targetZoneOriginX = 0.35f;
-    public float targetZoneOriginY = 0.05f;
+    public float targetZoneOriginY = 0.02f;       // 往 QR1-QR2／畫面下方移 3 cm
     public float cellSize = 0.035f;              // 2.5cm 立方體 + 1cm 間隙
     public int gridRows = 5;
     public int gridCols = 5;

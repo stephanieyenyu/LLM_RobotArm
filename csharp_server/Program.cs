@@ -63,6 +63,8 @@ Console.WriteLine();
 // 建立各 layer instance
 var workspace = new WorkspaceBounds();
 var patternDesigner = new PatternDesigner(workspace.MaxRows, workspace.MaxCols);
+var spatialPatternDesigner = new SpatialPatternDesigner(
+    workspace.SpatialRows, workspace.SpatialCols, workspace.SpatialLayers);
 var motionPlanner = new MotionPlanner();
 var commandRouter = new CommandRouter();
 
@@ -134,6 +136,9 @@ async Task RunTaskAsync(string userCommand)
         case "arrange_pattern":
             await RunPatternTaskAsync(userCommand);
             break;
+        case "arrange_3d_pattern":
+            await RunSpatialPatternTaskAsync(userCommand, initialScene);
+            break;
         case "move_relative":
             await RunSingleObjectTaskAsync(routed, initialScene);
             break;
@@ -156,10 +161,10 @@ async Task RunPatternTaskAsync(string userCommand)
     string blockColor = GuessBlockColor(userCommand, initialSnap);
     
     int cubeBudget = initialSnap.Count(s =>
-    s.Name == $"{blockColor}_cube" && s.X < 0.30);
+    s.Name == $"{blockColor}_cube" && s.X < workspace.SupplyZoneXMax);
 
     int dominoBudget = initialSnap.Count(s =>
-    s.Name == $"{blockColor}_domino" && s.X < 0.30);
+    s.Name == $"{blockColor}_domino" && s.X < workspace.SupplyZoneXMax);
 
     int maxCoveredCells = cubeBudget + dominoBudget * 2;
     Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={blockColor})...");
@@ -487,6 +492,163 @@ async Task RunPatternTaskAsync(string userCommand)
     {
         Console.WriteLine($"  × r{t.Row}c{t.Col} ({t.ExpectedShape}) 未匹配");
     }
+}
+
+async Task RunSpatialPatternTaskAsync(string userCommand, List<SceneObject> initialScene)
+{
+    string color = GuessBlockColor(userCommand, initialScene);
+    string cubeName = $"{color}_cube";
+    int cubeBudget = initialScene.Count(o =>
+        o.Name == cubeName && o.X < workspace.SupplyZoneXMax);
+    Console.WriteLine(
+        $"[3D Layer 1] Asking LLM for a self-supporting voxel glyph " +
+        $"(color={color}, cubes={cubeBudget}, volume=" +
+        $"{workspace.SpatialRows}x{workspace.SpatialCols}x{workspace.SpatialLayers})...");
+
+    SpatialPattern pattern;
+    try
+    {
+        pattern = await spatialPatternDesigner.DesignAsync(
+            userCommand, color, cubeBudget);
+    }
+    catch (SpatialPatternInfeasibleException ex)
+    {
+        Console.WriteLine($"[3D Layer 1] 不可執行：{ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[3D Layer 1] 設計服務失敗：{ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    int[,] heights = pattern.ColumnHeights!;
+    int rows = heights.GetLength(0), cols = heights.GetLength(1);
+    int total = 0;
+    Console.WriteLine($"[3D Layer 1] pattern={pattern.PatternId}, column heights={rows}x{cols}");
+    for (int r = 0; r < rows; r++)
+    {
+        var line = new System.Text.StringBuilder();
+        for (int c = 0; c < cols; c++)
+        {
+            line.Append(heights[r, c]);
+            if (c + 1 < cols) line.Append(' ');
+            total += heights[r, c];
+        }
+        Console.WriteLine("             " + line);
+    }
+    Console.WriteLine($"[3D deterministic] support=pass (contiguous columns), cubes={total}/{cubeBudget}");
+
+    var columns = new List<(int Row, int Col, int Height, double X, double Y)>();
+    for (int r = 0; r < rows; r++)
+    for (int c = 0; c < cols; c++)
+        if (heights[r, c] > 0)
+        {
+            double targetX = workspace.TargetOriginX + c * workspace.CellSize;
+            double targetY = workspace.TargetOriginY + (rows - 1 - r) * workspace.CellSize;
+            if (targetX < workspace.TargetZoneXMin)
+                throw new InvalidOperationException(
+                    $"3D target r{r}c{c} X={targetX:F3} is outside the target zone " +
+                    $"(X >= {workspace.TargetZoneXMin:F2} m).");
+            columns.Add((r, c, heights[r, c], targetX, targetY));
+        }
+    columns = columns.OrderByDescending(x => x.Y).ThenByDescending(x => x.X).ToList();
+
+    var failedSources = new List<SceneObject>();
+    var placedBases = new List<(int Row, int Col, int Height, double X, double Y, double TopZ)>();
+    var baseRoute = new RoutedCommand { Action = "move_relative" };
+    var stackRoute = new RoutedCommand { Action = "stack" };
+
+    // Build every table-supported base before adding upper layers.
+    foreach (var column in columns)
+    {
+        var scene = await FetchSceneAsync();
+        Assignment BuildBase(List<SceneObject> snap, int id)
+        {
+            SceneObject source = snap
+                .Where(o => o.Name == cubeName && o.X < workspace.SupplyZoneXMax)
+                .Where(o => !failedSources.Any(f => f.Name == o.Name &&
+                    Math.Pow(f.X - o.X, 2) + Math.Pow(f.Y - o.Y, 2) < Math.Pow(0.035, 2)))
+                .OrderBy(o => Math.Pow(o.X - column.X, 2) + Math.Pow(o.Y - column.Y, 2))
+                .FirstOrDefault()
+                ?? throw new InvalidOperationException($"No untried {cubeName} remains for 3D base.");
+            double z = Math.Max(source.Z, workspace.DefaultBlockZ);
+            return new Assignment
+            {
+                StepId = id,
+                Source = source,
+                Target = new TargetCell
+                {
+                    Row = column.Row, Col = column.Col,
+                    WorldX = column.X, WorldY = column.Y, WorldZ = z,
+                    ExpectedShape = "cube", ExpectedColor = color,
+                },
+                Reasoning = $"3D base r{column.Row}c{column.Col} at ({column.X:F3},{column.Y:F3})",
+            };
+        }
+
+        Assignment assignment;
+        try { assignment = BuildBase(scene, ++globalStepId); }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[3D base] " + ex.Message);
+            goto SpatialDone;
+        }
+        bool ok = await RunSingleObjectTaskAsync(
+            baseRoute, scene, assignment, writeDoneWhenFinished: false,
+            rebuildForRetry: BuildBase);
+        if (!ok)
+        {
+            failedSources.Add(assignment.Source!);
+            Console.WriteLine($"[3D base] Failed r{column.Row}c{column.Col}; stopping.");
+            goto SpatialDone;
+        }
+        placedBases.Add((column.Row, column.Col, column.Height,
+            column.X, column.Y, assignment.Source!.Z));
+    }
+
+    // Add upper cubes bottom-up. Every target is supported by its own column.
+    for (int layer = 2; layer <= workspace.SpatialLayers; layer++)
+    {
+        foreach (var column in placedBases.Where(c => c.Height >= layer).ToList())
+        {
+            int index = placedBases.FindIndex(c => c.Row == column.Row && c.Col == column.Col);
+            var scene = await FetchSceneAsync();
+            Assignment assignment;
+            try
+            {
+                assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
+                    cubeName, scene, column.X, column.Y, column.TopZ,
+                    ++globalStepId, failedSources, workspace.SupplyZoneXMax);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[3D layer {layer}] {ex.Message}");
+                goto SpatialDone;
+            }
+            bool ok = await RunSingleObjectTaskAsync(
+                stackRoute, scene, assignment, writeDoneWhenFinished: false,
+                rebuildForRetry: (latest, retryId) =>
+                    SingleObjectTaskBuilder.BuildStackOntoLocation(
+                        cubeName, latest, column.X, column.Y, column.TopZ,
+                        retryId, failedSources, workspace.SupplyZoneXMax),
+                failedStackSources: failedSources);
+            if (!ok)
+            {
+                Console.WriteLine($"[3D layer {layer}] Failed r{column.Row}c{column.Col}; stopping.");
+                goto SpatialDone;
+            }
+            placedBases[index] = (column.Row, column.Col, column.Height,
+                column.X, column.Y, column.TopZ + assignment.Source!.Z);
+        }
+    }
+
+    Console.WriteLine("[3D] 所有立體字柱已完成。");
+
+    SpatialDone:
+    WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
 }
 
 // --- 輔助函式 ---

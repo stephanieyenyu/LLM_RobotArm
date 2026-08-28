@@ -17,10 +17,25 @@ public class CanonicalPattern
 }
 
 /// <summary>
+/// Self-supporting 3D voxel glyph represented as contiguous vertical columns.
+/// A value N means N cubes from the table upward at that footprint cell.
+/// </summary>
+public class SpatialPattern
+{
+    public string PatternId { get; set; } = "";
+    public int[,]? ColumnHeights { get; set; }
+    public string BlockColor { get; set; } = "yellow";
+}
+
+/// <summary>
 /// 工作區邊界設定，Layer 2 依此將 bitmap 映射為世界座標。
 /// </summary>
 public class WorkspaceBounds
 {
+    // Shared 2D/3D zoning in the QR frame. Objects are picked only from the
+    // supply side; completed pattern blocks in the target side are never reused.
+    public double SupplyZoneXMax { get; set; } = 0.30;
+    public double TargetZoneXMin { get; set; } = 0.35;
     // 目標區左下角在 QR frame 的座標（bitmap 最後一列、第 0 欄的中心）。
     // 現有 5x5 grid 必須避開 QR2 (0.622, 0)：
     //   grid X 範圍：0.42 ～ 0.42 + 4*0.05 = 0.62，最右欄接近但不超過 QR2。
@@ -34,6 +49,17 @@ public class WorkspaceBounds
     public double DefaultBlockZ { get; set; } = 0.025;
     public int MaxRows { get; set; } = 5;
     public int MaxCols { get; set; } = 5;
+    public int MaxLayers { get; set; } = 3;
+    // 3D glyphs use their own fixed voxel volume.  Keep this separate from the
+    // 5x5 planar bitmap so changing 3D does not alter existing 2D layouts.
+    // Y/depth is fixed to one row: the upright glyph is built on a single
+    // front-view plane. X remains 3 cells wide and Z remains 3 cubes high.
+    public int SpatialRows { get; set; } = 1;
+    public int SpatialCols { get; set; } = 3;
+    public int SpatialLayers { get; set; } = 3;
+    // Front row of the 3D volume. It was Y=0.110 m; Y=0.080 m moves
+    // the 3D placement 3 cm toward the QR1-QR2 / camera side.
+    public double SpatialTargetOriginY { get; set; } = 0.080;
 }
 
 /// <summary>

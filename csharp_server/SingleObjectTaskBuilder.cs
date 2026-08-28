@@ -44,7 +44,8 @@ public static class SingleObjectTaskBuilder
         double towerY,
         double expectedTowerTopZ,
         int stepId,
-        IReadOnlyList<SceneObject>? failedSources = null)
+        IReadOnlyList<SceneObject>? failedSources = null,
+        double? sourceZoneXMax = null)
     {
         const double towerMatchRadiusM = 0.045;
         SceneObject reference = scene
@@ -55,6 +56,7 @@ public static class SingleObjectTaskBuilder
 
         SceneObject source = scene
             .Where(x => x.Name == objectName)
+            .Where(x => !sourceZoneXMax.HasValue || x.X < sourceZoneXMax.Value)
             .Where(x => Distance2D(x.X, x.Y, towerX, towerY) >= towerMatchRadiusM)
             .Where(x => failedSources == null || !failedSources.Any(f =>
                 f.Name == x.Name && Distance2D(f.X, f.Y, x.X, x.Y) < 0.035))
@@ -63,7 +65,10 @@ public static class SingleObjectTaskBuilder
             .ThenBy(x => Distance2D(x.X, x.Y, towerX, towerY))
             .FirstOrDefault()
             ?? throw new InvalidOperationException(
-                $"No untried separate '{objectName}' remains for the next tower layer.");
+                sourceZoneXMax.HasValue
+                    ? $"No untried separate '{objectName}' remains in the supply zone " +
+                      $"(X < {sourceZoneXMax.Value:F2} m) for the next tower layer."
+                    : $"No untried separate '{objectName}' remains for the next tower layer.");
 
         // Keep every layer on the original tower axis.  A higher layer's
         // camera contour shifts under perspective (and can even resemble a

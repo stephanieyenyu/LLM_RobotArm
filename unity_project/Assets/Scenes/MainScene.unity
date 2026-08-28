@@ -189,7 +189,7 @@ MonoBehaviour:
   workspaceDepthM: 0.281
   supplyZoneXMax: 0.3
   targetZoneOriginX: 0.35
-  targetZoneOriginY: 0.05
+  targetZoneOriginY: 0.02
   cellSize: 0.035
   gridRows: 5
   gridCols: 5
