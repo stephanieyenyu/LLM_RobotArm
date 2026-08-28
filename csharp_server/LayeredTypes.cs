@@ -30,7 +30,7 @@ public class WorkspaceBounds
     // 5.5 cm center spacing (about 3 cm clear gap for a 2.5 cm cube).
     public double TargetOriginX { get; set; } = 0.49;
     public double TargetOriginY { get; set; } = 0.00;
-    public double CellSize { get; set; } = 0.057;
+    public double CellSize { get; set; } = 0.055;
     public double DefaultBlockZ { get; set; } = 0.025;
     public int MaxRows { get; set; } = 5;
     public int MaxCols { get; set; } = 5;

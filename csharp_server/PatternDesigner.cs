@@ -8,6 +8,8 @@ using OpenAI.Chat;
 public sealed class PatternDesigner
 {
     const int MaxRounds = 2;
+    const double OpenAiVoteWeight = 0.80;
+    const double GeminiVoteWeight = 0.20;
     readonly ChatClient openAi;
     readonly HttpClient gemini;
     readonly string geminiModel;
@@ -81,7 +83,7 @@ public sealed class PatternDesigner
                 var openBallotTask = BallotOpenAi(command, finalists);
                 var gemBallotTask = BallotGemini(command, finalists);
                 await Task.WhenAll(openBallotTask, gemBallotTask);
-                selected = SelectByAverageScore(finalists, await openBallotTask, await gemBallotTask);
+                selected = SelectByWeightedScore(finalists, await openBallotTask, await gemBallotTask);
             }
             if (selected != null)
             {
@@ -276,7 +278,7 @@ public sealed class PatternDesigner
         PrintCandidate(author, revision);
     }
 
-    Candidate SelectByAverageScore(List<Candidate> candidates, Ballot openBallot, Ballot gemBallot)
+    Candidate SelectByWeightedScore(List<Candidate> candidates, Ballot openBallot, Ballot gemBallot)
     {
         var openScores = NormalizeScores(openBallot, candidates.Count);
         var gemScores = NormalizeScores(gemBallot, candidates.Count);
@@ -284,13 +286,15 @@ public sealed class PatternDesigner
         double bestScore = double.NegativeInfinity;
         for (int i = 0; i < candidates.Count; i++)
         {
-            double average = (openScores[i] + gemScores[i]) / 2.0;
+            double weightedScore = openScores[i] * OpenAiVoteWeight +
+                                   gemScores[i] * GeminiVoteWeight;
             Console.WriteLine(
                 $"[Layer 1 vote] candidate {i}: OpenAI={openScores[i]:F2}, " +
-                $"Gemini={gemScores[i]:F2}, average={average:F2}");
-            if (average > bestScore)
+                $"Gemini={gemScores[i]:F2}, weighted={weightedScore:F2} " +
+                $"(OpenAI {OpenAiVoteWeight:P0} / Gemini {GeminiVoteWeight:P0})");
+            if (weightedScore > bestScore)
             {
-                bestScore = average;
+                bestScore = weightedScore;
                 bestIndex = i;
             }
         }
