@@ -18,9 +18,10 @@ LLM CommandRouter（arrange_pattern / move_relative / stack）
    ├─ PatternDesigner：OpenAI + Gemini 獨立生成 bitmap 並交叉評審
    └─ SingleObjectTaskBuilder：方向/距離或疊放目標 → 實際座標
    ↓
-LLM MotionPlanner → MotionPlanValidator
-   ↓  StreamingAssets/current_step.json（robot function sequence）
-Unity JsonExecutor（高階 function → URScript）
+LLM BatchMotionPlanner（一次規劃所有積木的搬運順序與動作）
+   ↓  MotionPlanValidator 驗證整批每一步
+   ↓  StreamingAssets/batch_plan.json（完整 Batch Plan）
+Unity JsonExecutor（依序執行整批；高階 function → URScript）
    ↓  TCP 30002 URScript
 UR3e
 ```
@@ -33,7 +34,8 @@ UR3e
 - `CommandRouter.cs` — LLM 判斷排圖、相對移動或疊放
 - `PatternDesigner.cs` — OpenAI 與 Gemini 各自生成 bitmap、互審對方候選後選出結果
 - `SingleObjectTaskBuilder.cs` — 用確定性幾何計算相對移動與疊放座標
-- `MotionPlanner.cs` — LLM 使用白名單 robot functions 規劃動作
+- `BatchMotionPlanner.cs` — LLM 單次產生整批搬運順序與白名單 robot functions
+- `MotionPlanner.cs` — 單物件與舊流程的動作規劃相容層
 - `MotionPlanValidator.cs` — 執行前安全狀態機驗證
 - `RobotPlan.cs` — plan / SceneObject 資料類別
 - `models/pliers.pt`、`yolo11n.pt` — YOLO 權重
@@ -110,7 +112,7 @@ SAFE_Z_OFFSET = 0.08f // 抓取前後在物件上方留 8cm 安全空間
 
 - **「無法連線 perception_server」** → Terminal 1 沒起或還在載入 model
 - **「場景中沒有帶有效座標的物件」** → QR1-3 沒都在鏡頭裡
-- **等待 robot_plan.json 逾時（120 秒）** → OpenAI API 慢
+- **等待 batch_plan.json 逾時（120 秒）** → OpenAI API 慢或完整批次未通過安全驗證
 - **手臂完全不動** → Teach Pendant 沒切 Remote Control、速度滑桿在 0、或 IP 錯
 
 # Part A：YOLO 物件偵測與 QRCode 定位點輸出

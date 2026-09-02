@@ -172,3 +172,67 @@ public class MotionPlan
     public string Reasoning { get; set; } = "";
 }
 
+/// <summary>
+/// A complete, immutable plan produced from one scene snapshot. Unity executes
+/// the steps in array order without asking the planner for another decision.
+/// </summary>
+public class BatchPlan
+{
+    [JsonPropertyName("batch_id")]
+    public int BatchId { get; set; }
+
+    [JsonPropertyName("created_at")]
+    public string CreatedAt { get; set; } = "";
+
+    [JsonPropertyName("scene_captured_at")]
+    public string SceneCapturedAt { get; set; } = "";
+
+    [JsonPropertyName("comment")]
+    public string Comment { get; set; } = "";
+
+    [JsonPropertyName("steps")]
+    public List<StepEnvelope> Steps { get; set; } = new();
+}
+
+public class BatchExecutionResult
+{
+    [JsonPropertyName("batch_id")]
+    public int BatchId { get; set; }
+
+    [JsonPropertyName("completed")]
+    public bool Completed { get; set; }
+
+    [JsonPropertyName("completed_steps")]
+    public int CompletedSteps { get; set; }
+
+    [JsonPropertyName("total_steps")]
+    public int TotalSteps { get; set; }
+
+    [JsonPropertyName("failed_step_id")]
+    public int? FailedStepId { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("duration_sec")]
+    public double DurationSec { get; set; }
+}
+
+public class BatchMotionPlan
+{
+    [JsonPropertyName("steps")]
+    public List<BatchMotionStep> Steps { get; set; } = new();
+
+    [JsonPropertyName("reasoning")]
+    public string Reasoning { get; set; } = "";
+}
+
+public class BatchMotionStep
+{
+    [JsonPropertyName("step_id")]
+    public int StepId { get; set; }
+
+    [JsonPropertyName("action_sequence")]
+    public List<RobotFunctionCall> ActionSequence { get; set; } = new();
+}
+
