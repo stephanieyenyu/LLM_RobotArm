@@ -13,7 +13,12 @@ public sealed class PatternDesigner
     readonly ChatClient openAi;
     readonly HttpClient gemini;
     readonly string geminiModel;
-    readonly int maxRows, maxCols;
+    // Not readonly: DesignAsync can override these per call so the same
+    // PatternDesigner instance can be retried at a larger grid size when the
+    // current resolution turns out infeasible (see Program.cs resolution
+    // ladder). The server processes one command at a time, so this is safe
+    // without extra locking.
+    int maxRows, maxCols;
     readonly JsonSerializerOptions jsonOptions = new() { PropertyNameCaseInsensitive = true };
 
     public PatternDesigner(int maxRows, int maxCols, string openAiModel = "gpt-5", string? geminiModel = null)
@@ -31,9 +36,15 @@ public sealed class PatternDesigner
         this.maxCols = maxCols;
     }
 
-    public async Task<CanonicalPattern> DesignAsync(string command, string color = "yellow", int cubes = 0, int dominoes = 0)
+    public async Task<CanonicalPattern> DesignAsync(
+        string command, string color = "yellow", int cubes = 0, int dominoes = 0,
+        int? rows = null, int? cols = null)
     {
         if (string.IsNullOrWhiteSpace(command)) throw new ArgumentException("User command is empty.");
+        // Per-call resolution override, used by the resolution ladder in
+        // Program.cs to retry at a larger grid after an infeasible attempt.
+        if (rows.HasValue) maxRows = rows.Value;
+        if (cols.HasValue) maxCols = cols.Value;
         int capacity = cubes + dominoes * 2;
         string openFeedback = "", geminiFeedback = "";
 

@@ -169,16 +169,34 @@ async Task RunPatternTaskAsync(string userCommand)
     int maxCoveredCells = cubeBudget + dominoBudget * 2;
     Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={blockColor})...");
 
-    CanonicalPattern pattern;
-    try
+    // 解析度階梯：同一個物理擺放區域，格數越多、每格越小。5x5 排不出來（LLM 判 infeasible
+    // 或雙模型交叉評審都不接受）就自動換下一階，直到 cell 會小於 MinCellSize（積木會撞在一起）
+    // 為止。這個迴圈本身取代不了「LLM 自己判斷對不對」不可靠這件事——每一階仍然是靠
+    // PatternDesigner 內部的 feasible / recognizable 自我回報，只是把「排不出來就直接放棄整個
+    // 任務」換成「排不出來就換更高解析度再試」。
+    var resolutionLadder = LayoutRealizer.BuildResolutionLadder(workspace);
+    CanonicalPattern? pattern = null;
+    WorkspaceBounds realizeWs = workspace;
+    foreach (var (candRows, candCols, candCellSize) in resolutionLadder)
     {
-        pattern = await patternDesigner.DesignAsync(
-            userCommand, blockColor, cubeBudget, dominoBudget);
+        Console.WriteLine($"[Layer 1] 嘗試解析度 {candRows}x{candCols}（cell={candCellSize * 100:F1}cm）...");
+        try
+        {
+            pattern = await patternDesigner.DesignAsync(
+                userCommand, blockColor, cubeBudget, dominoBudget, candRows, candCols);
+            realizeWs = LayoutRealizer.WithResolution(workspace, candRows, candCols, candCellSize);
+            break;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Layer 1] 解析度 {candRows}x{candCols} 失敗：{ex.Message}");
+        }
     }
-    catch (Exception ex)
+    if (pattern == null)
     {
-        Console.WriteLine($"[Layer 1] pattern 設計失敗：{ex.Message}");
-        Console.WriteLine(ex.ToString());
+        Console.WriteLine(
+            $"[Layer 1] pattern 設計失敗：已嘗試 {resolutionLadder.Count} 種解析度" +
+            $"（受限於 MinCellSize={workspace.MinCellSize * 100:F1}cm 或積木庫存不足），仍無法排出此圖案。");
         return;
     }
     Console.WriteLine($"[Layer 1] pattern={pattern.PatternId}, bitmap={pattern.Bitmap!.GetLength(0)}x{pattern.Bitmap.GetLength(1)}");
@@ -207,7 +225,7 @@ async Task RunPatternTaskAsync(string userCommand)
     );
 
     // Layer 2：計算所有 target（cubeBudget / dominoBudget 已在上方算好）
-    var realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
+    var realize = LayoutRealizer.Realize(pattern, realizeWs, cubeBudget, dominoBudget);
     if (realize.Error != null || realize.Targets == null)
     {
         Console.WriteLine($"[Layer 2] {realize.Error}");
