@@ -119,6 +119,10 @@ public class JsonExecutor : MonoBehaviour
     private const float MOTION_TIMEOUT_SEC = 180f;
     private const float TCP_POSITION_TOLERANCE_M = 0.012f;
     private const float HOME_JOINT_TOLERANCE_RAD = 0.04f;
+    // Some UR/URSim secondary-interface versions keep isProgramRunning=true
+    // briefly (or indefinitely) after the commanded pose has settled. Accept a
+    // pose that remains inside tolerance for this period instead of deadlocking.
+    private const float TARGET_STABLE_CONFIRM_SEC = 0.30f;
     private const float SAFETY_RECOVERY_TIMEOUT_SEC = 300f;
     private const float SAFETY_STABLE_SEC = 1f;
     // Only the emergency return-to-Home command may be sent again after a
@@ -550,6 +554,7 @@ public class JsonExecutor : MonoBehaviour
         // actual Cartesian feedback to reach the commanded translation.
         yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
         float startedAt = Time.realtimeSinceStartup;
+        float reachedToleranceAt = -1f;
         bool protectiveStopDetected = false;
         while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
         {
@@ -579,13 +584,23 @@ public class JsonExecutor : MonoBehaviour
             float dy = (float)tcp.Y - y;
             float dz = (float)tcp.Z - z;
             float distance = Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
-            if (distance <= TCP_POSITION_TOLERANCE_M &&
-                !urListener.RobotModeData.isProgramRunning)
+            if (distance <= TCP_POSITION_TOLERANCE_M)
             {
-                lastMotionSucceeded = true;
-                Debug.Log($"  [{tag}] REACHED: TCP error {distance * 1000f:F1} mm");
-                yield break;
+                if (reachedToleranceAt < 0f)
+                    reachedToleranceAt = Time.realtimeSinceStartup;
+                bool controllerEnded = !urListener.RobotModeData.isProgramRunning;
+                bool poseStable = Time.realtimeSinceStartup - reachedToleranceAt >=
+                                  TARGET_STABLE_CONFIRM_SEC;
+                if (controllerEnded || poseStable)
+                {
+                    lastMotionSucceeded = true;
+                    string confirmation = controllerEnded ? "program ended" : "pose stable";
+                    Debug.Log($"  [{tag}] REACHED ({confirmation}): TCP error {distance * 1000f:F1} mm");
+                    yield break;
+                }
             }
+            else
+                reachedToleranceAt = -1f;
             yield return new WaitForSeconds(0.05f);
         }
 
@@ -645,6 +660,7 @@ public class JsonExecutor : MonoBehaviour
             yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
 
             float startedAt = Time.realtimeSinceStartup;
+            float reachedToleranceAt = -1f;
             bool protectiveStopDetected = false;
             while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
             {
@@ -678,13 +694,24 @@ public class JsonExecutor : MonoBehaviour
                         target[i] * Mathf.Rad2Deg)) * Mathf.Deg2Rad;
                     maxError = Mathf.Max(maxError, error);
                 }
-                if (maxError <= HOME_JOINT_TOLERANCE_RAD &&
-                    !urListener.RobotModeData.isProgramRunning)
+                if (maxError <= HOME_JOINT_TOLERANCE_RAD)
                 {
-                    lastMotionSucceeded = true;
-                    Debug.Log($"  [{tag}] REACHED: max joint error {maxError * Mathf.Rad2Deg:F2} deg");
-                    yield break;
+                    if (reachedToleranceAt < 0f)
+                        reachedToleranceAt = Time.realtimeSinceStartup;
+                    bool controllerEnded = !urListener.RobotModeData.isProgramRunning;
+                    bool poseStable = Time.realtimeSinceStartup - reachedToleranceAt >=
+                                      TARGET_STABLE_CONFIRM_SEC;
+                    if (controllerEnded || poseStable)
+                    {
+                        lastMotionSucceeded = true;
+                        string confirmation = controllerEnded ? "program ended" : "pose stable";
+                        Debug.Log($"  [{tag}] REACHED ({confirmation}): max joint error " +
+                                  $"{maxError * Mathf.Rad2Deg:F2} deg");
+                        yield break;
+                    }
                 }
+                else
+                    reachedToleranceAt = -1f;
                 yield return new WaitForSeconds(0.05f);
             }
 

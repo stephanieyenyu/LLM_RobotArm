@@ -8,8 +8,9 @@ using OpenAI.Chat;
 public sealed class PatternDesigner
 {
     const int MaxRounds = 2;
-    const double OpenAiVoteWeight = 0.80;
-    const double GeminiVoteWeight = 0.20;
+    const double MinimumWinningScore = 0.75;
+    const double OpenAiVoteWeight = 0.50;
+    const double GeminiVoteWeight = 0.50;
     readonly ChatClient openAi;
     readonly HttpClient gemini;
     readonly string geminiModel;
@@ -61,38 +62,46 @@ public sealed class PatternDesigner
             PrintReview("Gemini reviews OpenAI", openReview);
 
             var finalists = new List<Candidate>();
-            if (IsFinalist(open, openLocal, openReview))
+            open.Author = "Candidate 1: OpenAI original";
+            gem.Author = "Candidate 2: Gemini original";
+            // 1/2: both independently generated originals enter the anonymous
+            // ballot as long as deterministic format/inventory checks pass.
+            if (openLocal.Valid)
                 finalists.Add(open);
             else
-                PrintRejection("OpenAI", open, openLocal, openReview);
-            if (IsFinalist(gem, gemLocal, gemReview))
+                Console.WriteLine($"[Layer 1 candidate 1] OpenAI original rejected: {openLocal.Error}");
+            if (gemLocal.Valid)
                 finalists.Add(gem);
             else
-                PrintRejection("Gemini", gem, gemLocal, gemReview);
+                Console.WriteLine($"[Layer 1 candidate 2] Gemini original rejected: {gemLocal.Error}");
 
-            // Reviewer rewrites become next-round feedback; they cannot bypass
-            // self-review and blind cross-review by entering finalists directly.
-            finalists = finalists
-                .GroupBy(c => string.Join("/", c.Bitmap ?? new List<string>()))
-                .Select(g => g.First())
-                .ToList();
-
+            // 3: Gemini's revision of OpenAI. 4: OpenAI's revision of Gemini.
+            AddRevisionIfValid(finalists, openReview,
+                "Candidate 3: OpenAI revised by Gemini", command, capacity,
+                canvas.Rows, canvas.Cols);
+            AddRevisionIfValid(finalists, gemReview,
+                "Candidate 4: Gemini revised by OpenAI", command, capacity,
+                canvas.Rows, canvas.Cols);
             Candidate? selected = null;
-            if (finalists.Count == 1)
-            {
-                selected = finalists[0];
-            }
-            else if (finalists.Count > 1)
+            if (finalists.Count > 0)
             {
                 Console.WriteLine($"[Layer 1 vote] anonymously scoring {finalists.Count} finalists...");
                 var openBallotTask = BallotOpenAi(command, finalists);
                 var gemBallotTask = BallotGemini(command, finalists);
                 await Task.WhenAll(openBallotTask, gemBallotTask);
-                selected = SelectByWeightedScore(finalists, await openBallotTask, await gemBallotTask);
+                selected = SelectByWeightedScore(
+                    finalists, await openBallotTask, await gemBallotTask,
+                    out double winningScore);
+                if (winningScore < MinimumWinningScore)
+                {
+                    Console.WriteLine($"[Layer 1 vote] best weighted score {winningScore:F2} " +
+                                      $"is below {MinimumWinningScore:F2}; redraw/escalate canvas");
+                    selected = null;
+                }
             }
             if (selected != null)
             {
-                Console.WriteLine($"[Layer 1 dual] selected={selected.Author} by anonymous dual-model vote");
+                Console.WriteLine($"[Layer 1 dual] selected={selected.Author} by anonymous 50/50 dual-model vote");
                 Console.WriteLine("[Layer 1 FINAL] 最終採用 Bitmap：");
                 foreach (string row in selected.Bitmap!)
                     Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
@@ -110,32 +119,6 @@ public sealed class PatternDesigner
               Console.WriteLine($"[Layer 1 adaptive] {canvas.Rows}x{canvas.Cols} was not accepted; escalating canvas.");
         }
         throw new InvalidOperationException($"雙模型在 5x5 到 {maxRows}x{maxCols} 的自評與交叉評審後仍無可接受 bitmap。");
-    }
-
-    static bool IsFinalist(Candidate c, Validation local, Review cross) =>
-        local.Valid && c.SelfAccept && c.SelfRecognizable &&
-        c.SelfExactTargetMatch && !c.SelfNeedsLargerCanvas &&
-        c.SelfConfidence >= 0.75 && cross.Accept && cross.Recognizable &&
-        cross.ExactTargetMatch && !cross.NeedsLargerCanvas &&
-        cross.Confidence >= 0.75 && cross.StructuralProblems.Count == 0;
-
-    static void PrintRejection(string author, Candidate c, Validation local, Review cross)
-    {
-        var reasons = new List<string>();
-        if (!local.Valid) reasons.Add(local.Error);
-        if (!c.SelfAccept) reasons.Add("self_accept=false");
-        if (!c.SelfRecognizable) reasons.Add("self_recognizable=false");
-        if (!c.SelfExactTargetMatch) reasons.Add("self_exact_target_match=false");
-        if (c.SelfNeedsLargerCanvas) reasons.Add("self requested larger canvas");
-        if (c.SelfConfidence < 0.75) reasons.Add($"self confidence {c.SelfConfidence:F2}<0.75");
-        if (!cross.Accept) reasons.Add("cross accept=false");
-        if (!cross.Recognizable) reasons.Add("cross recognizable=false");
-        if (!cross.ExactTargetMatch) reasons.Add("cross exact_target_match=false");
-        if (cross.NeedsLargerCanvas) reasons.Add("cross requested larger canvas");
-        if (cross.Confidence < 0.75) reasons.Add($"cross confidence {cross.Confidence:F2}<0.75");
-        if (cross.StructuralProblems.Count > 0)
-            reasons.Add($"cross reported {cross.StructuralProblems.Count} structural problem(s)");
-        Console.WriteLine($"[Layer 1 reject] {author}: {string.Join("; ", reasons)}");
     }
 
     IEnumerable<(int Rows, int Cols)> CanvasSizes()
@@ -287,6 +270,8 @@ public sealed class PatternDesigner
         依照人類視覺可辨識度及對指定目標的忠實程度，獨立判斷每一個實際矩陣。
         候選順序與身分沒有任何意義，不可推測作者。
         不可使用應用程式提供的模板、特定目標規則、字型、範例或易混淆清單；本程式沒有提供這些資料。
+        如果矩陣不是原始要求的精確目標、存在身分歧義、方向錯誤、關鍵結構問題，
+        或需要更大畫布才能清楚表達，分數必須低於 0.75。
         每個候選索引必須剛好回傳一筆評分，分數範圍為 0 到 1。
         僅回傳符合指定 Schema 的 JSON。
         """;
@@ -319,7 +304,45 @@ public sealed class PatternDesigner
         catch (Exception ex) { return new(false, "invalid bitmap: " + ex.Message); }
     }
 
-    Candidate SelectByWeightedScore(List<Candidate> candidates, Ballot openBallot, Ballot gemBallot)
+    void AddRevisionIfValid(
+        List<Candidate> finalists,
+        Review review,
+        string author,
+        string command,
+        int capacity,
+        int canvasRows,
+        int canvasCols)
+    {
+        if (!review.HasRevision || review.RevisedBitmap.Count == 0)
+        {
+            Console.WriteLine($"[Layer 1 revision] {author}: reviewer did not provide a revision");
+            return;
+        }
+
+        var revision = new Candidate
+        {
+            PatternId = command,
+            Feasible = true,
+            Bitmap = review.RevisedBitmap,
+            Author = author,
+        };
+        Validation validation = Validate(revision, capacity, canvasRows, canvasCols);
+        if (!validation.Valid)
+        {
+            Console.WriteLine($"[Layer 1 revision] {author} rejected: {validation.Error}");
+            return;
+        }
+        finalists.Add(revision);
+        Console.WriteLine($"[Layer 1 revision] {author} entered ballot:");
+        foreach (string row in revision.Bitmap)
+            Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
+    }
+
+    Candidate SelectByWeightedScore(
+        List<Candidate> candidates,
+        Ballot openBallot,
+        Ballot gemBallot,
+        out double winningScore)
     {
         var openScores = NormalizeScores(openBallot, candidates.Count);
         var gemScores = NormalizeScores(gemBallot, candidates.Count);
@@ -339,6 +362,7 @@ public sealed class PatternDesigner
                 bestIndex = i;
             }
         }
+        winningScore = bestScore;
         return candidates[bestIndex];
     }
 

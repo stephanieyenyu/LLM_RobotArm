@@ -40,7 +40,9 @@ public sealed class BatchMotionPlanner
                 step_id exactly once, in the safest execution order. Prefer far targets
                 before near targets and bottom/supporting placements before upper ones.
                 For each step compose only: move_above, descend, grasp, release, lift,
-                wait, go_home. Use location source/target. Each pick must approach from
+                wait, go_home. Every move_above, descend, and lift call must set location
+                to source or target; location may be null only for grasp, release, wait,
+                and go_home. Each pick must approach from
                 above, descend, grasp, lift, travel while lifted, descend at target,
                 release, lift, and finish at home. Clearance must be 0.08-0.15 m.
                 Never output coordinates, URScript, joints, velocity, or extra steps.
@@ -65,8 +67,49 @@ public sealed class BatchMotionPlanner
             throw new TimeoutException("Batch Planner timed out after 240 seconds.");
         }
 
-        return JsonSerializer.Deserialize<BatchMotionPlan>(completion.Content[0].Text)
+        var plan = JsonSerializer.Deserialize<BatchMotionPlan>(completion.Content[0].Text)
             ?? throw new InvalidOperationException("Batch planner response parse failed.");
+        NormalizeLocations(plan);
+        return plan;
+    }
+
+    /// <summary>
+    /// The shared function-call schema must allow location=null for grasp,
+    /// release, wait, and go_home. Models occasionally copy that null onto a
+    /// lift even though its phase makes the endpoint unambiguous. Fill only
+    /// these mechanically certain omissions; the validator still rejects an
+    /// unsafe order or any genuinely ambiguous call.
+    /// </summary>
+    private static void NormalizeLocations(BatchMotionPlan plan)
+    {
+        foreach (BatchMotionStep step in plan.Steps)
+        {
+            bool holding = false;
+            bool released = false;
+            foreach (RobotFunctionCall call in step.ActionSequence)
+            {
+                if (call.Function == "grasp")
+                {
+                    holding = true;
+                    released = false;
+                    continue;
+                }
+                if (call.Function == "release")
+                {
+                    holding = false;
+                    released = true;
+                    continue;
+                }
+                if (!string.IsNullOrWhiteSpace(call.Location)) continue;
+
+                if (call.Function == "lift" && holding)
+                    call.Location = "source";
+                else if (call.Function == "lift" && released)
+                    call.Location = "target";
+                else if (call.Function is "move_above" or "descend")
+                    call.Location = holding ? "target" : "source";
+            }
+        }
     }
 
     private static string BuildSchema()
