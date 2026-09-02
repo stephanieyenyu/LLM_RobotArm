@@ -8,6 +8,10 @@ public class UIManager : MonoBehaviour
     public UIDocument uiDocument;
     public JsonExecutor executor;
 
+    [Header("Batch Planning")]
+    [Tooltip("等待 csharp_server 完成雙模型評審與完整 Batch Plan 的秒數")]
+    public float batchPlanTimeoutSec = 600f;
+
     // 兩邊共用的資料夾（Unity / csharp_server 都指到這裡）
     // 如果之後換電腦或換路徑，只要改這一行
     private string SHARED_DIR => Application.streamingAssetsPath;
@@ -155,7 +159,9 @@ public class UIManager : MonoBehaviour
         string batchPath = Path.Combine(SHARED_DIR, "batch_plan.json");
         var lastWrite = File.Exists(batchPath) ? File.GetLastWriteTime(batchPath) : System.DateTime.MinValue;
 
-        float timeout = 120f;     // gpt-5 設計 pattern 有時要一分鐘以上
+        // Dual-model generation, cross-review, up to four-candidate voting and
+        // full motion planning can exceed two minutes.
+        float timeout = Mathf.Max(30f, batchPlanTimeoutSec);
         float waited = 0f;
         float lastLogAt = 0f;
 

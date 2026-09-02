@@ -123,6 +123,8 @@ public class JsonExecutor : MonoBehaviour
     // briefly (or indefinitely) after the commanded pose has settled. Accept a
     // pose that remains inside tolerance for this period instead of deadlocking.
     private const float TARGET_STABLE_CONFIRM_SEC = 0.30f;
+    private const float COMMAND_SETTLE_SEC = 0.25f;
+    private const float MOTION_PROGRESS_LOG_SEC = 2.0f;
     private const float SAFETY_RECOVERY_TIMEOUT_SEC = 300f;
     private const float SAFETY_STABLE_SEC = 1f;
     // Only the emergency return-to-Home command may be sent again after a
@@ -554,6 +556,7 @@ public class JsonExecutor : MonoBehaviour
         // actual Cartesian feedback to reach the commanded translation.
         yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
         float startedAt = Time.realtimeSinceStartup;
+        float nextProgressLogAt = startedAt + MOTION_PROGRESS_LOG_SEC;
         float reachedToleranceAt = -1f;
         bool protectiveStopDetected = false;
         while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
@@ -596,11 +599,24 @@ public class JsonExecutor : MonoBehaviour
                     lastMotionSucceeded = true;
                     string confirmation = controllerEnded ? "program ended" : "pose stable";
                     Debug.Log($"  [{tag}] REACHED ({confirmation}): TCP error {distance * 1000f:F1} mm");
+                    // Give the secondary interface time to finish the previous
+                    // script before the next standalone program is submitted.
+                    yield return new WaitForSeconds(COMMAND_SETTLE_SEC);
                     yield break;
                 }
             }
             else
                 reachedToleranceAt = -1f;
+
+            if (Time.realtimeSinceStartup >= nextProgressLogAt)
+            {
+                Debug.Log($"  [{tag}] WAITING: actual=({(float)tcp.X:F4}," +
+                          $"{(float)tcp.Y:F4},{(float)tcp.Z:F4}), " +
+                          $"target=({x:F4},{y:F4},{z:F4}), " +
+                          $"error={distance * 1000f:F1} mm, " +
+                          $"programRunning={urListener.RobotModeData.isProgramRunning}");
+                nextProgressLogAt = Time.realtimeSinceStartup + MOTION_PROGRESS_LOG_SEC;
+            }
             yield return new WaitForSeconds(0.05f);
         }
 
@@ -660,6 +676,7 @@ public class JsonExecutor : MonoBehaviour
             yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
 
             float startedAt = Time.realtimeSinceStartup;
+            float nextProgressLogAt = startedAt + MOTION_PROGRESS_LOG_SEC;
             float reachedToleranceAt = -1f;
             bool protectiveStopDetected = false;
             while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
@@ -707,11 +724,19 @@ public class JsonExecutor : MonoBehaviour
                         string confirmation = controllerEnded ? "program ended" : "pose stable";
                         Debug.Log($"  [{tag}] REACHED ({confirmation}): max joint error " +
                                   $"{maxError * Mathf.Rad2Deg:F2} deg");
+                        yield return new WaitForSeconds(COMMAND_SETTLE_SEC);
                         yield break;
                     }
                 }
                 else
                     reachedToleranceAt = -1f;
+                if (Time.realtimeSinceStartup >= nextProgressLogAt)
+                {
+                    Debug.Log($"  [{tag}] WAITING HOME: max joint error " +
+                              $"{maxError * Mathf.Rad2Deg:F2} deg, " +
+                              $"programRunning={urListener.RobotModeData.isProgramRunning}");
+                    nextProgressLogAt = Time.realtimeSinceStartup + MOTION_PROGRESS_LOG_SEC;
+                }
                 yield return new WaitForSeconds(0.05f);
             }
 

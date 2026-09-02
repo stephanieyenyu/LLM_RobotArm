@@ -40,11 +40,13 @@ public sealed class BatchMotionPlanner
                 step_id exactly once, in the safest execution order. Prefer far targets
                 before near targets and bottom/supporting placements before upper ones.
                 For each step compose only: move_above, descend, grasp, release, lift,
-                wait, go_home. Every move_above, descend, and lift call must set location
-                to source or target; location may be null only for grasp, release, wait,
-                and go_home. Each pick must approach from
+                and wait. Every move_above, descend, and lift call must set location
+                to source or target; location may be null only for grasp, release, and wait.
+                Each pick must approach from
                 above, descend, grasp, lift, travel while lifted, descend at target,
-                release, lift, and finish at home. Clearance must be 0.08-0.15 m.
+                release, and finish by lifting safely above the target. Do not call
+                go_home between steps; the next step starts from this safe lifted pose.
+                Clearance must be 0.08-0.15 m.
                 Never output coordinates, URScript, joints, velocity, or extra steps.
                 """),
             new UserChatMessage($$"""
@@ -75,7 +77,7 @@ public sealed class BatchMotionPlanner
 
     /// <summary>
     /// The shared function-call schema must allow location=null for grasp,
-    /// release, wait, and go_home. Models occasionally copy that null onto a
+    /// release and wait. Models occasionally copy that null onto a
     /// lift even though its phase makes the endpoint unambiguous. Fill only
     /// these mechanically certain omissions; the validator still rejects an
     /// unsafe order or any genuinely ambiguous call.
@@ -122,7 +124,7 @@ public sealed class BatchMotionPlanner
                 ["function"] = new Dictionary<string, object?>
                 {
                     ["type"] = "string",
-                    ["enum"] = new[] { "move_above", "descend", "grasp", "release", "lift", "wait", "go_home" }
+                    ["enum"] = new[] { "move_above", "descend", "grasp", "release", "lift", "wait" }
                 },
                 ["location"] = new Dictionary<string, object?>
                 {

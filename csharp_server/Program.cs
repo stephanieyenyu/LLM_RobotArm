@@ -233,7 +233,8 @@ async Task RunBatchPatternTaskAsync(string userCommand, List<SceneObject> sceneS
     {
         Assignment assignment = byId[planned.StepId];
         var motion = new MotionPlan { ActionSequence = planned.ActionSequence };
-        if (!MotionPlanValidator.TryValidate(motion, assignment, sceneSnapshot, out string error))
+        if (!MotionPlanValidator.TryValidate(
+                motion, assignment, sceneSnapshot, out string error, requireHome: false))
         {
             Console.WriteLine($"[Batch Validator] Step {planned.StepId} rejected: {error}");
             return;

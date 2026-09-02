@@ -8,9 +8,9 @@ using OpenAI.Chat;
 public sealed class PatternDesigner
 {
     const int MaxRounds = 2;
-    const double MinimumWinningScore = 0.75;
-    const double OpenAiVoteWeight = 0.50;
-    const double GeminiVoteWeight = 0.50;
+    const double MinimumWinningScore = 0.80;
+    const double OpenAiVoteWeight = 0.40;
+    const double GeminiVoteWeight = 0.60;
     readonly ChatClient openAi;
     readonly HttpClient gemini;
     readonly string geminiModel;
@@ -73,6 +73,8 @@ public sealed class PatternDesigner
             PrintReview("Gemini reviews OpenAI", openReview);
 
             var finalists = new List<Candidate>();
+            open.DisplayNumber = 1;
+            gem.DisplayNumber = 2;
             open.Author = "Candidate 1: OpenAI original";
             gem.Author = "Candidate 2: Gemini original";
             // 1/2: both independently generated originals enter the anonymous
@@ -88,17 +90,24 @@ public sealed class PatternDesigner
 
             // 3: Gemini's revision of OpenAI. 4: OpenAI's revision of Gemini.
             AddRevisionIfValid(finalists, openReview,
-                "Candidate 3: OpenAI revised by Gemini", command, capacity,
+                3, "Candidate 3: OpenAI revised by Gemini", command, capacity,
                 canvas.Rows, canvas.Cols);
             AddRevisionIfValid(finalists, gemReview,
-                "Candidate 4: Gemini revised by OpenAI", command, capacity,
+                4, "Candidate 4: Gemini revised by OpenAI", command, capacity,
                 canvas.Rows, canvas.Cols);
             Candidate? selected = null;
             if (finalists.Count > 0)
             {
                 Console.WriteLine($"[Layer 1 vote] anonymously scoring {finalists.Count} finalists...");
-                var openBallotTask = BallotOpenAi(command, finalists);
-                var gemBallotTask = BallotGemini(command, finalists);
+                List<string>? glyphReference = GlyphReferenceRenderer.TryRenderFromCommand(command);
+                if (glyphReference != null)
+                {
+                    Console.WriteLine("[Layer 1 reference] system-font glyph supplied to both judges:");
+                    foreach (string row in glyphReference)
+                        Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
+                }
+                var openBallotTask = BallotOpenAi(command, finalists, glyphReference);
+                var gemBallotTask = BallotGemini(command, finalists, glyphReference);
                 await Task.WhenAll(openBallotTask, gemBallotTask);
                 selected = SelectByWeightedScore(
                     finalists, await openBallotTask, await gemBallotTask,
@@ -112,7 +121,7 @@ public sealed class PatternDesigner
             }
             if (selected != null)
             {
-                Console.WriteLine($"[Layer 1 dual] selected={selected.Author} by anonymous 50/50 dual-model vote");
+                Console.WriteLine($"[Layer 1 dual] selected={selected.Author} by anonymous weighted dual-model vote");
                 Console.WriteLine("[Layer 1 FINAL] 最終採用 Bitmap：");
                 foreach (string row in selected.Bitmap!)
                     Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
@@ -172,7 +181,8 @@ public sealed class PatternDesigner
     async Task<Review> ReviewGemini(string command, Candidate candidate, string localError)
         => ParseReview(await CallGemini(ReviewPrompt(), ReviewRequest(command, candidate, localError), ReviewSchema()));
 
-    async Task<Ballot> BallotOpenAi(string command, List<Candidate> candidates)
+    async Task<Ballot> BallotOpenAi(
+        string command, List<Candidate> candidates, List<string>? glyphReference)
     {
         var options = new ChatCompletionOptions { ResponseFormat = ChatResponseFormat.CreateJsonSchemaFormat(
             jsonSchemaFormatName: "pattern_ballot",
@@ -181,14 +191,15 @@ public sealed class PatternDesigner
         ChatCompletion completion = await openAi.CompleteChatAsync(new List<ChatMessage>
         {
             new SystemChatMessage(BallotPrompt()),
-            new UserChatMessage(BallotRequest(command, candidates)),
+            new UserChatMessage(BallotRequest(command, candidates, glyphReference)),
         }, options);
         return ParseBallot(completion.Content[0].Text);
     }
 
-    async Task<Ballot> BallotGemini(string command, List<Candidate> candidates)
+    async Task<Ballot> BallotGemini(
+        string command, List<Candidate> candidates, List<string>? glyphReference)
         => ParseBallot(await CallGemini(
-            BallotPrompt(), BallotRequest(command, candidates), BallotSchema()));
+            BallotPrompt(), BallotRequest(command, candidates, glyphReference), BallotSchema()));
 
     async Task<string> CallGemini(string system, string user, string schemaJson)
     {
@@ -280,19 +291,29 @@ public sealed class PatternDesigner
         請根據原始要求，為匿名的二進位矩陣評分。
         依照人類視覺可辨識度及對指定目標的忠實程度，獨立判斷每一個實際矩陣。
         候選順序與身分沒有任何意義，不可推測作者。
-        不可使用應用程式提供的模板、特定目標規則、字型、範例或易混淆清單；本程式沒有提供這些資料。
+        除了本次輸入明確附上的「系統字型參考字形」外，不可假設或使用其他模板、
+        特定目標規則、字型、範例或易混淆清單。
+        如果輸入中包含「系統字型參考字形」，請把它當作目標身分與筆畫拓撲的主要依據，
+        但不要求候選逐像素相同。候選可以因低解析度調整粗細與比例，但不可增加、刪除或移動
+        會改變字元身分的主要筆畫、交叉點或分支。
         如果矩陣不是原始要求的精確目標、存在身分歧義、方向錯誤、關鍵結構問題，
-        或需要更大畫布才能清楚表達，分數必須低於 0.75。
+        或需要更大畫布才能清楚表達，分數必須低於 0.80。
         每個候選索引必須剛好回傳一筆評分，分數範圍為 0 到 1。
         僅回傳符合指定 Schema 的 JSON。
         """;
 
-    static string BallotRequest(string command, List<Candidate> candidates)
+    static string BallotRequest(
+        string command, List<Candidate> candidates, List<string>? glyphReference)
     {
         var text = new StringBuilder($"原始使用者指令：{command}\n");
+        if (glyphReference is { Count: > 0 })
+        {
+            text.AppendLine("系統字型參考字形（僅作身分與結構基準，不要求逐像素複製）：");
+            foreach (string row in glyphReference) text.AppendLine(row);
+        }
         for (int i = 0; i < candidates.Count; i++)
         {
-            text.AppendLine($"候選圖案 {i}：");
+            text.AppendLine($"candidate_index={i}（Candidate {candidates[i].DisplayNumber}）：");
             foreach (string row in candidates[i].Bitmap ?? new()) text.AppendLine(row);
         }
         return text.ToString();
@@ -318,6 +339,7 @@ public sealed class PatternDesigner
     void AddRevisionIfValid(
         List<Candidate> finalists,
         Review review,
+        int displayNumber,
         string author,
         string command,
         int capacity,
@@ -336,6 +358,7 @@ public sealed class PatternDesigner
             Feasible = true,
             Bitmap = review.RevisedBitmap,
             Author = author,
+            DisplayNumber = displayNumber,
         };
         Validation validation = Validate(revision, capacity, canvasRows, canvasCols);
         if (!validation.Valid)
@@ -364,7 +387,8 @@ public sealed class PatternDesigner
             double weightedScore = openScores[i] * OpenAiVoteWeight +
                                    gemScores[i] * GeminiVoteWeight;
             Console.WriteLine(
-                $"[Layer 1 vote] candidate {i}: OpenAI={openScores[i]:F2}, " +
+                $"[Layer 1 vote] Candidate {candidates[i].DisplayNumber}: " +
+                $"OpenAI={openScores[i]:F2}, " +
                 $"Gemini={gemScores[i]:F2}, weighted={weightedScore:F2} " +
                 $"(OpenAI {OpenAiVoteWeight:P0} / Gemini {GeminiVoteWeight:P0})");
             if (weightedScore > bestScore)
@@ -504,6 +528,7 @@ public sealed class PatternDesigner
         [JsonPropertyName("self_observed_as")] public string SelfObservedAs { get; set; } = "";
         [JsonPropertyName("self_check_reason")] public string SelfCheckReason { get; set; } = "";
         [JsonIgnore] public string Author { get; set; } = "";
+        [JsonIgnore] public int DisplayNumber { get; set; }
     }
     sealed class Review
     {
