@@ -253,6 +253,7 @@ public class JsonExecutor : MonoBehaviour
             yield return new WaitForSeconds(pollIntervalSec);
 
             string path = Path.Combine(Application.streamingAssetsPath, batchPlanFile);
+            BatchPlanEnvelope batchToExecute = null;
             if (File.Exists(path))
             {
                 try
@@ -265,13 +266,7 @@ public class JsonExecutor : MonoBehaviour
                         lastProcessedBatchJson = json;
                         lastProcessedBatchWriteTimeUtc = writeTime;
                         if (batch != null && batch.steps != null && batch.steps.Count > 0)
-                        {
-                            currentStepCoroutine = StartCoroutine(ExecuteBatch(batch));
-                            yield return currentStepCoroutine;
-                            currentStepCoroutine = null;
-                            currentStepId = -1;
-                            continue;
-                        }
+                            batchToExecute = batch;
                     }
                 }
                 catch (Exception ex)
@@ -280,10 +275,22 @@ public class JsonExecutor : MonoBehaviour
                 }
             }
 
+            // Iterator methods cannot yield inside a try block that has catch.
+            // Execute only after file I/O and JSON parsing have left try/catch.
+            if (batchToExecute != null)
+            {
+                currentStepCoroutine = StartCoroutine(ExecuteBatch(batchToExecute));
+                yield return currentStepCoroutine;
+                currentStepCoroutine = null;
+                currentStepId = -1;
+                continue;
+            }
+
             // Compatibility for move_relative/stack/3D commands that still use
             // the closed-loop single-step channel. arrange_pattern never enters it.
             string legacyPath = Path.Combine(Application.streamingAssetsPath, currentStepFile);
             if (!File.Exists(legacyPath)) continue;
+            StepEnvelope legacyStepToExecute = null;
             try
             {
                 DateTime writeTime = File.GetLastWriteTimeUtc(legacyPath);
@@ -294,16 +301,21 @@ public class JsonExecutor : MonoBehaviour
                 lastProcessedStepJson = json;
                 lastProcessedStepWriteTimeUtc = writeTime;
                 if (env == null || env.done) continue;
-                currentStepId = env.step_id;
-                long stepEpoch = ++executionEpoch;
-                currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch));
-                yield return currentStepCoroutine;
-                currentStepCoroutine = null;
-                currentStepId = -1;
+                legacyStepToExecute = env;
             }
             catch (Exception ex)
             {
                 Debug.LogWarning($"[Executor] legacy step json parse failed: {ex.Message}");
+            }
+
+            if (legacyStepToExecute != null)
+            {
+                currentStepId = legacyStepToExecute.step_id;
+                long stepEpoch = ++executionEpoch;
+                currentStepCoroutine = StartCoroutine(ExecuteStep(legacyStepToExecute, stepEpoch));
+                yield return currentStepCoroutine;
+                currentStepCoroutine = null;
+                currentStepId = -1;
             }
         }
     }

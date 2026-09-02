@@ -72,8 +72,11 @@ var motionPlanner = new MotionPlanner();
 var batchMotionPlanner = new BatchMotionPlanner();
 var commandRouter = new CommandRouter();
 
-// 清空 input 與舊檔案
-if (File.Exists(inputPath)) File.WriteAllText(inputPath, "");
+// Do not clear an existing input at startup. Unity may submit a command while
+// the server is still initializing its API clients; clearing here would erase
+// that fresh command before the polling loop can consume it. The loop clears
+// the file atomically after reading the command.
+if (!File.Exists(inputPath)) File.WriteAllText(inputPath, "");
 if (File.Exists(currentStepPath)) File.Delete(currentStepPath);
 if (File.Exists(stepDonePath)) File.Delete(stepDonePath);
 if (File.Exists(batchPlanPath)) File.Delete(batchPlanPath);

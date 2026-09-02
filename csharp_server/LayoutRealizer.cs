@@ -120,12 +120,13 @@ return new RealizeResult { Targets = targets };
 
     private static TargetCell BuildCube(int r, int c, int rows, WorkspaceBounds ws, string color)
     {
+        (double originX, double cellSize) = PlanarGrid(rows, ws);
         return new TargetCell
         {
             Row = r,
             Col = c,
-            WorldX = ws.TargetOriginX + c * ws.CellSize,
-            WorldY = ws.TargetOriginY + (rows - 1 - r) * ws.CellSize,  // row 反向：字母不上下顛倒
+            WorldX = originX + c * cellSize,
+            WorldY = ws.TargetOriginY + (rows - 1 - r) * cellSize,  // row 反向：字母不上下顛倒
             WorldZ = ws.DefaultBlockZ,
             ExpectedShape = "cube",
             ExpectedColor = color,
@@ -137,9 +138,10 @@ return new RealizeResult { Targets = targets };
         int r1, int c1, int r2, int c2,
         int rows, WorkspaceBounds ws, string color, string orientation)
     {
+        (double originX, double cellSize) = PlanarGrid(rows, ws);
         // 中心點 = 兩格中點；row 反向處理
-        double cx = ws.TargetOriginX + (c1 + c2) * 0.5 * ws.CellSize;
-        double cy = ws.TargetOriginY + ((rows - 1 - r1) + (rows - 1 - r2)) * 0.5 * ws.CellSize;
+        double cx = originX + (c1 + c2) * 0.5 * cellSize;
+        double cy = ws.TargetOriginY + ((rows - 1 - r1) + (rows - 1 - r2)) * 0.5 * cellSize;
         return new TargetCell
         {
             Row = r1,
@@ -154,4 +156,9 @@ return new RealizeResult { Targets = targets };
             ExpectedOrientation = orientation,
         };
     }
+
+    private static (double OriginX, double CellSize) PlanarGrid(int rows, WorkspaceBounds ws)
+        => rows > ws.InitialPatternRows
+            ? (ws.ExpandedTargetOriginX, ws.ExpandedCellSize)
+            : (ws.TargetOriginX, ws.CellSize);
 }

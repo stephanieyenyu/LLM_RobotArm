@@ -47,8 +47,17 @@ public class WorkspaceBounds
     public double TargetOriginY { get; set; } = 0.00;
     public double CellSize { get; set; } = 0.055;
     public double DefaultBlockZ { get; set; } = 0.025;
-    public int MaxRows { get; set; } = 5;
-    public int MaxCols { get; set; } = 5;
+    // Planar glyphs start at 5x5 and may escalate to 7x7 when the LLM judges
+    // that the smaller canvas cannot represent the requested identity clearly.
+    public int MaxRows { get; set; } = 7;
+    public int MaxCols { get; set; } = 7;
+    public int InitialPatternRows { get; set; } = 5;
+    public int InitialPatternCols { get; set; } = 5;
+    // 7x7 uses the exact same physical footprint as 5x5. The 5x5 centre span is
+    // 4 * 0.055 = 0.22 m, so six 7x7 intervals are 0.22 / 6 m each. The smaller
+    // blocks must fit this approximately 3.667 cm centre spacing.
+    public double ExpandedTargetOriginX { get; set; } = 0.49;
+    public double ExpandedCellSize { get; set; } = 0.22 / 6.0;
     public int MaxLayers { get; set; } = 3;
     // 3D glyphs use their own fixed voxel volume.  Keep this separate from the
     // 5x5 planar bitmap so changing 3D does not alter existing 2D layouts.
