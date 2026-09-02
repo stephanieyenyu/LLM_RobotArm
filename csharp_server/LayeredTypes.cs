@@ -46,6 +46,14 @@ public class WorkspaceBounds
     public double TargetOriginX { get; set; } = 0.49;
     public double TargetOriginY { get; set; } = 0.00;
     public double CellSize { get; set; } = 0.055;
+    // Hard physical floor for CellSize when the resolution ladder (see
+    // LayoutRealizer.BuildResolutionLadder) shrinks cells to fit a higher
+    // row/col count into the same target footprint. Must stay >= physical
+    // cube size + a safe clearance so adjacent cubes never collide.
+    // PLACEHOLDER: current cubes are documented elsewhere as ~2.5cm; this
+    // assumes ~1cm clearance. VERIFY against the real cube model before
+    // relying on the ladder to pick a resolution automatically.
+    public double MinCellSize { get; set; } = 0.035;
     public double DefaultBlockZ { get; set; } = 0.025;
     // Planar glyphs start at 5x5 and may escalate to 7x7 when the LLM judges
     // that the smaller canvas cannot represent the requested identity clearly.

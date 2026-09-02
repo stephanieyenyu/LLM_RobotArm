@@ -19,6 +19,56 @@ public static class LayoutRealizer
     }
 
     /// <summary>
+    /// Builds a ladder of candidate (rows, cols, cellSize) resolutions that all
+    /// share the SAME physical footprint as the base workspace (rows*CellSize,
+    /// cols*CellSize stay constant), by shrinking CellSize as rows/cols grow.
+    /// Stops before CellSize would drop below MinCellSize, i.e. before adjacent
+    /// cubes would physically collide. Caller tries each entry in order and
+    /// stops at the first one PatternDesigner accepts as feasible.
+    /// </summary>
+    public static List<(int Rows, int Cols, double CellSize)> BuildResolutionLadder(
+        WorkspaceBounds baseWs, int step = 2, int maxSteps = 6)
+    {
+        double footprintW = baseWs.MaxCols * baseWs.CellSize;
+        double footprintH = baseWs.MaxRows * baseWs.CellSize;
+        var ladder = new List<(int, int, double)>();
+        int rows = baseWs.MaxRows, cols = baseWs.MaxCols;
+        for (int i = 0; i < maxSteps; i++)
+        {
+            double cellSize = System.Math.Min(footprintW / cols, footprintH / rows);
+            if (cellSize < baseWs.MinCellSize) break;
+            ladder.Add((rows, cols, cellSize));
+            rows += step;
+            cols += step;
+        }
+        return ladder;
+    }
+
+    /// <summary>
+    /// Copies a WorkspaceBounds with MaxRows/MaxCols/CellSize overridden for one
+    /// resolution-ladder attempt, leaving every other field (origins, zones,
+    /// 3D fields) identical to the base workspace.
+    /// </summary>
+    public static WorkspaceBounds WithResolution(WorkspaceBounds baseWs, int rows, int cols, double cellSize)
+        => new()
+        {
+            SupplyZoneXMax = baseWs.SupplyZoneXMax,
+            TargetZoneXMin = baseWs.TargetZoneXMin,
+            TargetOriginX = baseWs.TargetOriginX,
+            TargetOriginY = baseWs.TargetOriginY,
+            CellSize = cellSize,
+            MinCellSize = baseWs.MinCellSize,
+            DefaultBlockZ = baseWs.DefaultBlockZ,
+            MaxRows = rows,
+            MaxCols = cols,
+            MaxLayers = baseWs.MaxLayers,
+            SpatialRows = baseWs.SpatialRows,
+            SpatialCols = baseWs.SpatialCols,
+            SpatialLayers = baseWs.SpatialLayers,
+            SpatialTargetOriginY = baseWs.SpatialTargetOriginY,
+        };
+
+    /// <summary>
     /// bitmap + workspace → 每一格對應的世界座標。
     /// dominoBudget = supply 池中可用 domino 數量，用來決定要不要把相鄰 1 合成 domino。
     /// 傳 0 → 全部用 cube。
