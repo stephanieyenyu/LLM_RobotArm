@@ -57,7 +57,7 @@ public static class LayoutRealizer
             TargetOriginX = baseWs.TargetOriginX,
             TargetOriginY = baseWs.TargetOriginY,
             CellSize = cellSize,
-            MinCellSize = baseWs.MinCellSize,
+            MinCellClearanceM = baseWs.MinCellClearanceM,
             DefaultBlockZ = baseWs.DefaultBlockZ,
             MaxRows = rows,
             MaxCols = cols,
