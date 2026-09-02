@@ -10,6 +10,13 @@ public sealed class PatternDesigner
     const int MaxRounds = 2;
     const double OpenAiVoteWeight = 0.80;
     const double GeminiVoteWeight = 0.20;
+    // A candidate only becomes a finalist if BOTH its own self-assessment and
+    // the independent cross-reviewer's assessment clear this bar. This is
+    // still LLM self-report, not an external ground truth — it only raises
+    // the bar the self-report has to clear before being trusted, it does not
+    // make the report objectively correct (see Gemini's own 15-cell "exact
+    // 13-cell" mistake, which this bar alone would not have caught either).
+    const double ConfidenceThreshold = 0.75;
     readonly ChatClient openAi;
     readonly HttpClient gemini;
     readonly string geminiModel;
@@ -71,10 +78,10 @@ public sealed class PatternDesigner
             PrintReview("Gemini reviews OpenAI", openReview);
 
             var finalists = new List<Candidate>();
-            if (openLocal.Valid && openReview.Accept && openReview.Recognizable)
-                finalists.Add(open);
-            if (gemLocal.Valid && gemReview.Accept && gemReview.Recognizable)
-                finalists.Add(gem);
+            if (openLocal.Valid && MeetsBar(open, openReview)) finalists.Add(open);
+            else Console.WriteLine($"[Layer 1 reject] OpenAI: {RejectSummary(open, openLocal, openReview)}");
+            if (gemLocal.Valid && MeetsBar(gem, gemReview)) finalists.Add(gem);
+            else Console.WriteLine($"[Layer 1 reject] Gemini: {RejectSummary(gem, gemLocal, gemReview)}");
 
             AddRevisionIfValid(finalists, openReview, "Gemini revision by OpenAI", command, capacity);
             AddRevisionIfValid(finalists, gemReview, "OpenAI revision by Gemini", command, capacity);
@@ -202,6 +209,22 @@ public sealed class PatternDesigner
         - Available pieces: {{cubes}} cubes and {{dominoes}} dominoes. A cube covers one cell and a domino covers two orthogonally adjacent cells.
         - If no sufficiently recognizable and realizable matrix fits, set feasible=false instead of forcing an answer.
         - With feasible=false bitmap is empty; with feasible=true failure_reason is empty.
+        - After drawing (or deciding infeasible), grade your own result exactly as a skeptical
+          independent reviewer would, not as its author:
+          - self_accept: would you accept this bitmap as correct if someone else had drawn it?
+          - self_recognizable: would a human recognize the target from the bitmap alone, with no
+            hint of what it was supposed to be?
+          - self_exact_match: does it precisely match the requested target's structure, not just
+            something plausible or a different-but-similar symbol?
+          - self_needs_larger: would strictly more rows/cols let the target be represented more
+            clearly than the current {{maxRows}}x{{maxCols}} canvas allows, regardless of whether
+            this candidate happens to fit?
+          - self_confidence: 0-1, your honest confidence in the four judgments above.
+          - self_observed_as: what a human would say this bitmap shows, in a few words.
+          - self_reason: why you hold this bitmap to be right or wrong.
+        - If feasible=false, set self_accept=false, self_recognizable=false, self_exact_match=false,
+          self_confidence=0, self_observed_as to a short note that nothing was drawn, and self_reason
+          to why no matrix fits.
         Return only JSON matching the schema.
         """;
 
@@ -218,6 +241,11 @@ public sealed class PatternDesigner
         Inspect the cells; do not trust candidate ID, author, or claimed label.
         Do not use any application-provided target template, target-specific stroke rule, font, example, or confusion list; none is provided.
         Reject uncertain, ambiguous, broken, or wrong-target candidates. Give concise structural problems and actionable corrections based only on this matrix.
+        - exact_match: true only if the matrix precisely matches the requested target's structure,
+          not merely a plausible-looking or different-but-similar symbol.
+        - needs_larger: true if you believe the requested canvas size is too small to represent the
+          target clearly, independent of whether this specific candidate happens to fit it.
+        - confidence: 0-1, your honest confidence in accept/recognizable/exact_match together.
         If you can materially improve the submitted matrix, set has_revision=true and return the complete revised bitmap in revised_bitmap.
         A revision must target the original request and must not merely describe edits in suggested_changes.
         If no revision is needed or possible, set has_revision=false and revised_bitmap=[];
@@ -251,6 +279,38 @@ public sealed class PatternDesigner
         }
         return text.ToString();
     }
+
+    // Both self-assessment (by the model that drew it) and cross-assessment
+    // (by the other model, blind to authorship) must independently agree the
+    // candidate is acceptable, recognizable, and an exact match, each above
+    // the confidence bar. Requiring both sides to clear the bar does not make
+    // either side objectively correct — it only means two separately-sampled
+    // judgments agreed, which is weaker evidence than a checkable ground
+    // truth but stronger than trusting either one alone.
+    static bool MeetsBar(Candidate self, Review cross) =>
+        self.SelfAccept && self.SelfRecognizable && self.SelfExactMatch &&
+        self.SelfConfidence >= ConfidenceThreshold &&
+        cross.Accept && cross.Recognizable && cross.ExactMatch &&
+        cross.Confidence >= ConfidenceThreshold;
+
+    static string RejectSummary(Candidate self, Validation local, Review cross)
+    {
+        var parts = new List<string>();
+        if (!local.Valid) parts.Add(local.Error);
+        parts.Add($"self_accept={Lower(self.SelfAccept)}");
+        parts.Add($"self_recognizable={Lower(self.SelfRecognizable)}");
+        parts.Add($"self_exact_target_match={Lower(self.SelfExactMatch)}");
+        if (self.SelfNeedsLarger) parts.Add("self requested larger canvas");
+        if (self.SelfConfidence < ConfidenceThreshold) parts.Add($"self confidence {self.SelfConfidence:F2}<{ConfidenceThreshold:F2}");
+        parts.Add($"cross accept={Lower(cross.Accept)}");
+        parts.Add($"cross recognizable={Lower(cross.Recognizable)}");
+        parts.Add($"cross exact_target_match={Lower(cross.ExactMatch)}");
+        if (cross.NeedsLarger) parts.Add("cross requested larger canvas");
+        if (cross.Confidence < ConfidenceThreshold) parts.Add($"cross confidence {cross.Confidence:F2}<{ConfidenceThreshold:F2}");
+        if (cross.StructuralProblems.Count > 0) parts.Add($"cross reported {cross.StructuralProblems.Count} structural problem(s)");
+        return string.Join("; ", parts);
+    }
+    static string Lower(bool b) => b ? "true" : "false";
 
     Validation Validate(Candidate c, int capacity)
     {
@@ -336,10 +396,16 @@ public sealed class PatternDesigner
         Console.WriteLine($"[Layer 1 dual] {name} candidate={c.PatternId}, feasible={c.Feasible}");
         foreach (var row in c.Bitmap ?? new()) Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
         if (!c.Feasible) Console.WriteLine("                  reason=" + c.FailureReason);
+        Console.WriteLine(
+            $"                  self: accept={c.SelfAccept}, recognizable={c.SelfRecognizable}, " +
+            $"exact_match={c.SelfExactMatch}, needs_larger={c.SelfNeedsLarger}, confidence={c.SelfConfidence:F2}, " +
+            $"observed={c.SelfObservedAs}, reason={c.SelfReason}");
     }
     static void PrintReview(string name, Review r)
     {
-        Console.WriteLine($"[Layer 1 cross] {name}: accept={r.Accept}, recognizable={r.Recognizable}, confidence={r.Confidence:F2}, observed={r.ObservedAs}");
+        Console.WriteLine(
+            $"[Layer 1 cross] {name}: accept={r.Accept}, recognizable={r.Recognizable}, " +
+            $"exact_match={r.ExactMatch}, needs_larger={r.NeedsLarger}, confidence={r.Confidence:F2}, observed={r.ObservedAs}");
         foreach (var x in r.StructuralProblems) Console.WriteLine("                  problem: " + x);
         foreach (var x in r.SuggestedChanges) Console.WriteLine("                  suggestion: " + x);
         if (r.HasRevision)
@@ -359,8 +425,16 @@ public sealed class PatternDesigner
             ["failure_reason"] = new { type = "string" }, ["suggested_rows"] = new { type = "integer" },
             ["suggested_cols"] = new { type = "integer" }, ["suggested_occupied_cells"] = new { type = "integer" },
             ["bitmap"] = new { type = "array", items = new { type = "string" } },
+            ["self_accept"] = new { type = "boolean" }, ["self_recognizable"] = new { type = "boolean" },
+            ["self_exact_match"] = new { type = "boolean" }, ["self_needs_larger"] = new { type = "boolean" },
+            ["self_confidence"] = new { type = "number", minimum = 0, maximum = 1 },
+            ["self_observed_as"] = new { type = "string" }, ["self_reason"] = new { type = "string" },
         },
-        required = new[] { "pattern_id", "feasible", "failure_reason", "suggested_rows", "suggested_cols", "suggested_occupied_cells", "bitmap" },
+        required = new[]
+        {
+            "pattern_id", "feasible", "failure_reason", "suggested_rows", "suggested_cols", "suggested_occupied_cells", "bitmap",
+            "self_accept", "self_recognizable", "self_exact_match", "self_needs_larger", "self_confidence", "self_observed_as", "self_reason",
+        },
     });
     static string ReviewSchema() => JsonSerializer.Serialize(new
     {
@@ -368,13 +442,14 @@ public sealed class PatternDesigner
         properties = new Dictionary<string, object>
         {
             ["accept"] = new { type = "boolean" }, ["recognizable"] = new { type = "boolean" },
+            ["exact_match"] = new { type = "boolean" }, ["needs_larger"] = new { type = "boolean" },
             ["confidence"] = new { type = "number", minimum = 0, maximum = 1 }, ["observed_as"] = new { type = "string" },
             ["structural_problems"] = new { type = "array", items = new { type = "string" } },
             ["suggested_changes"] = new { type = "array", items = new { type = "string" } },
             ["has_revision"] = new { type = "boolean" },
             ["revised_bitmap"] = new { type = "array", items = new { type = "string" } },
         },
-        required = new[] { "accept", "recognizable", "confidence", "observed_as", "structural_problems", "suggested_changes", "has_revision", "revised_bitmap" },
+        required = new[] { "accept", "recognizable", "exact_match", "needs_larger", "confidence", "observed_as", "structural_problems", "suggested_changes", "has_revision", "revised_bitmap" },
     });
     static string BallotSchema() => JsonSerializer.Serialize(new
     {
@@ -410,12 +485,21 @@ public sealed class PatternDesigner
         [JsonPropertyName("suggested_cols")] public int SuggestedCols { get; set; }
         [JsonPropertyName("suggested_occupied_cells")] public int SuggestedOccupiedCells { get; set; }
         [JsonPropertyName("bitmap")] public List<string>? Bitmap { get; set; }
+        [JsonPropertyName("self_accept")] public bool SelfAccept { get; set; }
+        [JsonPropertyName("self_recognizable")] public bool SelfRecognizable { get; set; }
+        [JsonPropertyName("self_exact_match")] public bool SelfExactMatch { get; set; }
+        [JsonPropertyName("self_needs_larger")] public bool SelfNeedsLarger { get; set; }
+        [JsonPropertyName("self_confidence")] public double SelfConfidence { get; set; }
+        [JsonPropertyName("self_observed_as")] public string SelfObservedAs { get; set; } = "";
+        [JsonPropertyName("self_reason")] public string SelfReason { get; set; } = "";
         [JsonIgnore] public string Author { get; set; } = "";
     }
     sealed class Review
     {
         [JsonPropertyName("accept")] public bool Accept { get; set; }
         [JsonPropertyName("recognizable")] public bool Recognizable { get; set; }
+        [JsonPropertyName("exact_match")] public bool ExactMatch { get; set; }
+        [JsonPropertyName("needs_larger")] public bool NeedsLarger { get; set; }
         [JsonPropertyName("confidence")] public double Confidence { get; set; }
         [JsonPropertyName("observed_as")] public string ObservedAs { get; set; } = "";
         [JsonPropertyName("structural_problems")] public List<string> StructuralProblems { get; set; } = new();
