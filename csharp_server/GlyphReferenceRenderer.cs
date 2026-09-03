@@ -33,11 +33,12 @@ public static class GlyphReferenceRenderer
     // Font, and the constructed Font's resolved Name is checked AFTER, as a
     // second line of defense — either mismatch is treated as "unavailable"
     // (return null), never as "close enough, render with substitute font".
-    private static bool IsFamilyInstalled(string familyName)
+    private static bool IsFamilyInstalled(string familyName, out string[] installedNames)
     {
         using var installed = new InstalledFontCollection();
-        foreach (var family in installed.Families)
-            if (string.Equals(family.Name, familyName, StringComparison.OrdinalIgnoreCase))
+        installedNames = installed.Families.Select(f => f.Name).ToArray();
+        foreach (var name in installedNames)
+            if (string.Equals(name, familyName, StringComparison.OrdinalIgnoreCase))
                 return true;
         return false;
     }
@@ -48,13 +49,29 @@ public static class GlyphReferenceRenderer
         string? target = ExtractTarget(command);
         if (string.IsNullOrWhiteSpace(target)) return null;
 
-        if (!IsFamilyInstalled(FontFamilyName))
+        if (!IsFamilyInstalled(FontFamilyName, out string[] installedNames))
         {
+            // Print what InstalledFontCollection actually enumerated instead of
+            // just asserting "not installed" — after two rounds of guessing at
+            // install-scope causes (per-user vs all-users) that didn't fix it,
+            // the only way to stop guessing is to see GDI+'s real list. Filter
+            // to plausible near-matches first (cheap to read); if none, dump
+            // everything so a naming mismatch is visible directly.
+            var nearMatches = installedNames
+                .Where(n => n.Contains("Gen", StringComparison.OrdinalIgnoreCase)
+                         || n.Contains("Round", StringComparison.OrdinalIgnoreCase)
+                         || n.Contains("源泉", StringComparison.Ordinal))
+                .ToArray();
             Console.WriteLine(
                 $"[Glyph reference] unavailable: font family \"{FontFamilyName}\" is not " +
-                "installed on this machine (checked InstalledFontCollection). Install " +
-                "GenSenRounded2TW-R.otf and restart the process — do not proceed, GDI+ " +
-                "would otherwise silently substitute a different font.");
+                $"among the {installedNames.Length} families InstalledFontCollection sees. " +
+                (nearMatches.Length > 0
+                    ? $"Near-matches found instead: [{string.Join(", ", nearMatches.Select(n => $"\"{n}\""))}] " +
+                      "— compare these character-by-character against the expected name (stray " +
+                      "space, different digit/spacing, CJK vs ASCII variant) rather than reinstalling again."
+                    : "No near-match (nothing containing \"Gen\", \"Round\", or \"源泉\") — " +
+                      "InstalledFontCollection is not seeing this font at all, regardless of name. " +
+                      $"Full list: [{string.Join(", ", installedNames)}]"));
             return null;
         }
 
