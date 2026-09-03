@@ -288,25 +288,43 @@ public static class GlyphReferenceRenderer
         var area = Rectangle.FromLTRB(left, top, right, bottom);
 
         // The skeleton is (barring rare junction pixels) exactly 1px wide, so
-        // a coverage-fraction threshold like the old CellInkCoverageThreshold
-        // would almost always read near-zero and mark every cell empty. The
-        // occupancy rule is simply "does the skeleton pass through this cell
-        // at all".
+        // a 2D area-coverage fraction like the old CellInkCoverageThreshold
+        // would almost always read near-zero. But "any single skeleton pixel
+        // in the cell" is the wrong replacement: at low output resolution
+        // (e.g. 5x5) a real stroke that runs the length of a row or column
+        // hits nearly every cell along it, and even a stroke that only
+        // grazes a cell's corner counts the same as one that runs straight
+        // through it — most non-trivial glyphs collapse into a solid block
+        // regardless of their actual shape.
+        //
+        // Instead, occupancy is judged against how far the skeleton actually
+        // travels through the cell: a straight 1px line fully transiting a
+        // cell contributes roughly max(cellWidth, cellHeight) ink pixels, so
+        // requiring ink >= CellTransitFraction * max(cellWidth, cellHeight)
+        // accepts a real through-stroke while rejecting a corner graze or a
+        // stray pixel from a nearby junction.
+        const double CellTransitFraction = 0.35;
+
         var result = new List<string>(rows);
         for (int r = 0; r < rows; r++)
         {
             var line = new StringBuilder(cols);
             int y0 = area.Top + r * area.Height / rows;
             int y1 = area.Top + (r + 1) * area.Height / rows;
+            int cellHeight = Math.Max(1, y1 - y0);
             for (int c = 0; c < cols; c++)
             {
                 int x0 = area.Left + c * area.Width / cols;
                 int x1 = area.Left + (c + 1) * area.Width / cols;
-                bool ink = false;
-                for (int y = y0; y < Math.Max(y0 + 1, y1) && !ink; y++)
-                for (int x = x0; x < Math.Max(x0 + 1, x1) && !ink; x++)
-                    if (skeleton[x, y]) ink = true;
-                line.Append(ink ? '1' : '0');
+                int cellWidth = Math.Max(1, x1 - x0);
+                int threshold = Math.Max(1, (int)Math.Round(
+                    CellTransitFraction * Math.Max(cellWidth, cellHeight)));
+
+                int ink = 0;
+                for (int y = y0; y < Math.Max(y0 + 1, y1); y++)
+                for (int x = x0; x < Math.Max(x0 + 1, x1); x++)
+                    if (skeleton[x, y]) ink++;
+                line.Append(ink >= threshold ? '1' : '0');
             }
             result.Add(line.ToString());
         }
