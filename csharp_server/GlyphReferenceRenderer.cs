@@ -202,7 +202,7 @@ public static class GlyphReferenceRenderer
                     total++;
                     if (image.GetPixel(x, y).GetBrightness() < 0.80f) ink++;
                 }
-                line.Append(total > 0 && (double)ink / total >= 0.20 ? '1' : '0');
+                line.Append(total > 0 && (double)ink / total >= 0.10 ? '1' : '0');
             }
             result.Add(line.ToString());
         }
