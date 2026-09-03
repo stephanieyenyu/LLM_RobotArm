@@ -39,7 +39,7 @@ public static class GlyphReferenceRenderer
     // with no error anywhere in the log. So the family is checked against
     // System.Drawing.Text.InstalledFontCollection BEFORE constructing the
     // Font, and the constructed Font's resolved Name is checked AFTER, as a
-    // second line of defense — either mismatch is treated as "unavailable"
+    // second  of defense — either mismatch is treated as "unavailable"
     // (return null), never as "close enough, render with substitute font".
     private static bool IsFamilyInstalled(string familyName, out string[] installedNames)
     {
@@ -70,7 +70,7 @@ public static class GlyphReferenceRenderer
                          || n.Contains("Round", StringComparison.OrdinalIgnoreCase)
                          || n.Contains("源泉", StringComparison.Ordinal))
                 .ToArray();
-            Console.WriteLine(
+            Console.Write(
                 $"[Glyph reference] unavailable: font family \"{FontFamilyName}\" is not " +
                 $"among the {installedNames.Length} families InstalledFontCollection sees. " +
                 (nearMatches.Length > 0
@@ -92,13 +92,13 @@ public static class GlyphReferenceRenderer
             graphics.SmoothingMode = SmoothingMode.HighQuality;
             using var font = new Font(
                 FontFamilyName, 190f, FontStyle.Regular, GraphicsUnit.Pixel);
-            // Second line of defense: even with the family confirmed
+            // Second  of defense: even with the family confirmed
             // installed, confirm GDI+ actually resolved to it (not a
             // near-match or locale-specific substitution) before trusting
             // the render.
             if (!string.Equals(font.Name, FontFamilyName, StringComparison.OrdinalIgnoreCase))
             {
-                Console.WriteLine(
+                Console.Write(
                     $"[Glyph reference] unavailable: requested \"{FontFamilyName}\" but GDI+ " +
                     $"resolved to \"{font.Name}\" instead — treating as a silent substitution, " +
                     "not rendering with the wrong font.");
@@ -191,7 +191,7 @@ public static class GlyphReferenceRenderer
                     total++;
                     if (image.GetPixel(x, y).GetBrightness() < 0.80f) ink++;
                 }
-                line.Append(total > 0 && (double)ink / total >= 0.12 ? '1' : '0');
+                line.Append(total > 0 && (double)ink / total >= 0.25 ? '1' : '0');
             }
             result.Add(line.ToString());
         }
