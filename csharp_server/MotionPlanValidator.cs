@@ -27,7 +27,8 @@ public static class MotionPlanValidator
         MotionPlan? plan,
         Assignment assignment,
         IReadOnlyList<SceneObject> scene,
-        out string error)
+        out string error,
+        bool requireHome = true)
     {
         error = "";
         if (assignment.Source == null || assignment.Target == null)
@@ -153,8 +154,12 @@ public static class MotionPlanValidator
             }
         }
 
-        if (!released || holding || phase != "home")
-            return Fail("plan must release, retreat, and finish at home", out error);
+        string requiredFinalPhase = requireHome ? "home" : "retreated";
+        if (!released || holding || phase != requiredFinalPhase)
+            return Fail(requireHome
+                ? "plan must release, retreat, and finish at home"
+                : "batch step must release and retreat above the target without going home",
+                out error);
         return true;
     }
 

@@ -20,20 +20,23 @@ public static class LayoutRealizer
 
     /// <summary>
     /// Builds a ladder of candidate (rows, cols, cellSize) resolutions that all
-    /// share the SAME physical footprint as the base workspace (rows*CellSize,
-    /// cols*CellSize stay constant), by shrinking CellSize as rows/cols grow.
-    /// Stops before CellSize would drop below MinCellSize, i.e. before adjacent
-    /// cubes would physically collide. Caller tries each entry in order and
-    /// stops at the first one PatternDesigner accepts as feasible.
+    /// share the SAME physical footprint as the base workspace's starting size
+    /// (InitialPatternRows/Cols * CellSize stays constant), by shrinking
+    /// CellSize as rows/cols grow from there. Stops at whichever comes first:
+    /// MaxRows/MaxCols (the workspace's own ceiling — e.g. where an expanded
+    /// layout like ExpandedCellSize takes over instead of linear shrinking),
+    /// CellSize dropping below MinCellSize (adjacent cubes would physically
+    /// collide), or maxSteps (safety net). Caller tries each entry in order
+    /// and stops at the first one PatternDesigner accepts as feasible.
     /// </summary>
     public static List<(int Rows, int Cols, double CellSize)> BuildResolutionLadder(
         WorkspaceBounds baseWs, int step = 2, int maxSteps = 6)
     {
-        double footprintW = baseWs.MaxCols * baseWs.CellSize;
-        double footprintH = baseWs.MaxRows * baseWs.CellSize;
+        double footprintW = baseWs.InitialPatternCols * baseWs.CellSize;
+        double footprintH = baseWs.InitialPatternRows * baseWs.CellSize;
         var ladder = new List<(int, int, double)>();
-        int rows = baseWs.MaxRows, cols = baseWs.MaxCols;
-        for (int i = 0; i < maxSteps; i++)
+        int rows = baseWs.InitialPatternRows, cols = baseWs.InitialPatternCols;
+        for (int i = 0; i < maxSteps && rows <= baseWs.MaxRows && cols <= baseWs.MaxCols; i++)
         {
             double cellSize = System.Math.Min(footprintW / cols, footprintH / rows);
             if (cellSize < baseWs.MinCellSize) break;
@@ -170,12 +173,13 @@ return new RealizeResult { Targets = targets };
 
     private static TargetCell BuildCube(int r, int c, int rows, WorkspaceBounds ws, string color)
     {
+        (double originX, double cellSize) = PlanarGrid(rows, ws);
         return new TargetCell
         {
             Row = r,
             Col = c,
-            WorldX = ws.TargetOriginX + c * ws.CellSize,
-            WorldY = ws.TargetOriginY + (rows - 1 - r) * ws.CellSize,  // row 反向：字母不上下顛倒
+            WorldX = originX + c * cellSize,
+            WorldY = ws.TargetOriginY + (rows - 1 - r) * cellSize,  // row 反向：字母不上下顛倒
             WorldZ = ws.DefaultBlockZ,
             ExpectedShape = "cube",
             ExpectedColor = color,
@@ -187,9 +191,10 @@ return new RealizeResult { Targets = targets };
         int r1, int c1, int r2, int c2,
         int rows, WorkspaceBounds ws, string color, string orientation)
     {
+        (double originX, double cellSize) = PlanarGrid(rows, ws);
         // 中心點 = 兩格中點；row 反向處理
-        double cx = ws.TargetOriginX + (c1 + c2) * 0.5 * ws.CellSize;
-        double cy = ws.TargetOriginY + ((rows - 1 - r1) + (rows - 1 - r2)) * 0.5 * ws.CellSize;
+        double cx = originX + (c1 + c2) * 0.5 * cellSize;
+        double cy = ws.TargetOriginY + ((rows - 1 - r1) + (rows - 1 - r2)) * 0.5 * cellSize;
         return new TargetCell
         {
             Row = r1,
@@ -204,4 +209,9 @@ return new RealizeResult { Targets = targets };
             ExpectedOrientation = orientation,
         };
     }
+
+    private static (double OriginX, double CellSize) PlanarGrid(int rows, WorkspaceBounds ws)
+        => rows > ws.InitialPatternRows
+            ? (ws.ExpandedTargetOriginX, ws.ExpandedCellSize)
+            : (ws.TargetOriginX, ws.CellSize);
 }

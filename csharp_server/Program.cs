@@ -49,6 +49,8 @@ string unityStreamingAssets = "../unity_project/Assets/StreamingAssets";
 string inputPath = Path.Combine(unityStreamingAssets, "user_input.txt");
 string currentStepPath = Path.Combine(unityStreamingAssets, "current_step.json");
 string stepDonePath = Path.Combine(unityStreamingAssets, "step_done.json");
+string batchPlanPath = Path.Combine(unityStreamingAssets, "batch_plan.json");
+string batchDonePath = Path.Combine(unityStreamingAssets, "batch_done.json");
 string localOutputDir = "outputs";
 Directory.CreateDirectory(localOutputDir);
 
@@ -57,6 +59,7 @@ Console.WriteLine("=== LLM Planner（分層架構）已啟動 ===");
 Console.WriteLine($"監聽：{Path.GetFullPath(inputPath)}");
 Console.WriteLine($"每步指令：{Path.GetFullPath(currentStepPath)}");
 Console.WriteLine($"執行回報：{Path.GetFullPath(stepDonePath)}");
+Console.WriteLine($"完整 Batch Plan：{Path.GetFullPath(batchPlanPath)}");
 Console.WriteLine("等待 Unity 輸入指令...");
 Console.WriteLine();
 
@@ -66,12 +69,18 @@ var patternDesigner = new PatternDesigner(workspace.MaxRows, workspace.MaxCols);
 var spatialPatternDesigner = new SpatialPatternDesigner(
     workspace.SpatialRows, workspace.SpatialCols, workspace.SpatialLayers);
 var motionPlanner = new MotionPlanner();
+var batchMotionPlanner = new BatchMotionPlanner();
 var commandRouter = new CommandRouter();
 
-// 清空 input 與舊檔案
-if (File.Exists(inputPath)) File.WriteAllText(inputPath, "");
+// Do not clear an existing input at startup. Unity may submit a command while
+// the server is still initializing its API clients; clearing here would erase
+// that fresh command before the polling loop can consume it. The loop clears
+// the file atomically after reading the command.
+if (!File.Exists(inputPath)) File.WriteAllText(inputPath, "");
 if (File.Exists(currentStepPath)) File.Delete(currentStepPath);
 if (File.Exists(stepDonePath)) File.Delete(stepDonePath);
+if (File.Exists(batchPlanPath)) File.Delete(batchPlanPath);
+if (File.Exists(batchDonePath)) File.Delete(batchDonePath);
 
 // Keep step IDs unique when dotnet is restarted while Unity remains in Play
 // Mode; otherwise Unity can mistake a new Step 1/2/... for an old command.
@@ -134,7 +143,7 @@ async Task RunTaskAsync(string userCommand)
     switch (routed.Action)
     {
         case "arrange_pattern":
-            await RunPatternTaskAsync(userCommand);
+            await RunBatchPatternTaskAsync(userCommand, initialScene);
             break;
         case "arrange_3d_pattern":
             await RunSpatialPatternTaskAsync(userCommand, initialScene);
@@ -152,6 +161,126 @@ async Task RunTaskAsync(string userCommand)
             Console.WriteLine($"[CommandRouter] Unsupported action: {routed.Action}");
             break;
     }
+}
+
+// Complete batch path: one perception snapshot -> one LLM batch request -> one
+// immutable JSON file -> sequential physical execution. There is deliberately no
+// per-step re-perception or replanning inside this path.
+async Task RunBatchPatternTaskAsync(string userCommand, List<SceneObject> sceneSnapshot)
+{
+    string blockColor = GuessBlockColor(userCommand, sceneSnapshot);
+    int cubeBudget = sceneSnapshot.Count(s =>
+        s.Name == $"{blockColor}_cube" && s.X < workspace.SupplyZoneXMax);
+    int dominoBudget = sceneSnapshot.Count(s =>
+        s.Name == $"{blockColor}_domino" && s.X < workspace.SupplyZoneXMax);
+
+    Console.WriteLine($"[Batch Layer 1] Designing pattern from one scene snapshot (color={blockColor})...");
+    CanonicalPattern pattern;
+    try
+    {
+        pattern = await patternDesigner.DesignAsync(
+            userCommand, blockColor, cubeBudget, dominoBudget);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Batch Layer 1] Pattern design failed: {ex.Message}");
+        return;
+    }
+
+    var realized = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
+    if (realized.Error != null || realized.Targets == null)
+    {
+        Console.WriteLine($"[Batch Layer 2] {realized.Error}");
+        return;
+    }
+
+    List<Assignment> candidates;
+    try
+    {
+        candidates = TaskAssigner.AssignBatch(realized.Targets, sceneSnapshot, ref globalStepId);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Batch Layer 3] {ex.Message}");
+        return;
+    }
+    Console.WriteLine($"[Batch Layer 3] Frozen {candidates.Count} unique source/target assignments.");
+
+    BatchMotionPlan llmBatch;
+    try
+    {
+        Console.WriteLine("[Batch Layer 4A] LLM is planning all moves and their order in one request...");
+        llmBatch = await batchMotionPlanner.PlanAsync(candidates, sceneSnapshot);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Batch Layer 4A] Batch planning failed: {ex.Message}");
+        return;
+    }
+
+    var byId = candidates.ToDictionary(a => a.StepId);
+    var returnedIds = llmBatch.Steps.Select(s => s.StepId).ToList();
+    if (returnedIds.Count != candidates.Count ||
+        returnedIds.Distinct().Count() != candidates.Count ||
+        returnedIds.Any(id => !byId.ContainsKey(id)))
+    {
+        Console.WriteLine("[Batch Validator] Rejected: LLM must return every candidate step_id exactly once.");
+        return;
+    }
+
+    var envelopes = new List<StepEnvelope>();
+    foreach (var planned in llmBatch.Steps)
+    {
+        Assignment assignment = byId[planned.StepId];
+        var motion = new MotionPlan { ActionSequence = planned.ActionSequence };
+        if (!MotionPlanValidator.TryValidate(
+                motion, assignment, sceneSnapshot, out string error, requireHome: false))
+        {
+            Console.WriteLine($"[Batch Validator] Step {planned.StepId} rejected: {error}");
+            return;
+        }
+        envelopes.Add(new StepEnvelope
+        {
+            StepId = assignment.StepId,
+            SourcePosition = assignment.Source,
+            TargetPosition = new SceneObject
+            {
+                Name = $"grid_{assignment.Target!.ExpectedShape}_r{assignment.Target.Row}_c{assignment.Target.Col}",
+                X = assignment.Target.WorldX, Y = assignment.Target.WorldY, Z = assignment.Target.WorldZ,
+                Shape = assignment.Target.ExpectedShape,
+                Orientation = assignment.Target.ExpectedOrientation,
+            },
+            Comment = assignment.Reasoning,
+            ActionSequence = planned.ActionSequence,
+        });
+    }
+
+    int batchId = checked(++globalStepId);
+    var batch = new BatchPlan
+    {
+        BatchId = batchId,
+        CreatedAt = DateTimeOffset.Now.ToString("O"),
+        SceneCapturedAt = DateTimeOffset.Now.ToString("O"),
+        Comment = $"{pattern.PatternId}: {llmBatch.Reasoning}",
+        Steps = envelopes,
+    };
+    WriteBatchFile(batch);
+    Console.WriteLine($"[Batch Layer 4B] Sent batch {batchId}: {envelopes.Count} physical steps.");
+
+    BatchExecutionResult? result = await WaitForBatchDoneAsync(
+        batchId, UNITY_STEP_TIMEOUT_SEC * Math.Max(1, envelopes.Count));
+    if (result == null)
+    {
+        Console.WriteLine("[Batch Executor] Timed out waiting for Unity.");
+        return;
+    }
+    Console.WriteLine(result.Completed
+        ? $"[Batch Executor] Completed all {result.TotalSteps} steps in {result.DurationSec:F1}s."
+        : $"[Batch Executor] Stopped at step {result.FailedStepId}: {result.Error}");
+
+    var finalSnap = await FetchSceneAsync();
+    var overall = Verifier.CheckOverall(realized.Targets, finalSnap);
+    Console.WriteLine($"[Batch Verifier] {overall.Count(x => x.matched)}/{overall.Count} targets matched.");
 }
 
 async Task RunPatternTaskAsync(string userCommand)
@@ -964,6 +1093,39 @@ void WriteStepFile(StepEnvelope env)
     string json = JsonSerializer.Serialize(env, jsonOptions);
     File.WriteAllText(currentStepPath, json);
     File.WriteAllText(Path.Combine(localOutputDir, $"step_{env.StepId}.json"), json);
+}
+
+void WriteBatchFile(BatchPlan batch)
+{
+    string json = JsonSerializer.Serialize(batch, jsonOptions);
+    string tempPath = batchPlanPath + ".tmp";
+    File.WriteAllText(tempPath, json);
+    File.Move(tempPath, batchPlanPath, true);
+    File.WriteAllText(Path.Combine(localOutputDir, $"batch_{batch.BatchId}.json"), json);
+}
+
+async Task<BatchExecutionResult?> WaitForBatchDoneAsync(int batchId, double timeoutSec)
+{
+    var start = DateTime.UtcNow;
+    while ((DateTime.UtcNow - start).TotalSeconds < timeoutSec)
+    {
+        if (File.Exists(batchDonePath))
+        {
+            try
+            {
+                string json = File.ReadAllText(batchDonePath);
+                var result = JsonSerializer.Deserialize<BatchExecutionResult>(json, jsonOptions);
+                if (result != null && result.BatchId == batchId)
+                {
+                    File.Delete(batchDonePath);
+                    return result;
+                }
+            }
+            catch { /* writer may still be replacing the report */ }
+        }
+        await Task.Delay(200);
+    }
+    return null;
 }
 
 async Task<ExecutionResult?> WaitForStepDoneAsync(int stepId, double timeoutSec)

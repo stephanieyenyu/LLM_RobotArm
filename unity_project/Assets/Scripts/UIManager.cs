@@ -8,6 +8,10 @@ public class UIManager : MonoBehaviour
     public UIDocument uiDocument;
     public JsonExecutor executor;
 
+    [Header("Batch Planning")]
+    [Tooltip("等待 csharp_server 完成雙模型評審與完整 Batch Plan 的秒數")]
+    public float batchPlanTimeoutSec = 600f;
+
     // 兩邊共用的資料夾（Unity / csharp_server 都指到這裡）
     // 如果之後換電腦或換路徑，只要改這一行
     private string SHARED_DIR => Application.streamingAssetsPath;
@@ -38,6 +42,14 @@ public class UIManager : MonoBehaviour
         inputField.style.marginRight = 5;
         inputField.style.height = 40;
         inputField.focusable = true;
+        inputField.RegisterCallback<KeyDownEvent>(evt =>
+        {
+            if (evt.keyCode != KeyCode.Return && evt.keyCode != KeyCode.KeypadEnter)
+                return;
+
+            OnSendCommand();
+            evt.StopPropagation();
+        });
 
         sendButton = new Button(() => OnSendCommand());
         sendButton.text = "執行";
@@ -47,6 +59,7 @@ public class UIManager : MonoBehaviour
         container.Add(inputField);
         container.Add(sendButton);
         root.Add(container);
+        container.RegisterCallback<MouseDownEvent>(_ => FocusInputField());
 
         statusLabel = new Label("");
         statusLabel.style.position = UnityEngine.UIElements.Position.Absolute;
@@ -67,6 +80,7 @@ public class UIManager : MonoBehaviour
             Directory.CreateDirectory(SHARED_DIR);
             Debug.Log("已建立共享資料夾：" + SHARED_DIR);
         }
+        inputField.schedule.Execute(FocusInputField).ExecuteLater(100);
 
         // ---------------------------------------------------------
         // 右上角三個手動控制按鈕：鬆開 / 夾緊 / 回 Home
@@ -125,6 +139,7 @@ public class UIManager : MonoBehaviour
         if (string.IsNullOrWhiteSpace(command))
         {
             Debug.LogWarning("輸入是空的，所以沒有寫入");
+            FocusInputField();
             return;
         }
 
@@ -140,24 +155,34 @@ public class UIManager : MonoBehaviour
             File.WriteAllText(inputPath, command);
 
             Debug.Log("寫入後讀回：" + File.ReadAllText(inputPath));
+            inputField.value = "";
+            FocusInputField();
 
             StartCoroutine(WaitAndExecute());
         }
         catch (System.Exception ex)
         {
             Debug.LogError("寫入 user_input.txt 失敗：" + ex);
+            FocusInputField();
         }
+    }
+
+    void FocusInputField()
+    {
+        if (inputField == null) return;
+        inputField.Focus();
+        inputField.SelectAll();
     }
 
     IEnumerator WaitAndExecute()
     {
-        // 分層架構下：csharp_server 的 orchestrator 會逐步寫 current_step.json、
-        // JsonExecutor 自己 poll 這個檔案來執行。UI 只要等到「至少一步」被 Unity 收到就代表任務啟動了。
-        // 這裡等 current_step.json 出現 / 更新，log 一下讓使用者知道 pipeline 通了。
-        string stepPath = Path.Combine(SHARED_DIR, "current_step.json");
-        var lastWrite = File.Exists(stepPath) ? File.GetLastWriteTime(stepPath) : System.DateTime.MinValue;
+        // Server 會一次產生完整 batch_plan.json；Executor 收到後自行逐步執行。
+        string batchPath = Path.Combine(SHARED_DIR, "batch_plan.json");
+        var lastWrite = File.Exists(batchPath) ? File.GetLastWriteTime(batchPath) : System.DateTime.MinValue;
 
-        float timeout = 120f;     // gpt-5 設計 pattern 有時要一分鐘以上
+        // Dual-model generation, cross-review, up to four-candidate voting and
+        // full motion planning can exceed two minutes.
+        float timeout = Mathf.Max(30f, batchPlanTimeoutSec);
         float waited = 0f;
         float lastLogAt = 0f;
 
@@ -166,19 +191,19 @@ public class UIManager : MonoBehaviour
             yield return new WaitForSeconds(0.5f);
             waited += 0.5f;
 
-            if (File.Exists(stepPath) && File.GetLastWriteTime(stepPath) > lastWrite)
+            if (File.Exists(batchPath) && File.GetLastWriteTime(batchPath) > lastWrite)
             {
-                Debug.Log($"[UI] current_step.json 已更新（等了 {waited:F1} 秒），Executor 會自動 poll 執行");
+                Debug.Log($"[UI] 完整 batch_plan.json 已產生（等了 {waited:F1} 秒），Executor 開始依序執行");
                 yield break;
             }
 
             if (waited - lastLogAt >= 15f)
             {
-                Debug.Log($"[UI] 仍在等 csharp_server 產生第一步...（已等 {waited:F0} 秒 / 上限 {timeout:F0} 秒）");
+                Debug.Log($"[UI] 仍在等 csharp_server 產生完整 Batch Plan...（已等 {waited:F0} 秒 / 上限 {timeout:F0} 秒）");
                 lastLogAt = waited;
             }
         }
 
-        Debug.LogWarning($"[UI] 等待 current_step.json 逾時（{timeout} 秒）— 檢查 csharp_server / perception_server 是否在跑");
+        Debug.LogWarning($"[UI] 等待 batch_plan.json 逾時（{timeout} 秒）— 檢查 csharp_server / perception_server 是否在跑");
     }
 }

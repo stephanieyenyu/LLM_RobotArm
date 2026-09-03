@@ -21,6 +21,49 @@ public static class TaskAssigner
     private const double SUPPLY_ZONE_X_MAX = 0.30;
 
     /// <summary>
+    /// Freezes all source/target pairings from one scene snapshot. A physical
+    /// source is consumed at most once; the LLM may subsequently reorder these
+    /// assignments but cannot invent coordinates or objects.
+    /// </summary>
+    public static List<Assignment> AssignBatch(
+        IReadOnlyList<TargetCell> targets,
+        IReadOnlyList<SceneObject> scene,
+        ref int nextStepId)
+    {
+        var remainingTargets = targets.ToList();
+        var remainingSupplies = scene
+            .Where(s => s != null && s.X < SUPPLY_ZONE_X_MAX)
+            .ToList();
+        var assignments = new List<Assignment>();
+        var protectedTargets = new List<TargetCell>();
+
+        while (remainingTargets.Count > 0)
+        {
+            int id = checked(++nextStepId);
+            var assignment = Assign(
+                remainingTargets, remainingSupplies, id,
+                recoveryMode: false, protectedTargets: protectedTargets);
+            if (assignment == null) break;
+
+            assignments.Add(assignment);
+            protectedTargets.Add(assignment.Target!);
+            remainingTargets.RemoveAll(t =>
+                t.Row == assignment.Target!.Row && t.Col == assignment.Target.Col);
+
+            // Remove the same detected piece using a tight coordinate match.
+            remainingSupplies.RemoveAll(s =>
+                s.Name == assignment.Source!.Name &&
+                Math.Pow(s.X - assignment.Source.X, 2) +
+                Math.Pow(s.Y - assignment.Source.Y, 2) < 1e-8);
+        }
+
+        if (remainingTargets.Count > 0)
+            throw new InvalidOperationException(
+                $"Cannot build complete batch: {remainingTargets.Count} target(s) have no unique supply.");
+        return assignments;
+    }
+
+    /// <summary>
     /// 挑下一步。回傳 null 代表沒有可執行的（供應不足 / 無 target）。
     /// </summary>
     public static Assignment? Assign(

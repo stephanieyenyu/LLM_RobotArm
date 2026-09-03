@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -42,6 +43,19 @@ namespace Assets.Scripts
             client?.Close();
         }
 
+        bool ReadExact(byte[] buffer, int offset, int count)
+        {
+            if (stream == null) return false;
+            int readTotal = 0;
+            while (readTotal < count)
+            {
+                int read = stream.Read(buffer, offset + readTotal, count - readTotal);
+                if (read <= 0) return false;
+                readTotal += read;
+            }
+            return true;
+        }
+
         void connectCallback(IAsyncResult result)
         {
             if (client == null)
@@ -64,20 +78,24 @@ namespace Assets.Scripts
                 {
                     if (IsRealtime)
                     {
-                        stream.Read(packageHeadBuffer, 0, 4);
+                        if (!ReadExact(packageHeadBuffer, 0, 4)) break;
                         int packageLength = URUtil.ArrayToInt32(packageHeadBuffer, 0);
+                        if (packageLength < 4 || packageLength > 2048)
+                            throw new InvalidDataException($"Invalid realtime package length: {packageLength}");
                         byte[] packageBuffer = new byte[packageLength - 4];
-                        stream.Read(packageBuffer, 0, packageBuffer.Length);
+                        if (!ReadExact(packageBuffer, 0, packageBuffer.Length)) break;
                         RealtimePackage = URUtil.ArrayToStruct<RealtimePackage>(packageBuffer, 0);
                     }
                     else
                     {
-                        stream.Read(packageHeadBuffer, 0, 5);
+                        if (!ReadExact(packageHeadBuffer, 0, 5)) break;
                         int packageLength = URUtil.ArrayToInt32(packageHeadBuffer, 0);
                         byte robotMessageType = packageHeadBuffer[4];
+                        if (packageLength < 5 || packageLength > 65536)
+                            throw new InvalidDataException($"Invalid robot-state package length: {packageLength}");
 
                         byte[] packageBuffer = new byte[packageLength - 5];
-                        stream.Read(packageBuffer, 0, packageBuffer.Length);
+                        if (!ReadExact(packageBuffer, 0, packageBuffer.Length)) break;
 
                         int pointer = 0;
                         // MESSAGE_TYPE_ROBOT_STATE
@@ -85,7 +103,12 @@ namespace Assets.Scripts
                         {
                             while (pointer < packageBuffer.Length)
                             {
+                                if (pointer + 5 > packageBuffer.Length)
+                                    break;
                                 int subPackageLength = URUtil.ArrayToInt32(packageBuffer, pointer);
+                                if (subPackageLength < 5 ||
+                                    pointer + subPackageLength > packageBuffer.Length)
+                                    break;
                                 byte subPackageType = packageBuffer[pointer + 4];
                                 switch (subPackageType)
                                 {
@@ -116,6 +139,12 @@ namespace Assets.Scripts
                     }
                 }
                 catch (System.IO.IOException) { }
+                catch (SocketException) { }
+                catch (ObjectDisposedException) { break; }
+                catch (InvalidDataException ex)
+                {
+                    UnityEngine.Debug.LogWarning("[URPackageListener] " + ex.Message);
+                }
             }
         }
 

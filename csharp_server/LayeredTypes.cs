@@ -64,8 +64,17 @@ public class WorkspaceBounds
     // placeholder: CubeEdgeM + MinCellClearanceM.
     public double MinCellSize => CubeEdgeM + MinCellClearanceM;
     public double DefaultBlockZ { get; set; } = 0.025;
-    public int MaxRows { get; set; } = 5;
-    public int MaxCols { get; set; } = 5;
+    // Planar glyphs start at 5x5 and may escalate to 8x8 when the LLM judges
+    // that the smaller canvas cannot represent the requested identity clearly.
+    public int MaxRows { get; set; } = 8;
+    public int MaxCols { get; set; } = 8;
+    public int InitialPatternRows { get; set; } = 5;
+    public int InitialPatternCols { get; set; } = 5;
+    // Expanded grids reuse the 7x7 spacing as the current safe physical minimum.
+    // At 8x8 the footprint grows slightly, so verify it on the real workspace.
+    // blocks must fit this approximately 3.667 cm centre spacing.
+    public double ExpandedTargetOriginX { get; set; } = 0.49;
+    public double ExpandedCellSize { get; set; } = 0.22 / 6.0;
     public int MaxLayers { get; set; } = 3;
     // 3D glyphs use their own fixed voxel volume.  Keep this separate from the
     // 5x5 planar bitmap so changing 3D does not alter existing 2D layouts.
@@ -187,5 +196,69 @@ public class MotionPlan
 
     [JsonPropertyName("reasoning")]
     public string Reasoning { get; set; } = "";
+}
+
+/// <summary>
+/// A complete, immutable plan produced from one scene snapshot. Unity executes
+/// the steps in array order without asking the planner for another decision.
+/// </summary>
+public class BatchPlan
+{
+    [JsonPropertyName("batch_id")]
+    public int BatchId { get; set; }
+
+    [JsonPropertyName("created_at")]
+    public string CreatedAt { get; set; } = "";
+
+    [JsonPropertyName("scene_captured_at")]
+    public string SceneCapturedAt { get; set; } = "";
+
+    [JsonPropertyName("comment")]
+    public string Comment { get; set; } = "";
+
+    [JsonPropertyName("steps")]
+    public List<StepEnvelope> Steps { get; set; } = new();
+}
+
+public class BatchExecutionResult
+{
+    [JsonPropertyName("batch_id")]
+    public int BatchId { get; set; }
+
+    [JsonPropertyName("completed")]
+    public bool Completed { get; set; }
+
+    [JsonPropertyName("completed_steps")]
+    public int CompletedSteps { get; set; }
+
+    [JsonPropertyName("total_steps")]
+    public int TotalSteps { get; set; }
+
+    [JsonPropertyName("failed_step_id")]
+    public int? FailedStepId { get; set; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    [JsonPropertyName("duration_sec")]
+    public double DurationSec { get; set; }
+}
+
+public class BatchMotionPlan
+{
+    [JsonPropertyName("steps")]
+    public List<BatchMotionStep> Steps { get; set; } = new();
+
+    [JsonPropertyName("reasoning")]
+    public string Reasoning { get; set; } = "";
+}
+
+public class BatchMotionStep
+{
+    [JsonPropertyName("step_id")]
+    public int StepId { get; set; }
+
+    [JsonPropertyName("action_sequence")]
+    public List<RobotFunctionCall> ActionSequence { get; set; } = new();
 }
 

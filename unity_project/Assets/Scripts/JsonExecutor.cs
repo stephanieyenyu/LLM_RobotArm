@@ -10,12 +10,8 @@ using Assets.Scripts;
 
 // -----------------------------------------------------------------
 // Layer 4（Executor）：Unity 端
-// 分層架構中的單步執行器：
-//   - 持續 poll current_step.json
-//   - 收到新的 step_id 後，依 action_sequence 執行 URScript
-//   - 執行完寫入 step_done.json 回報結果
-//   - 收到 {"done": true} 後停止該批任務
-// 不再載入整批 batch plan，也不需要按 Space 執行。
+// 完整 Batch Executor：poll batch_plan.json，收到後按陣列順序逐步執行，
+// 任一步失敗即停止整批，最後寫 batch_done.json。
 // -----------------------------------------------------------------
 
 [System.Serializable]
@@ -64,11 +60,35 @@ public class StepDoneReport
     public float duration_sec;
 }
 
+[System.Serializable]
+public class BatchPlanEnvelope
+{
+    public int batch_id;
+    public string created_at;
+    public string scene_captured_at;
+    public string comment;
+    public List<StepEnvelope> steps;
+}
+
+[System.Serializable]
+public class BatchDoneReport
+{
+    public int batch_id;
+    public bool completed;
+    public int completed_steps;
+    public int total_steps;
+    public int failed_step_id;
+    public string error;
+    public float duration_sec;
+}
+
 public class JsonExecutor : MonoBehaviour
 {
     private static JsonExecutor activeInstance;
     [Header("設定")]
-    public string currentStepFile = "current_step.json";
+    public string batchPlanFile = "batch_plan.json";
+    public string batchDoneFile = "batch_done.json";
+    public string currentStepFile = "current_step.json"; // legacy report compatibility
     public string stepDoneFile = "step_done.json";
     public string urIP = "192.168.50.204";
     public float pollIntervalSec = 0.3f;
@@ -86,7 +106,8 @@ public class JsonExecutor : MonoBehaviour
 
     private const float SAFE_Z_OFFSET = 0.08f;
     private const float Z_CORRECTION = 0.02f;
-    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.22f;
+    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.30f;
+    private const float TRAVEL_PLANE_TOLERANCE_M = 0.015f;
     // Fine-angle correction is intentionally disabled. We retain only the two
     // discrete gripper directions: horizontal = 0 degrees, vertical = 90 degrees.
     // private const float SKEW_SIGN = 1f;
@@ -99,6 +120,12 @@ public class JsonExecutor : MonoBehaviour
     private const float MOTION_TIMEOUT_SEC = 180f;
     private const float TCP_POSITION_TOLERANCE_M = 0.012f;
     private const float HOME_JOINT_TOLERANCE_RAD = 0.04f;
+    // Some UR/URSim secondary-interface versions keep isProgramRunning=true
+    // briefly (or indefinitely) after the commanded pose has settled. Accept a
+    // pose that remains inside tolerance for this period instead of deadlocking.
+    private const float TARGET_STABLE_CONFIRM_SEC = 0.30f;
+    private const float COMMAND_SETTLE_SEC = 0.25f;
+    private const float MOTION_PROGRESS_LOG_SEC = 2.0f;
     private const float SAFETY_RECOVERY_TIMEOUT_SEC = 300f;
     private const float SAFETY_STABLE_SEC = 1f;
     // Only the emergency return-to-Home command may be sent again after a
@@ -116,6 +143,13 @@ public class JsonExecutor : MonoBehaviour
     // step_id alone, otherwise a new task reusing Step 1/2/... is silently skipped.
     private string lastProcessedStepJson = "";
     private DateTime lastProcessedStepWriteTimeUtc = DateTime.MinValue;
+    private string lastProcessedBatchJson = "";
+    private DateTime lastProcessedBatchWriteTimeUtc = DateTime.MinValue;
+    private int currentBatchId = -1;
+    private int currentBatchTotalSteps;
+    private int currentBatchCompletedSteps;
+    private bool lastStepCompleted;
+    private string lastStepError;
 
     // 保存目前執行中的 ExecuteStep coroutine 與 step_id，供 Home 按鈕中止。
     private Coroutine currentStepCoroutine;
@@ -158,7 +192,7 @@ public class JsonExecutor : MonoBehaviour
     // UIManager 寫入 plan 後不需要主動觸發，PollLoop 會自動偵測新步驟。
     public void LoadAndExecute()
     {
-        Debug.Log("[Executor] LoadAndExecute() 已停用；分層 executor 會自動 poll current_step.json");
+        Debug.Log("[Executor] Batch executor 會自動 poll batch_plan.json");
     }
 
     // -----------------------------------------------------------
@@ -203,6 +237,9 @@ public class JsonExecutor : MonoBehaviour
             currentStepCoroutine = null;
             currentStepId = -1;
             WriteStepDone(abortedStepId, false, "aborted by user (GoHome)", 0f);
+            if (currentBatchId >= 0)
+                WriteBatchDone(currentBatchId, false, currentBatchCompletedSteps,
+                    currentBatchTotalSteps, abortedStepId, "aborted by user (GoHome)", 0f);
             Debug.LogWarning($"[Executor] 已中止 step {abortedStepId}，改為返回 Home");
 
             // 將 perception 切回 idle，讓 SceneSyncer 恢復更新。
@@ -215,67 +252,120 @@ public class JsonExecutor : MonoBehaviour
         Debug.Log("[Executor] 已送出 home：" + homeCmd);
     }
 
-    // --- 主 poll loop：監看 current_step.json 的新 step_id ---
+    // --- 主 poll loop：監看完整 batch_plan.json ---
     IEnumerator PollLoop()
     {
         while (true)
         {
             yield return new WaitForSeconds(pollIntervalSec);
 
-            string path = Path.Combine(Application.streamingAssetsPath, currentStepFile);
-            if (!File.Exists(path)) continue;
+            string path = Path.Combine(Application.streamingAssetsPath, batchPlanFile);
+            BatchPlanEnvelope batchToExecute = null;
+            if (File.Exists(path))
+            {
+                try
+                {
+                    DateTime writeTime = File.GetLastWriteTimeUtc(path);
+                    string json = File.ReadAllText(path);
+                    if (json != lastProcessedBatchJson || writeTime > lastProcessedBatchWriteTimeUtc)
+                    {
+                        BatchPlanEnvelope batch = JsonUtility.FromJson<BatchPlanEnvelope>(json);
+                        lastProcessedBatchJson = json;
+                        lastProcessedBatchWriteTimeUtc = writeTime;
+                        if (batch != null && batch.steps != null && batch.steps.Count > 0)
+                            batchToExecute = batch;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[Executor] batch json parse failed: {ex.Message}");
+                }
+            }
 
-            StepEnvelope env;
-            string stepJson;
-            DateTime stepWriteTimeUtc;
+            // Iterator methods cannot yield inside a try block that has catch.
+            // Execute only after file I/O and JSON parsing have left try/catch.
+            if (batchToExecute != null)
+            {
+                currentStepCoroutine = StartCoroutine(ExecuteBatch(batchToExecute));
+                yield return currentStepCoroutine;
+                currentStepCoroutine = null;
+                currentStepId = -1;
+                continue;
+            }
+
+            // Compatibility for move_relative/stack/3D commands that still use
+            // the closed-loop single-step channel. arrange_pattern never enters it.
+            string legacyPath = Path.Combine(Application.streamingAssetsPath, currentStepFile);
+            if (!File.Exists(legacyPath)) continue;
+            StepEnvelope legacyStepToExecute = null;
             try
             {
-                stepWriteTimeUtc = File.GetLastWriteTimeUtc(path);
-                stepJson = File.ReadAllText(path);
-                if (stepJson == lastProcessedStepJson &&
-                    stepWriteTimeUtc <= lastProcessedStepWriteTimeUtc) continue;
-                env = JsonUtility.FromJson<StepEnvelope>(stepJson);
+                DateTime writeTime = File.GetLastWriteTimeUtc(legacyPath);
+                string json = File.ReadAllText(legacyPath);
+                if (json == lastProcessedStepJson && writeTime <= lastProcessedStepWriteTimeUtc)
+                    continue;
+                StepEnvelope env = JsonUtility.FromJson<StepEnvelope>(json);
+                lastProcessedStepJson = json;
+                lastProcessedStepWriteTimeUtc = writeTime;
+                if (env == null || env.done) continue;
+                legacyStepToExecute = env;
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[Executor] step json parse failed: {ex.Message}");
-                continue;
+                Debug.LogWarning($"[Executor] legacy step json parse failed: {ex.Message}");
             }
 
-            if (env == null) continue;
-            lastProcessedStepJson = stepJson;
-            lastProcessedStepWriteTimeUtc = stepWriteTimeUtc;
-
-            if (env.done)
+            if (legacyStepToExecute != null)
             {
-                // Invalidate any delayed child coroutine before accepting the end
-                // of a batch. A stale safety-recovery coroutine must never resume.
-                executionEpoch++;
-                if (currentStepCoroutine != null)
-                {
-                    StopCoroutine(currentStepCoroutine);
-                    currentStepCoroutine = null;
-                    currentStepId = -1;
-                }
-                Debug.Log($"[Executor] 收到 done 訊號 (step {env.step_id})，等待下一批任務");
-                lastExecutedStepId = env.step_id;
-                continue;
+                currentStepId = legacyStepToExecute.step_id;
+                long stepEpoch = ++executionEpoch;
+                currentStepCoroutine = StartCoroutine(ExecuteStep(legacyStepToExecute, stepEpoch));
+                yield return currentStepCoroutine;
+                currentStepCoroutine = null;
+                currentStepId = -1;
             }
-
-            if (env.source_position == null || env.target_position == null)
-            {
-                Debug.LogWarning($"[Executor] step {env.step_id} 缺少 source/target");
-                continue;
-            }
-
-            lastExecutedStepId = env.step_id;
-            currentStepId = env.step_id;
-            long stepEpoch = ++executionEpoch;
-            currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch));
-            yield return currentStepCoroutine;
-            currentStepCoroutine = null;
-            currentStepId = -1;
         }
+    }
+
+    IEnumerator ExecuteBatch(BatchPlanEnvelope batch)
+    {
+        currentBatchId = batch.batch_id;
+        currentBatchTotalSteps = batch.steps.Count;
+        currentBatchCompletedSteps = 0;
+        float startedAt = Time.realtimeSinceStartup;
+        Debug.Log($"═══ Batch {batch.batch_id}: {batch.steps.Count} steps ═══ {batch.comment}");
+
+        foreach (StepEnvelope env in batch.steps)
+        {
+            if (env == null || env.source_position == null || env.target_position == null)
+            {
+                string error = $"step {env?.step_id ?? -1} missing source/target";
+                WriteBatchDone(batch.batch_id, false, currentBatchCompletedSteps,
+                    batch.steps.Count, env?.step_id ?? -1, error,
+                    Time.realtimeSinceStartup - startedAt);
+                yield break;
+            }
+            currentStepId = env.step_id;
+            lastExecutedStepId = env.step_id;
+            long stepEpoch = ++executionEpoch;
+            lastStepCompleted = false;
+            lastStepError = "step ended without a completion report";
+            yield return ExecuteStep(env, stepEpoch);
+            if (!lastStepCompleted)
+            {
+                WriteBatchDone(batch.batch_id, false, currentBatchCompletedSteps,
+                    batch.steps.Count, env.step_id, lastStepError,
+                    Time.realtimeSinceStartup - startedAt);
+                currentBatchId = -1;
+                yield break;
+            }
+            currentBatchCompletedSteps++;
+        }
+
+        WriteBatchDone(batch.batch_id, true, currentBatchCompletedSteps,
+            batch.steps.Count, -1, null, Time.realtimeSinceStartup - startedAt);
+        Debug.Log($"═══ Batch {batch.batch_id} 完成：{currentBatchCompletedSteps}/{batch.steps.Count} ═══");
+        currentBatchId = -1;
     }
 
     // --- 執行單一步驟：依序解讀 LLM Motion Planner 的 robot functions ---
@@ -373,8 +463,13 @@ public class JsonExecutor : MonoBehaviour
             switch (action.function)
             {
                 case "move_above":
-                    // Use the configured travel plane for lateral motion, then the LLM-selected
-                    // safe height. This preserves collision clearance while allowing variable plans.
+                    // Match the paper-style plan/verify/refine idea with a
+                    // deterministic transit corridor: retreat vertically first,
+                    // move laterally only on the high travel plane, then descend.
+                    yield return RetreatVerticallyToTravelPlane(
+                        travelZ, orientation, skew, tag + " vertical retreat",
+                        stepEpoch, env.step_id);
+                    if (!lastMotionSucceeded) break;
                     yield return SendMove(x, y, travelZ, orientation, skew,
                         tag + " travel", false, stepEpoch, env.step_id);
                     if (!lastMotionSucceeded) break;
@@ -467,6 +562,8 @@ public class JsonExecutor : MonoBehaviour
         // actual Cartesian feedback to reach the commanded translation.
         yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
         float startedAt = Time.realtimeSinceStartup;
+        float nextProgressLogAt = startedAt + MOTION_PROGRESS_LOG_SEC;
+        float reachedToleranceAt = -1f;
         bool protectiveStopDetected = false;
         while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
         {
@@ -496,12 +593,35 @@ public class JsonExecutor : MonoBehaviour
             float dy = (float)tcp.Y - y;
             float dz = (float)tcp.Z - z;
             float distance = Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
-            if (distance <= TCP_POSITION_TOLERANCE_M &&
-                !urListener.RobotModeData.isProgramRunning)
+            if (distance <= TCP_POSITION_TOLERANCE_M)
             {
-                lastMotionSucceeded = true;
-                Debug.Log($"  [{tag}] REACHED: TCP error {distance * 1000f:F1} mm");
-                yield break;
+                if (reachedToleranceAt < 0f)
+                    reachedToleranceAt = Time.realtimeSinceStartup;
+                bool controllerEnded = !urListener.RobotModeData.isProgramRunning;
+                bool poseStable = Time.realtimeSinceStartup - reachedToleranceAt >=
+                                  TARGET_STABLE_CONFIRM_SEC;
+                if (controllerEnded || poseStable)
+                {
+                    lastMotionSucceeded = true;
+                    string confirmation = controllerEnded ? "program ended" : "pose stable";
+                    Debug.Log($"  [{tag}] REACHED ({confirmation}): TCP error {distance * 1000f:F1} mm");
+                    // Give the secondary interface time to finish the previous
+                    // script before the next standalone program is submitted.
+                    yield return new WaitForSeconds(COMMAND_SETTLE_SEC);
+                    yield break;
+                }
+            }
+            else
+                reachedToleranceAt = -1f;
+
+            if (Time.realtimeSinceStartup >= nextProgressLogAt)
+            {
+                Debug.Log($"  [{tag}] WAITING: actual=({(float)tcp.X:F4}," +
+                          $"{(float)tcp.Y:F4},{(float)tcp.Z:F4}), " +
+                          $"target=({x:F4},{y:F4},{z:F4}), " +
+                          $"error={distance * 1000f:F1} mm, " +
+                          $"programRunning={urListener.RobotModeData.isProgramRunning}");
+                nextProgressLogAt = Time.realtimeSinceStartup + MOTION_PROGRESS_LOG_SEC;
             }
             yield return new WaitForSeconds(0.05f);
         }
@@ -540,6 +660,28 @@ public class JsonExecutor : MonoBehaviour
         lastMotionError = $"UR motion timeout during {tag}: TCP remained {finalDistance * 1000f:F1} mm from target";
     }
 
+    IEnumerator RetreatVerticallyToTravelPlane(
+        float travelZ, string orientation, float skewDeg, string tag,
+        long stepEpoch, int stepId)
+    {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+
+        var tcp = urListener.CartesianInfo;
+        float currentX = (float)tcp.X;
+        float currentY = (float)tcp.Y;
+        float currentZ = (float)tcp.Z;
+        if (currentZ >= travelZ - TRAVEL_PLANE_TOLERANCE_M)
+        {
+            lastMotionSucceeded = true;
+            lastMotionError = null;
+            yield break;
+        }
+
+        yield return SendMove(
+            currentX, currentY, travelZ, orientation, skewDeg,
+            tag, true, stepEpoch, stepId);
+    }
+
     IEnumerator SendHome(string tag, long stepEpoch, int stepId)
     {
         if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
@@ -562,6 +704,8 @@ public class JsonExecutor : MonoBehaviour
             yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
 
             float startedAt = Time.realtimeSinceStartup;
+            float nextProgressLogAt = startedAt + MOTION_PROGRESS_LOG_SEC;
+            float reachedToleranceAt = -1f;
             bool protectiveStopDetected = false;
             while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
             {
@@ -595,12 +739,31 @@ public class JsonExecutor : MonoBehaviour
                         target[i] * Mathf.Rad2Deg)) * Mathf.Deg2Rad;
                     maxError = Mathf.Max(maxError, error);
                 }
-                if (maxError <= HOME_JOINT_TOLERANCE_RAD &&
-                    !urListener.RobotModeData.isProgramRunning)
+                if (maxError <= HOME_JOINT_TOLERANCE_RAD)
                 {
-                    lastMotionSucceeded = true;
-                    Debug.Log($"  [{tag}] REACHED: max joint error {maxError * Mathf.Rad2Deg:F2} deg");
-                    yield break;
+                    if (reachedToleranceAt < 0f)
+                        reachedToleranceAt = Time.realtimeSinceStartup;
+                    bool controllerEnded = !urListener.RobotModeData.isProgramRunning;
+                    bool poseStable = Time.realtimeSinceStartup - reachedToleranceAt >=
+                                      TARGET_STABLE_CONFIRM_SEC;
+                    if (controllerEnded || poseStable)
+                    {
+                        lastMotionSucceeded = true;
+                        string confirmation = controllerEnded ? "program ended" : "pose stable";
+                        Debug.Log($"  [{tag}] REACHED ({confirmation}): max joint error " +
+                                  $"{maxError * Mathf.Rad2Deg:F2} deg");
+                        yield return new WaitForSeconds(COMMAND_SETTLE_SEC);
+                        yield break;
+                    }
+                }
+                else
+                    reachedToleranceAt = -1f;
+                if (Time.realtimeSinceStartup >= nextProgressLogAt)
+                {
+                    Debug.Log($"  [{tag}] WAITING HOME: max joint error " +
+                              $"{maxError * Mathf.Rad2Deg:F2} deg, " +
+                              $"programRunning={urListener.RobotModeData.isProgramRunning}");
+                    nextProgressLogAt = Time.realtimeSinceStartup + MOTION_PROGRESS_LOG_SEC;
                 }
                 yield return new WaitForSeconds(0.05f);
             }
@@ -781,6 +944,8 @@ public class JsonExecutor : MonoBehaviour
 
     void WriteStepDone(int stepId, bool completed, string error, float duration)
     {
+        lastStepCompleted = completed;
+        lastStepError = error ?? "";
         var report = new StepDoneReport
         {
             step_id = stepId,
@@ -790,6 +955,24 @@ public class JsonExecutor : MonoBehaviour
         };
         string json = JsonUtility.ToJson(report, prettyPrint: true);
         string path = Path.Combine(Application.streamingAssetsPath, stepDoneFile);
+        File.WriteAllText(path, json);
+    }
+
+    void WriteBatchDone(int batchId, bool completed, int completedSteps,
+        int totalSteps, int failedStepId, string error, float duration)
+    {
+        var report = new BatchDoneReport
+        {
+            batch_id = batchId,
+            completed = completed,
+            completed_steps = completedSteps,
+            total_steps = totalSteps,
+            failed_step_id = failedStepId,
+            error = error ?? "",
+            duration_sec = duration,
+        };
+        string json = JsonUtility.ToJson(report, prettyPrint: true);
+        string path = Path.Combine(Application.streamingAssetsPath, batchDoneFile);
         File.WriteAllText(path, json);
     }
 }
