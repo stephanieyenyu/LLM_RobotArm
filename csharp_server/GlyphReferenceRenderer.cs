@@ -16,10 +16,18 @@ public static class GlyphReferenceRenderer
     private const int RenderSize = 256;
     // Source Han Sans-derived rounded font (源泉圓體 / GenSenRounded), SIL OFL
     // 1.1 licensed: https://github.com/ButTaiwan/gensen-font
-    // Exact family name taken from the font file's own name table
-    // (`fc-scan --format '%{family}'`), not the marketing/display name:
-    //   GenSenRounded2TW-R.otf -> family = "GenSenRounded2 TW"
-    private const string FontFamilyName = "GenSenRounded2 TW";
+    //
+    // Name is "GenSenRounded2 TW R", WITH the weight suffix — confirmed against
+    // this machine's actual InstalledFontCollection dump, not against
+    // `fc-scan --format '%{family}'` on Linux (which reported "GenSenRounded2 TW",
+    // no suffix, and was wrong for this purpose). This font ships each weight
+    // (EL/L/R/M/B/H) without a shared typographic-family (nameID 16) grouping,
+    // so Windows GDI+ registers each weight as its own standalone family
+    // including the weight letter, rather than as a style variant within one
+    // family. If a different weight is ever installed instead of Regular,
+    // this string needs the matching suffix (e.g. "GenSenRounded2 TW B" for
+    // Bold) — check the real InstalledFontCollection list, don't assume.
+    private const string FontFamilyName = "GenSenRounded2 TW R";
 
     // GDI+ font family resolution does NOT throw when FontFamilyName isn't
     // installed: `new Font(name, ...)` silently substitutes a fallback font
