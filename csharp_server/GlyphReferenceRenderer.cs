@@ -19,10 +19,12 @@ public static class GlyphReferenceRenderer
     //
     // Back to Regular ("GenSenRounded2 TW R", confirmed against this
     // machine's actual InstalledFontCollection). Light ("GenSenRounded2 TW
-    // L") was tried as a way to get thinner strokes from the font itself
-    // instead of an erosion post-process, but Regular + erosion is now the
-    // combination in use (see ErosionRadius below) — Regular is the weight
-    // that's actually confirmed installed under this exact name.
+    // L") was tried as a way to get thinner strokes from the font itself,
+    // and erosion (integer- then fractional-radius) was tried as a
+    // post-process; stroke thickness is now handled by skeletonizing the
+    // rendered glyph down to a 1px-wide centerline (see Skeletonize below)
+    // instead of tuning either of those — Regular is the weight that's
+    // actually confirmed installed under this exact name.
     private const string FontFamilyName = "GenSenRounded2 TW R";
 
     // GDI+ font family resolution does NOT throw when FontFamilyName isn't
@@ -111,7 +113,8 @@ public static class GlyphReferenceRenderer
 
             Rectangle bounds = FindInkBounds(image);
             if (bounds.Width == 0 || bounds.Height == 0) return null;
-            return Downsample(image, bounds, outputRows, outputCols);
+            bool[,] skeleton = Skeletonize(BuildInkMask(image));
+            return Downsample(skeleton, bounds, outputRows, outputCols);
         }
         catch (Exception ex)
         {
@@ -143,76 +146,116 @@ public static class GlyphReferenceRenderer
         return enumerator.MoveNext() ? enumerator.GetTextElement() : null;
     }
 
-    // Fraction of a downsample cell's area that must be (post-erosion) ink
-    // for that cell to be marked occupied.
-    private const double CellInkCoverageThreshold = 0.35;
-
-    // A pixel counts as "ink" if its (possibly eroded) brightness is below
-    // this. Separate from FindInkBounds's own, more permissive 0.92f
-    // threshold, which is deliberately generous so faint anti-aliased edges
-    // still count toward the crop/pad region.
+    // A pixel counts as "ink" if its brightness is below this. Separate from
+    // FindInkBounds's own, more permissive 0.92f threshold, which is
+    // deliberately generous so faint anti-aliased edges still count toward
+    // the crop/pad region.
     private const double InkBrightnessThreshold = 0.80;
 
-    // How far to shrink every stroke inward, in source-image pixels (the
-    // 256x256 render, before downsampling), via grayscale erosion. This is
-    // the actual stroke-thickness control — raising CellInkCoverageThreshold
-    // alone can only trim cells the ink barely grazes at an edge; a cell a
-    // thick stroke fully covers stays occupied no matter how high that
-    // threshold goes (confirmed earlier: 0.55 didn't thin "甲" at 8x8 below
-    // 40/64 occupied cells).
-    //
-    // This supports FRACTIONAL radii (0.5, 1.5, ...) meaningfully, unlike a
-    // plain "erode by whole neighbor pixels" implementation — on an integer
-    // pixel grid the nearest possible neighbor is exactly 1 pixel away, so a
-    // binary-mask erosion literally cannot distinguish radius 0.5 from
-    // radius 0. ErodedBrightness instead bilinearly samples the source's
-    // already-anti-aliased grayscale field at `radius` pixels away in 8
-    // directions, so fractional radii genuinely interpolate between whole
-    // pixels. 0 disables erosion.
-    private const double ErosionRadius = 0.5;
-
-    // Unit vectors (4 axis-aligned + 4 diagonal, diagonals normalized to
-    // unit length) sampled around each pixel for erosion.
-    private static readonly (double Dx, double Dy)[] ErosionDirections =
+    private static bool[,] BuildInkMask(Bitmap image)
     {
-        (1, 0), (-1, 0), (0, 1), (0, -1),
-        (0.70710678, 0.70710678), (-0.70710678, 0.70710678),
-        (0.70710678, -0.70710678), (-0.70710678, -0.70710678),
-    };
-
-    private static float SampleBrightness(Bitmap image, double x, double y)
-    {
-        x = Math.Clamp(x, 0, image.Width - 1.0001);
-        y = Math.Clamp(y, 0, image.Height - 1.0001);
-        int x0 = (int)x, y0 = (int)y;
-        int x1 = x0 + 1, y1 = y0 + 1;
-        double fx = x - x0, fy = y - y0;
-        float b00 = image.GetPixel(x0, y0).GetBrightness();
-        float b10 = image.GetPixel(x1, y0).GetBrightness();
-        float b01 = image.GetPixel(x0, y1).GetBrightness();
-        float b11 = image.GetPixel(x1, y1).GetBrightness();
-        double top = b00 + (b10 - b00) * fx;
-        double bottom = b01 + (b11 - b01) * fx;
-        return (float)(top + (bottom - top) * fy);
+        var mask = new bool[image.Width, image.Height];
+        for (int y = 0; y < image.Height; y++)
+        for (int x = 0; x < image.Width; x++)
+            mask[x, y] = image.GetPixel(x, y).GetBrightness() < InkBrightnessThreshold;
+        return mask;
     }
 
     /// <summary>
-    /// Grayscale erosion of the ink (dark = low-brightness) region: returns
-    /// the MAXIMUM brightness (whitest, i.e. least ink) found among the
-    /// pixel itself and 8 directional samples `radius` pixels away. Taking
-    /// the max — not the min — is what shrinks dark strokes inward; min
-    /// would grow them instead (dilation).
+    /// Zhang-Suen thinning: iteratively removes boundary ink pixels that can
+    /// be deleted without breaking connectivity or erasing a line entirely,
+    /// alternating two sub-iterations until nothing changes. Unlike a
+    /// fixed-radius erosion, there is no thickness parameter to tune —
+    /// thick and thin source strokes both converge to a skeleton that's
+    /// (with rare, unavoidable exceptions at junctions) exactly 1 pixel
+    /// wide, so downstream cell-occupancy just needs "does the skeleton
+    /// pass through this cell at all", not a coverage fraction.
     /// </summary>
-    private static float ErodedBrightness(Bitmap image, int x, int y, double radius)
+    private static bool[,] Skeletonize(bool[,] mask)
     {
-        float maxBrightness = image.GetPixel(x, y).GetBrightness();
-        if (radius <= 0) return maxBrightness;
-        foreach (var (dx, dy) in ErosionDirections)
+        int width = mask.GetLength(0), height = mask.GetLength(1);
+        var img = new int[width, height];
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+            img[x, y] = mask[x, y] ? 1 : 0;
+
+        // Real convergence is normally well under this; it's only a safety
+        // net against an unexpected non-terminating edge case.
+        const int maxIterations = 200;
+        bool changed;
+        int guard = 0;
+        do
         {
-            float b = SampleBrightness(image, x + dx * radius, y + dy * radius);
-            if (b > maxBrightness) maxBrightness = b;
+            changed = ThinPass(img, width, height, subIteration: 1);
+            changed |= ThinPass(img, width, height, subIteration: 2);
+            guard++;
+        } while (changed && guard < maxIterations);
+
+        var result = new bool[width, height];
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+            result[x, y] = img[x, y] == 1;
+        return result;
+    }
+
+    /// <summary>
+    /// One Zhang-Suen sub-iteration. Marks then deletes (after a full scan,
+    /// not in place — deleting during the scan would let a pixel's own
+    /// deletion affect the neighbor count of pixels visited later in the
+    /// same pass) every ink pixel P1 whose 8-neighborhood (P2 at 12 o'clock,
+    /// continuing clockwise to P9) satisfies all four Zhang-Suen conditions
+    /// for the given sub-iteration.
+    /// </summary>
+    private static bool ThinPass(int[,] img, int width, int height, int subIteration)
+    {
+        var toDelete = new List<(int X, int Y)>();
+        for (int y = 1; y < height - 1; y++)
+        for (int x = 1; x < width - 1; x++)
+        {
+            if (img[x, y] != 1) continue;
+
+            int p2 = img[x, y - 1];
+            int p3 = img[x + 1, y - 1];
+            int p4 = img[x + 1, y];
+            int p5 = img[x + 1, y + 1];
+            int p6 = img[x, y + 1];
+            int p7 = img[x - 1, y + 1];
+            int p8 = img[x - 1, y];
+            int p9 = img[x - 1, y - 1];
+
+            // Condition 1: 2 <= B(P1) <= 6 — not an isolated point or the
+            // interior of a >=2px-thick fill.
+            int b = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+            if (b < 2 || b > 6) continue;
+
+            // Condition 2: A(P1) == 1 — exactly one 0->1 transition walking
+            // the ring P2..P9..P2, i.e. P1 sits on a single simple boundary,
+            // not a junction that would disconnect the skeleton if removed.
+            Span<int> ring = stackalloc int[] { p2, p3, p4, p5, p6, p7, p8, p9, p2 };
+            int a = 0;
+            for (int i = 0; i < 8; i++)
+                if (ring[i] == 0 && ring[i + 1] == 1) a++;
+            if (a != 1) continue;
+
+            // Conditions 3 & 4 differ between the two sub-iterations so that
+            // alternating passes peel from all four sides evenly instead of
+            // eating strokes asymmetrically from just north/west.
+            if (subIteration == 1)
+            {
+                if (p2 * p4 * p6 != 0) continue;
+                if (p4 * p6 * p8 != 0) continue;
+            }
+            else
+            {
+                if (p2 * p4 * p8 != 0) continue;
+                if (p2 * p6 * p8 != 0) continue;
+            }
+
+            toDelete.Add((x, y));
         }
-        return maxBrightness;
+
+        foreach (var (x, y) in toDelete) img[x, y] = 0;
+        return toDelete.Count > 0;
     }
 
     private static Rectangle FindInkBounds(Bitmap image)
@@ -230,18 +273,25 @@ public static class GlyphReferenceRenderer
     }
 
     private static List<string> Downsample(
-        Bitmap image, Rectangle bounds, int rows, int cols)
+        bool[,] skeleton, Rectangle bounds, int rows, int cols)
     {
+        int width = skeleton.GetLength(0), height = skeleton.GetLength(1);
+
         // Add proportional whitespace so endpoints and relative stroke lengths
         // remain visible to the judges instead of being cropped edge-to-edge.
         int padX = Math.Max(2, bounds.Width / 10);
         int padY = Math.Max(2, bounds.Height / 10);
         int left = Math.Max(0, bounds.Left - padX);
         int top = Math.Max(0, bounds.Top - padY);
-        int right = Math.Min(image.Width, bounds.Right + padX);
-        int bottom = Math.Min(image.Height, bounds.Bottom + padY);
+        int right = Math.Min(width, bounds.Right + padX);
+        int bottom = Math.Min(height, bounds.Bottom + padY);
         var area = Rectangle.FromLTRB(left, top, right, bottom);
 
+        // The skeleton is (barring rare junction pixels) exactly 1px wide, so
+        // a coverage-fraction threshold like the old CellInkCoverageThreshold
+        // would almost always read near-zero and mark every cell empty. The
+        // occupancy rule is simply "does the skeleton pass through this cell
+        // at all".
         var result = new List<string>(rows);
         for (int r = 0; r < rows; r++)
         {
@@ -252,14 +302,11 @@ public static class GlyphReferenceRenderer
             {
                 int x0 = area.Left + c * area.Width / cols;
                 int x1 = area.Left + (c + 1) * area.Width / cols;
-                int ink = 0, total = 0;
-                for (int y = y0; y < Math.Max(y0 + 1, y1); y++)
-                for (int x = x0; x < Math.Max(x0 + 1, x1); x++)
-                {
-                    total++;
-                    if (ErodedBrightness(image, x, y, ErosionRadius) < InkBrightnessThreshold) ink++;
-                }
-                line.Append(total > 0 && (double)ink / total >= 0.10 ? '1' : '0');
+                bool ink = false;
+                for (int y = y0; y < Math.Max(y0 + 1, y1) && !ink; y++)
+                for (int x = x0; x < Math.Max(x0 + 1, x1) && !ink; x++)
+                    if (skeleton[x, y]) ink = true;
+                line.Append(ink ? '1' : '0');
             }
             result.Add(line.ToString());
         }
