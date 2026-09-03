@@ -14,13 +14,49 @@ using System.Text;
 public static class GlyphReferenceRenderer
 {
     private const int RenderSize = 256;
-    private const string FontFamilyName = "Microsoft JhengHei";
+    // Source Han Sans-derived rounded font (源泉圓體 / GenSenRounded), SIL OFL
+    // 1.1 licensed: https://github.com/ButTaiwan/gensen-font
+    // Exact family name taken from the font file's own name table
+    // (`fc-scan --format '%{family}'`), not the marketing/display name:
+    //   GenSenRounded2TW-R.otf -> family = "GenSenRounded2 TW"
+    private const string FontFamilyName = "GenSenRounded2 TW";
+
+    // GDI+ font family resolution does NOT throw when FontFamilyName isn't
+    // installed: `new Font(name, ...)` silently substitutes a fallback font
+    // (Microsoft's own documented behavior) and returns successfully as if
+    // nothing were wrong. A previous version of this file assumed a missing
+    // font would throw and be caught below — it does not. Left unguarded,
+    // that means a wrong/serif fallback font gets rendered, downsampled, and
+    // handed to the ballot judges as if it were the real reference glyph,
+    // with no error anywhere in the log. So the family is checked against
+    // System.Drawing.Text.InstalledFontCollection BEFORE constructing the
+    // Font, and the constructed Font's resolved Name is checked AFTER, as a
+    // second line of defense — either mismatch is treated as "unavailable"
+    // (return null), never as "close enough, render with substitute font".
+    private static bool IsFamilyInstalled(string familyName)
+    {
+        using var installed = new InstalledFontCollection();
+        foreach (var family in installed.Families)
+            if (string.Equals(family.Name, familyName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
 
     public static List<string>? TryRenderFromCommand(
         string command, int outputRows = 15, int outputCols = 15)
     {
         string? target = ExtractTarget(command);
         if (string.IsNullOrWhiteSpace(target)) return null;
+
+        if (!IsFamilyInstalled(FontFamilyName))
+        {
+            Console.WriteLine(
+                $"[Glyph reference] unavailable: font family \"{FontFamilyName}\" is not " +
+                "installed on this machine (checked InstalledFontCollection). Install " +
+                "GenSenRounded2TW-R.otf and restart the process — do not proceed, GDI+ " +
+                "would otherwise silently substitute a different font.");
+            return null;
+        }
 
         try
         {
@@ -31,6 +67,18 @@ public static class GlyphReferenceRenderer
             graphics.SmoothingMode = SmoothingMode.HighQuality;
             using var font = new Font(
                 FontFamilyName, 190f, FontStyle.Regular, GraphicsUnit.Pixel);
+            // Second line of defense: even with the family confirmed
+            // installed, confirm GDI+ actually resolved to it (not a
+            // near-match or locale-specific substitution) before trusting
+            // the render.
+            if (!string.Equals(font.Name, FontFamilyName, StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine(
+                    $"[Glyph reference] unavailable: requested \"{FontFamilyName}\" but GDI+ " +
+                    $"resolved to \"{font.Name}\" instead — treating as a silent substitution, " +
+                    "not rendering with the wrong font.");
+                return null;
+            }
             using var format = new StringFormat
             {
                 Alignment = StringAlignment.Center,

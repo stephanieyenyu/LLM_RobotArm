@@ -20,20 +20,23 @@ public static class LayoutRealizer
 
     /// <summary>
     /// Builds a ladder of candidate (rows, cols, cellSize) resolutions that all
-    /// share the SAME physical footprint as the base workspace (rows*CellSize,
-    /// cols*CellSize stay constant), by shrinking CellSize as rows/cols grow.
-    /// Stops before CellSize would drop below MinCellSize, i.e. before adjacent
-    /// cubes would physically collide. Caller tries each entry in order and
-    /// stops at the first one PatternDesigner accepts as feasible.
+    /// share the SAME physical footprint as the base workspace's starting size
+    /// (InitialPatternRows/Cols * CellSize stays constant), by shrinking
+    /// CellSize as rows/cols grow from there. Stops at whichever comes first:
+    /// MaxRows/MaxCols (the workspace's own ceiling — e.g. where an expanded
+    /// layout like ExpandedCellSize takes over instead of linear shrinking),
+    /// CellSize dropping below MinCellSize (adjacent cubes would physically
+    /// collide), or maxSteps (safety net). Caller tries each entry in order
+    /// and stops at the first one PatternDesigner accepts as feasible.
     /// </summary>
     public static List<(int Rows, int Cols, double CellSize)> BuildResolutionLadder(
         WorkspaceBounds baseWs, int step = 2, int maxSteps = 6)
     {
-        double footprintW = baseWs.MaxCols * baseWs.CellSize;
-        double footprintH = baseWs.MaxRows * baseWs.CellSize;
+        double footprintW = baseWs.InitialPatternCols * baseWs.CellSize;
+        double footprintH = baseWs.InitialPatternRows * baseWs.CellSize;
         var ladder = new List<(int, int, double)>();
-        int rows = baseWs.MaxRows, cols = baseWs.MaxCols;
-        for (int i = 0; i < maxSteps; i++)
+        int rows = baseWs.InitialPatternRows, cols = baseWs.InitialPatternCols;
+        for (int i = 0; i < maxSteps && rows <= baseWs.MaxRows && cols <= baseWs.MaxCols; i++)
         {
             double cellSize = System.Math.Min(footprintW / cols, footprintH / rows);
             if (cellSize < baseWs.MinCellSize) break;
@@ -57,7 +60,7 @@ public static class LayoutRealizer
             TargetOriginX = baseWs.TargetOriginX,
             TargetOriginY = baseWs.TargetOriginY,
             CellSize = cellSize,
-            MinCellSize = baseWs.MinCellSize,
+            MinCellClearanceM = baseWs.MinCellClearanceM,
             DefaultBlockZ = baseWs.DefaultBlockZ,
             MaxRows = rows,
             MaxCols = cols,

@@ -46,14 +46,23 @@ public class WorkspaceBounds
     public double TargetOriginX { get; set; } = 0.49;
     public double TargetOriginY { get; set; } = 0.00;
     public double CellSize { get; set; } = 0.055;
+    // Physical cube edge length, matching cubeSizeM in
+    // unity_project/Assets/Scenes/MainScene.unity (2.5cm). This is the actual
+    // model dimension, not an estimate — resolution-ladder math below should
+    // derive from this rather than guessing.
+    public const double CubeEdgeM = 0.025;
+    // Extra center-to-center clearance the ladder keeps on top of CubeEdgeM
+    // at its smallest (highest-resolution) step, so two adjacent cubes never
+    // touch even with placement/gripper tolerance. The comment above (5.5cm
+    // spacing = 3cm clear gap) shows the DEFAULT 5x5 resolution is generous;
+    // this is the tighter floor used only once escalation is actually
+    // needed. Tune this if real placement error turns out larger/smaller.
+    public double MinCellClearanceM { get; set; } = 0.010;
     // Hard physical floor for CellSize when the resolution ladder (see
     // LayoutRealizer.BuildResolutionLadder) shrinks cells to fit a higher
-    // row/col count into the same target footprint. Must stay >= physical
-    // cube size + a safe clearance so adjacent cubes never collide.
-    // PLACEHOLDER: current cubes are documented elsewhere as ~2.5cm; this
-    // assumes ~1cm clearance. VERIFY against the real cube model before
-    // relying on the ladder to pick a resolution automatically.
-    public double MinCellSize { get; set; } = 0.035;
+    // row/col count into the same target footprint. Derived, not a bare
+    // placeholder: CubeEdgeM + MinCellClearanceM.
+    public double MinCellSize => CubeEdgeM + MinCellClearanceM;
     public double DefaultBlockZ { get; set; } = 0.025;
     // Planar glyphs start at 5x5 and may escalate to 8x8 when the LLM judges
     // that the smaller canvas cannot represent the requested identity clearly.
