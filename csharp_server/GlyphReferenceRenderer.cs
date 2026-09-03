@@ -259,7 +259,7 @@ public static class GlyphReferenceRenderer
                     total++;
                     if (ErodedBrightness(image, x, y, ErosionRadius) < InkBrightnessThreshold) ink++;
                 }
-                line.Append(total > 0 && (double)ink / total >= CellInkCoverageThreshold ? '1' : '0');
+                line.Append(total > 0 && (double)ink / total >= 0.10 ? '1' : '0');
             }
             result.Add(line.ToString());
         }
