@@ -106,7 +106,8 @@ public class JsonExecutor : MonoBehaviour
 
     private const float SAFE_Z_OFFSET = 0.08f;
     private const float Z_CORRECTION = 0.02f;
-    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.22f;
+    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.30f;
+    private const float TRAVEL_PLANE_TOLERANCE_M = 0.015f;
     // Fine-angle correction is intentionally disabled. We retain only the two
     // discrete gripper directions: horizontal = 0 degrees, vertical = 90 degrees.
     // private const float SKEW_SIGN = 1f;
@@ -462,8 +463,13 @@ public class JsonExecutor : MonoBehaviour
             switch (action.function)
             {
                 case "move_above":
-                    // Use the configured travel plane for lateral motion, then the LLM-selected
-                    // safe height. This preserves collision clearance while allowing variable plans.
+                    // Match the paper-style plan/verify/refine idea with a
+                    // deterministic transit corridor: retreat vertically first,
+                    // move laterally only on the high travel plane, then descend.
+                    yield return RetreatVerticallyToTravelPlane(
+                        travelZ, orientation, skew, tag + " vertical retreat",
+                        stepEpoch, env.step_id);
+                    if (!lastMotionSucceeded) break;
                     yield return SendMove(x, y, travelZ, orientation, skew,
                         tag + " travel", false, stepEpoch, env.step_id);
                     if (!lastMotionSucceeded) break;
@@ -652,6 +658,28 @@ public class JsonExecutor : MonoBehaviour
         float finalDz = (float)finalTcp.Z - z;
         float finalDistance = Mathf.Sqrt(finalDx * finalDx + finalDy * finalDy + finalDz * finalDz);
         lastMotionError = $"UR motion timeout during {tag}: TCP remained {finalDistance * 1000f:F1} mm from target";
+    }
+
+    IEnumerator RetreatVerticallyToTravelPlane(
+        float travelZ, string orientation, float skewDeg, string tag,
+        long stepEpoch, int stepId)
+    {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+
+        var tcp = urListener.CartesianInfo;
+        float currentX = (float)tcp.X;
+        float currentY = (float)tcp.Y;
+        float currentZ = (float)tcp.Z;
+        if (currentZ >= travelZ - TRAVEL_PLANE_TOLERANCE_M)
+        {
+            lastMotionSucceeded = true;
+            lastMotionError = null;
+            yield break;
+        }
+
+        yield return SendMove(
+            currentX, currentY, travelZ, orientation, skewDeg,
+            tag, true, stepEpoch, stepId);
     }
 
     IEnumerator SendHome(string tag, long stepEpoch, int stepId)

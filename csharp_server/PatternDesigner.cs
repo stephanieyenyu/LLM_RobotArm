@@ -4,13 +4,12 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using OpenAI.Chat;
 
-// OpenAI 與 Gemini 各自生成，再各自審查對方的候選圖。
+// 高解析度字形渲染後逐步降採樣；OpenAI 與 Gemini 只負責判斷
+// 低解析度 bitmap 是否仍能被辨識成目標字。
 public sealed class PatternDesigner
 {
-    const int MaxRounds = 2;
-    const double MinimumWinningScore = 0.80;
-    const double OpenAiVoteWeight = 0.40;
-    const double GeminiVoteWeight = 0.60;
+    const double MinimumAverageScore = 0.70;
+    const double MinimumIndividualScore = 0.45;
     readonly ChatClient openAi;
     readonly HttpClient gemini;
     readonly string geminiModel;
@@ -42,6 +41,9 @@ public sealed class PatternDesigner
         int? rows = null, int? cols = null)
     {
         if (string.IsNullOrWhiteSpace(command)) throw new ArgumentException("User command is empty.");
+        if (!OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException(
+                "Adaptive glyph rendering currently requires Windows fonts.");
         // Per-call resolution override, used by the resolution ladder in
         // Program.cs to retry at a larger grid after an infeasible attempt.
         if (rows.HasValue) maxRows = rows.Value;
@@ -49,79 +51,66 @@ public sealed class PatternDesigner
         int capacity = cubes + dominoes * 2;
         foreach (var canvas in CanvasSizes())
         {
-          string openFeedback = "", geminiFeedback = "";
-          for (int round = 1; round <= MaxRounds; round++)
-          {
-            Console.WriteLine($"[Layer 1 adaptive] canvas {canvas.Rows}x{canvas.Cols}, round {round}/{MaxRounds}...");
-            var openTask = GenerateOpenAi(command, color, cubes, dominoes, openFeedback, canvas.Rows, canvas.Cols);
-            var gemTask = GenerateGemini(command, color, cubes, dominoes, geminiFeedback, canvas.Rows, canvas.Cols);
-            await Task.WhenAll(openTask, gemTask);
-            var open = await openTask;
-            var gem = await gemTask;
-            PrintCandidate("OpenAI", open);
-            PrintCandidate("Gemini", gem);
-
-            var openLocal = Validate(open, capacity, canvas.Rows, canvas.Cols);
-            var gemLocal = Validate(gem, capacity, canvas.Rows, canvas.Cols);
-            // Each model sees only the other model's candidate.
-            var openReviewsGem = ReviewOpenAi(command, gem, gemLocal.Error);
-            var gemReviewsOpen = ReviewGemini(command, open, openLocal.Error);
-            await Task.WhenAll(openReviewsGem, gemReviewsOpen);
-            var gemReview = await openReviewsGem;
-            var openReview = await gemReviewsOpen;
-            PrintReview("OpenAI reviews Gemini", gemReview);
-            PrintReview("Gemini reviews OpenAI", openReview);
-
-            var finalists = new List<Candidate>();
-            open.DisplayNumber = 1;
-            gem.DisplayNumber = 2;
-            open.Author = "Candidate 1: OpenAI original";
-            gem.Author = "Candidate 2: Gemini original";
-            // 1/2: both independently generated originals enter the anonymous
-            // ballot as long as deterministic format/inventory checks pass.
-            if (openLocal.Valid)
-                finalists.Add(open);
-            else
-                Console.WriteLine($"[Layer 1 candidate 1] OpenAI original rejected: {openLocal.Error}");
-            if (gemLocal.Valid)
-                finalists.Add(gem);
-            else
-                Console.WriteLine($"[Layer 1 candidate 2] Gemini original rejected: {gemLocal.Error}");
-
-            // 3: Gemini's revision of OpenAI. 4: OpenAI's revision of Gemini.
-            AddRevisionIfValid(finalists, openReview,
-                3, "Candidate 3: OpenAI revised by Gemini", command, capacity,
-                canvas.Rows, canvas.Cols);
-            AddRevisionIfValid(finalists, gemReview,
-                4, "Candidate 4: Gemini revised by OpenAI", command, capacity,
-                canvas.Rows, canvas.Cols);
-            Candidate? selected = null;
-            if (finalists.Count > 0)
+            Console.WriteLine();
+            Console.WriteLine($"[Layer 1 renderer] 嘗試 {canvas.Rows}x{canvas.Cols}: high-res glyph -> downsample");
+            List<string>? rendered = GlyphReferenceRenderer.TryRenderFromCommand(
+                command, canvas.Rows, canvas.Cols);
+            if (rendered == null)
             {
-                Console.WriteLine($"[Layer 1 vote] anonymously scoring {finalists.Count} finalists...");
-                List<string>? glyphReference = GlyphReferenceRenderer.TryRenderFromCommand(command);
-                if (glyphReference != null)
-                {
-                    Console.WriteLine("[Layer 1 reference] system-font glyph supplied to both judges:");
-                    foreach (string row in glyphReference)
-                        Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
-                }
-                var openBallotTask = BallotOpenAi(command, finalists, glyphReference);
-                var gemBallotTask = BallotGemini(command, finalists, glyphReference);
-                await Task.WhenAll(openBallotTask, gemBallotTask);
-                selected = SelectByWeightedScore(
-                    finalists, await openBallotTask, await gemBallotTask,
-                    out double winningScore);
-                if (winningScore < MinimumWinningScore)
-                {
-                    Console.WriteLine($"[Layer 1 vote] best weighted score {winningScore:F2} " +
-                                      $"is below {MinimumWinningScore:F2}; redraw/escalate canvas");
-                    selected = null;
-                }
+                Console.WriteLine($"[Layer 1 renderer] {canvas.Rows}x{canvas.Cols} rejected: unable to render requested glyph.");
+                continue;
             }
+
+            var candidate = new Candidate
+            {
+                PatternId = command,
+                Feasible = true,
+                FailureReason = "",
+                SuggestedRows = canvas.Rows,
+                SuggestedCols = canvas.Cols,
+                SuggestedOccupiedCells = rendered.Sum(row => row.Count(ch => ch == '1')),
+                Bitmap = rendered,
+                Author = "Candidate 1: deterministic font render",
+                DisplayNumber = 1,
+            };
+            PrintRenderedCandidate(candidate);
+
+            var local = Validate(candidate, capacity, canvas.Rows, canvas.Cols);
+            if (!local.Valid)
+            {
+                Console.WriteLine($"[Layer 1 renderer] {canvas.Rows}x{canvas.Cols} rejected: {local.Error}");
+                continue;
+            }
+
+            var finalists = new List<Candidate> { candidate };
+            List<string>? glyphReference = GlyphReferenceRenderer.TryRenderFromCommand(command);
+            if (glyphReference != null)
+            {
+                Console.WriteLine("[Layer 1 reference] higher-resolution glyph supplied to both judges:");
+                foreach (string row in glyphReference)
+                    Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
+            }
+
+            Console.WriteLine($"[Layer 1 vote] {canvas.Rows}x{canvas.Cols}: OpenAI and Gemini independently score recognizability...");
+            var openBallotTask = BallotOpenAi(command, finalists, glyphReference);
+            var gemBallotTask = BallotGemini(command, finalists, glyphReference);
+            await Task.WhenAll(openBallotTask, gemBallotTask);
+            Candidate selected = SelectByAverageScore(
+                finalists, await openBallotTask, await gemBallotTask,
+                out double averageScore, out double lowestScore);
+            if (averageScore <= MinimumAverageScore ||
+                lowestScore < MinimumIndividualScore)
+            {
+                Console.WriteLine(
+                    $"[Layer 1 vote] {canvas.Rows}x{canvas.Cols} rejected: " +
+                    $"average={averageScore:F2} must be > {MinimumAverageScore:F2}, " +
+                    $"lowest={lowestScore:F2} must be >= {MinimumIndividualScore:F2}.");
+                continue;
+            }
+
             if (selected != null)
             {
-                Console.WriteLine($"[Layer 1 dual] selected={selected.Author} by anonymous weighted dual-model vote");
+                Console.WriteLine($"[Layer 1 adaptive] selected minimum accepted canvas={canvas.Rows}x{canvas.Cols}");
                 Console.WriteLine("[Layer 1 FINAL] 最終採用 Bitmap：");
                 foreach (string row in selected.Bitmap!)
                     Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
@@ -132,19 +121,21 @@ public sealed class PatternDesigner
                     BlockColor = color,
                 };
             }
-            openFeedback = Feedback(openLocal.Error, openReview, open);
-            geminiFeedback = Feedback(gemLocal.Error, gemReview, gem);
-          }
-          if (canvas.Rows < maxRows || canvas.Cols < maxCols)
-              Console.WriteLine($"[Layer 1 adaptive] {canvas.Rows}x{canvas.Cols} was not accepted; escalating canvas.");
         }
-        throw new InvalidOperationException($"雙模型在 5x5 到 {maxRows}x{maxCols} 的自評與交叉評審後仍無可接受 bitmap。");
+        throw new InvalidOperationException($"雙模型在 5x5 到 {maxRows}x{maxCols} 的渲染降採樣評估後仍無可接受 bitmap。");
     }
 
     IEnumerable<(int Rows, int Cols)> CanvasSizes()
     {
-        yield return (Math.Min(5, maxRows), Math.Min(5, maxCols));
-        if (maxRows > 5 || maxCols > 5) yield return (maxRows, maxCols);
+        int startRows = Math.Min(5, maxRows);
+        int startCols = Math.Min(5, maxCols);
+        int steps = Math.Max(maxRows - startRows, maxCols - startCols);
+        for (int step = 0; step <= steps; step++)
+        {
+            int rows = Math.Min(maxRows, startRows + step);
+            int cols = Math.Min(maxCols, startCols + step);
+            yield return (rows, cols);
+        }
     }
 
     async Task<Candidate> GenerateOpenAi(string command, string color, int cubes, int dominoes, string feedback, int rows, int cols)
@@ -288,7 +279,8 @@ public sealed class PatternDesigner
         """;
 
     static string BallotPrompt() => """
-        請根據原始要求，為匿名的二進位矩陣評分。
+        請根據原始要求，為由高解析度系統字型降採樣得到的低解析度二進位矩陣評分。
+        你的角色是辨識度評估器，不是 bitmap 產生器；不要修改矩陣，也不要自行補畫。
         依照人類視覺可辨識度及對指定目標的忠實程度，獨立判斷每一個實際矩陣。
         候選順序與身分沒有任何意義，不可推測作者。
         除了本次輸入明確附上的「系統字型參考字形」外，不可假設或使用其他模板、
@@ -297,7 +289,10 @@ public sealed class PatternDesigner
         但不要求候選逐像素相同。候選可以因低解析度調整粗細與比例，但不可增加、刪除或移動
         會改變字元身分的主要筆畫、交叉點或分支。
         如果矩陣不是原始要求的精確目標、存在身分歧義、方向錯誤、關鍵結構問題，
-        或需要更大畫布才能清楚表達，分數必須低於 0.80。
+        或需要更大畫布才能清楚表達，請給低分。
+        若低解析度矩陣已經保留人眼辨識該字所需的主要結構，請給予 0.70 以上；
+        若只是因為知道原始要求才勉強猜得出，請給予 0.70 以下。
+        系統通過條件是 OpenAI/Gemini 平均分數必須大於 0.70，且任一模型分數不可低於 0.45。
         每個候選索引必須剛好回傳一筆評分，分數範圍為 0 到 1。
         僅回傳符合指定 Schema 的 JSON。
         """;
@@ -315,6 +310,9 @@ public sealed class PatternDesigner
         {
             text.AppendLine($"candidate_index={i}（Candidate {candidates[i].DisplayNumber}）：");
             foreach (string row in candidates[i].Bitmap ?? new()) text.AppendLine(row);
+            text.AppendLine("視覺化（■=放積木，□=空白）：");
+            foreach (string row in candidates[i].Bitmap ?? new())
+                text.AppendLine(row.Replace('0', '□').Replace('1', '■'));
         }
         return text.ToString();
     }
@@ -372,32 +370,35 @@ public sealed class PatternDesigner
             Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
     }
 
-    Candidate SelectByWeightedScore(
+    Candidate SelectByAverageScore(
         List<Candidate> candidates,
         Ballot openBallot,
         Ballot gemBallot,
-        out double winningScore)
+        out double winningAverageScore,
+        out double winningLowestScore)
     {
         var openScores = NormalizeScores(openBallot, candidates.Count);
         var gemScores = NormalizeScores(gemBallot, candidates.Count);
         int bestIndex = 0;
         double bestScore = double.NegativeInfinity;
+        double bestLowest = 0.0;
         for (int i = 0; i < candidates.Count; i++)
         {
-            double weightedScore = openScores[i] * OpenAiVoteWeight +
-                                   gemScores[i] * GeminiVoteWeight;
+            double averageScore = (openScores[i] + gemScores[i]) / 2.0;
+            double lowestScore = Math.Min(openScores[i], gemScores[i]);
             Console.WriteLine(
                 $"[Layer 1 vote] Candidate {candidates[i].DisplayNumber}: " +
                 $"OpenAI={openScores[i]:F2}, " +
-                $"Gemini={gemScores[i]:F2}, weighted={weightedScore:F2} " +
-                $"(OpenAI {OpenAiVoteWeight:P0} / Gemini {GeminiVoteWeight:P0})");
-            if (weightedScore > bestScore)
+                $"Gemini={gemScores[i]:F2}, average={averageScore:F2}, lowest={lowestScore:F2}");
+            if (averageScore > bestScore)
             {
-                bestScore = weightedScore;
+                bestScore = averageScore;
+                bestLowest = lowestScore;
                 bestIndex = i;
             }
         }
-        winningScore = bestScore;
+        winningAverageScore = bestScore;
+        winningLowestScore = bestLowest;
         return candidates[bestIndex];
     }
 
@@ -448,6 +449,15 @@ public sealed class PatternDesigner
         }
     }
 
+    static void PrintRenderedCandidate(Candidate c)
+    {
+        Console.WriteLine(
+            $"[Layer 1 renderer] candidate={c.PatternId}, " +
+            $"canvas={c.SuggestedRows}x{c.SuggestedCols}, occupied={c.SuggestedOccupiedCells}");
+        foreach (var row in c.Bitmap ?? new())
+            Console.WriteLine("                  " + row.Replace('0', '□').Replace('1', '■'));
+    }
+
     static string CandidateSchema() => JsonSerializer.Serialize(new
     {
         type = "object", additionalProperties = false,
@@ -481,7 +491,7 @@ public sealed class PatternDesigner
             ["has_revision"] = new { type = "boolean" },
             ["revised_bitmap"] = new { type = "array", items = new { type = "string" } },
             ["needs_larger_canvas"] = new { type = "boolean" },
-            ["recommended_canvas_size"] = new { type = "integer", minimum = 5, maximum = 7 },
+            ["recommended_canvas_size"] = new { type = "integer", minimum = 5, maximum = 8 },
         },
         required = new[] { "accept", "recognizable", "exact_target_match", "confidence", "observed_as", "structural_problems", "suggested_changes", "has_revision", "revised_bitmap",
             "needs_larger_canvas", "recommended_canvas_size" },

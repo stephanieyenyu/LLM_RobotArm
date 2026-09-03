@@ -45,7 +45,8 @@ public sealed class BatchMotionPlanner
                 Each pick must approach from
                 above, descend, grasp, lift, travel while lifted, descend at target,
                 release, and finish by lifting safely above the target. Do not call
-                go_home between steps; the next step starts from this safe lifted pose.
+                go_home between steps; the executor will route every lateral transfer
+                through a high travel plane before descending to the next source.
                 Clearance must be 0.08-0.15 m.
                 Never output coordinates, URScript, joints, velocity, or extra steps.
                 """),

@@ -55,14 +55,14 @@ public class WorkspaceBounds
     // relying on the ladder to pick a resolution automatically.
     public double MinCellSize { get; set; } = 0.035;
     public double DefaultBlockZ { get; set; } = 0.025;
-    // Planar glyphs start at 5x5 and may escalate to 7x7 when the LLM judges
+    // Planar glyphs start at 5x5 and may escalate to 8x8 when the LLM judges
     // that the smaller canvas cannot represent the requested identity clearly.
-    public int MaxRows { get; set; } = 7;
-    public int MaxCols { get; set; } = 7;
+    public int MaxRows { get; set; } = 8;
+    public int MaxCols { get; set; } = 8;
     public int InitialPatternRows { get; set; } = 5;
     public int InitialPatternCols { get; set; } = 5;
-    // 7x7 uses the exact same physical footprint as 5x5. The 5x5 centre span is
-    // 4 * 0.055 = 0.22 m, so six 7x7 intervals are 0.22 / 6 m each. The smaller
+    // Expanded grids reuse the 7x7 spacing as the current safe physical minimum.
+    // At 8x8 the footprint grows slightly, so verify it on the real workspace.
     // blocks must fit this approximately 3.667 cm centre spacing.
     public double ExpandedTargetOriginX { get; set; } = 0.49;
     public double ExpandedCellSize { get; set; } = 0.22 / 6.0;

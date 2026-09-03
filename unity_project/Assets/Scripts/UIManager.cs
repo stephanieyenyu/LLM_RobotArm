@@ -42,6 +42,14 @@ public class UIManager : MonoBehaviour
         inputField.style.marginRight = 5;
         inputField.style.height = 40;
         inputField.focusable = true;
+        inputField.RegisterCallback<KeyDownEvent>(evt =>
+        {
+            if (evt.keyCode != KeyCode.Return && evt.keyCode != KeyCode.KeypadEnter)
+                return;
+
+            OnSendCommand();
+            evt.StopPropagation();
+        });
 
         sendButton = new Button(() => OnSendCommand());
         sendButton.text = "執行";
@@ -51,6 +59,7 @@ public class UIManager : MonoBehaviour
         container.Add(inputField);
         container.Add(sendButton);
         root.Add(container);
+        container.RegisterCallback<MouseDownEvent>(_ => FocusInputField());
 
         statusLabel = new Label("");
         statusLabel.style.position = UnityEngine.UIElements.Position.Absolute;
@@ -71,6 +80,7 @@ public class UIManager : MonoBehaviour
             Directory.CreateDirectory(SHARED_DIR);
             Debug.Log("已建立共享資料夾：" + SHARED_DIR);
         }
+        inputField.schedule.Execute(FocusInputField).ExecuteLater(100);
 
         // ---------------------------------------------------------
         // 右上角三個手動控制按鈕：鬆開 / 夾緊 / 回 Home
@@ -129,6 +139,7 @@ public class UIManager : MonoBehaviour
         if (string.IsNullOrWhiteSpace(command))
         {
             Debug.LogWarning("輸入是空的，所以沒有寫入");
+            FocusInputField();
             return;
         }
 
@@ -144,13 +155,23 @@ public class UIManager : MonoBehaviour
             File.WriteAllText(inputPath, command);
 
             Debug.Log("寫入後讀回：" + File.ReadAllText(inputPath));
+            inputField.value = "";
+            FocusInputField();
 
             StartCoroutine(WaitAndExecute());
         }
         catch (System.Exception ex)
         {
             Debug.LogError("寫入 user_input.txt 失敗：" + ex);
+            FocusInputField();
         }
+    }
+
+    void FocusInputField()
+    {
+        if (inputField == null) return;
+        inputField.Focus();
+        inputField.SelectAll();
     }
 
     IEnumerator WaitAndExecute()
