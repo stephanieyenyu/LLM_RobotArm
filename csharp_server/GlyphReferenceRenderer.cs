@@ -17,21 +17,13 @@ public static class GlyphReferenceRenderer
     // Source Han Sans-derived rounded font (源泉圓體 / GenSenRounded), SIL OFL
     // 1.1 licensed: https://github.com/ButTaiwan/gensen-font
     //
-    // Switched from Regular ("GenSenRounded2 TW R") to Light, to get thinner
-    // strokes from the font itself instead of an erosion post-process (see
-    // git history: erosion worked but was removed in favor of just using a
-    // lighter weight, now that it's installed).
-    //
-    // "GenSenRounded2 TW L" is inferred from the Regular weight's confirmed
-    // name, NOT yet verified against this machine's actual
-    // InstalledFontCollection — Regular came back as "GenSenRounded2 TW R"
-    // (name INCLUDES the weight letter; this font ships each weight without a
-    // shared typographic-family grouping, so GDI+ registers each as its own
-    // standalone family). If "L" isn't exactly right, IsFamilyInstalled's
-    // diagnostic logging below will show the real name from the near-matches
-    // list — check that output before assuming this string is wrong for some
-    // other reason.
-    private const string FontFamilyName = "GenSenRounded2 TW L";
+    // Back to Regular ("GenSenRounded2 TW R", confirmed against this
+    // machine's actual InstalledFontCollection). Light ("GenSenRounded2 TW
+    // L") was tried as a way to get thinner strokes from the font itself
+    // instead of an erosion post-process, but Regular + erosion is now the
+    // combination in use (see ErosionRadius below) — Regular is the weight
+    // that's actually confirmed installed under this exact name.
+    private const string FontFamilyName = "GenSenRounded2 TW R";
 
     // GDI+ font family resolution does NOT throw when FontFamilyName isn't
     // installed: `new Font(name, ...)` silently substitutes a fallback font
@@ -151,12 +143,77 @@ public static class GlyphReferenceRenderer
         return enumerator.MoveNext() ? enumerator.GetTextElement() : null;
     }
 
-    // Fraction of a downsample cell's area that must be ink for that cell to
-    // be marked occupied. Erosion (tried, then removed — see git history) is
-    // no longer in the picture; this is the only stroke-thickness lever now,
-    // and the Light weight font this switched to should need less help from
-    // it than Regular did.
+    // Fraction of a downsample cell's area that must be (post-erosion) ink
+    // for that cell to be marked occupied.
     private const double CellInkCoverageThreshold = 0.35;
+
+    // A pixel counts as "ink" if its (possibly eroded) brightness is below
+    // this. Separate from FindInkBounds's own, more permissive 0.92f
+    // threshold, which is deliberately generous so faint anti-aliased edges
+    // still count toward the crop/pad region.
+    private const double InkBrightnessThreshold = 0.80;
+
+    // How far to shrink every stroke inward, in source-image pixels (the
+    // 256x256 render, before downsampling), via grayscale erosion. This is
+    // the actual stroke-thickness control — raising CellInkCoverageThreshold
+    // alone can only trim cells the ink barely grazes at an edge; a cell a
+    // thick stroke fully covers stays occupied no matter how high that
+    // threshold goes (confirmed earlier: 0.55 didn't thin "甲" at 8x8 below
+    // 40/64 occupied cells).
+    //
+    // This supports FRACTIONAL radii (0.5, 1.5, ...) meaningfully, unlike a
+    // plain "erode by whole neighbor pixels" implementation — on an integer
+    // pixel grid the nearest possible neighbor is exactly 1 pixel away, so a
+    // binary-mask erosion literally cannot distinguish radius 0.5 from
+    // radius 0. ErodedBrightness instead bilinearly samples the source's
+    // already-anti-aliased grayscale field at `radius` pixels away in 8
+    // directions, so fractional radii genuinely interpolate between whole
+    // pixels. 0 disables erosion.
+    private const double ErosionRadius = 0.5;
+
+    // Unit vectors (4 axis-aligned + 4 diagonal, diagonals normalized to
+    // unit length) sampled around each pixel for erosion.
+    private static readonly (double Dx, double Dy)[] ErosionDirections =
+    {
+        (1, 0), (-1, 0), (0, 1), (0, -1),
+        (0.70710678, 0.70710678), (-0.70710678, 0.70710678),
+        (0.70710678, -0.70710678), (-0.70710678, -0.70710678),
+    };
+
+    private static float SampleBrightness(Bitmap image, double x, double y)
+    {
+        x = Math.Clamp(x, 0, image.Width - 1.0001);
+        y = Math.Clamp(y, 0, image.Height - 1.0001);
+        int x0 = (int)x, y0 = (int)y;
+        int x1 = x0 + 1, y1 = y0 + 1;
+        double fx = x - x0, fy = y - y0;
+        float b00 = image.GetPixel(x0, y0).GetBrightness();
+        float b10 = image.GetPixel(x1, y0).GetBrightness();
+        float b01 = image.GetPixel(x0, y1).GetBrightness();
+        float b11 = image.GetPixel(x1, y1).GetBrightness();
+        double top = b00 + (b10 - b00) * fx;
+        double bottom = b01 + (b11 - b01) * fx;
+        return (float)(top + (bottom - top) * fy);
+    }
+
+    /// <summary>
+    /// Grayscale erosion of the ink (dark = low-brightness) region: returns
+    /// the MAXIMUM brightness (whitest, i.e. least ink) found among the
+    /// pixel itself and 8 directional samples `radius` pixels away. Taking
+    /// the max — not the min — is what shrinks dark strokes inward; min
+    /// would grow them instead (dilation).
+    /// </summary>
+    private static float ErodedBrightness(Bitmap image, int x, int y, double radius)
+    {
+        float maxBrightness = image.GetPixel(x, y).GetBrightness();
+        if (radius <= 0) return maxBrightness;
+        foreach (var (dx, dy) in ErosionDirections)
+        {
+            float b = SampleBrightness(image, x + dx * radius, y + dy * radius);
+            if (b > maxBrightness) maxBrightness = b;
+        }
+        return maxBrightness;
+    }
 
     private static Rectangle FindInkBounds(Bitmap image)
     {
@@ -200,9 +257,9 @@ public static class GlyphReferenceRenderer
                 for (int x = x0; x < Math.Max(x0 + 1, x1); x++)
                 {
                     total++;
-                    if (image.GetPixel(x, y).GetBrightness() < 0.80f) ink++;
+                    if (ErodedBrightness(image, x, y, ErosionRadius) < InkBrightnessThreshold) ink++;
                 }
-                line.Append(total > 0 && (double)ink / total >= 0.10 ? '1' : '0');
+                line.Append(total > 0 && (double)ink / total >= CellInkCoverageThreshold ? '1' : '0');
             }
             result.Add(line.ToString());
         }
