@@ -17,17 +17,21 @@ public static class GlyphReferenceRenderer
     // Source Han Sans-derived rounded font (源泉圓體 / GenSenRounded), SIL OFL
     // 1.1 licensed: https://github.com/ButTaiwan/gensen-font
     //
-    // Name is "GenSenRounded2 TW R", WITH the weight suffix — confirmed against
-    // this machine's actual InstalledFontCollection dump, not against
-    // `fc-scan --format '%{family}'` on Linux (which reported "GenSenRounded2 TW",
-    // no suffix, and was wrong for this purpose). This font ships each weight
-    // (EL/L/R/M/B/H) without a shared typographic-family (nameID 16) grouping,
-    // so Windows GDI+ registers each weight as its own standalone family
-    // including the weight letter, rather than as a style variant within one
-    // family. If a different weight is ever installed instead of Regular,
-    // this string needs the matching suffix (e.g. "GenSenRounded2 TW B" for
-    // Bold) — check the real InstalledFontCollection list, don't assume.
-    private const string FontFamilyName = "GenSenRounded2 TW R";
+    // Switched from Regular ("GenSenRounded2 TW R") to Light, to get thinner
+    // strokes from the font itself instead of an erosion post-process (see
+    // git history: erosion worked but was removed in favor of just using a
+    // lighter weight, now that it's installed).
+    //
+    // "GenSenRounded2 TW L" is inferred from the Regular weight's confirmed
+    // name, NOT yet verified against this machine's actual
+    // InstalledFontCollection — Regular came back as "GenSenRounded2 TW R"
+    // (name INCLUDES the weight letter; this font ships each weight without a
+    // shared typographic-family grouping, so GDI+ registers each as its own
+    // standalone family). If "L" isn't exactly right, IsFamilyInstalled's
+    // diagnostic logging below will show the real name from the near-matches
+    // list — check that output before assuming this string is wrong for some
+    // other reason.
+    private const string FontFamilyName = "GenSenRounded2 TW L";
 
     // GDI+ font family resolution does NOT throw when FontFamilyName isn't
     // installed: `new Font(name, ...)` silently substitutes a fallback font
@@ -115,8 +119,7 @@ public static class GlyphReferenceRenderer
 
             Rectangle bounds = FindInkBounds(image);
             if (bounds.Width == 0 || bounds.Height == 0) return null;
-            bool[,] inkMask = Erode(BuildInkMask(image), ErosionRadius);
-            return Downsample(inkMask, bounds, outputRows, outputCols);
+            return Downsample(image, bounds, outputRows, outputCols);
         }
         catch (Exception ex)
         {
@@ -148,31 +151,11 @@ public static class GlyphReferenceRenderer
         return enumerator.MoveNext() ? enumerator.GetTextElement() : null;
     }
 
-    // A pixel counts as "ink" (part of a stroke) if its brightness is below
-    // this. Used to build the binary mask that Erode and Downsample both
-    // work from — separate from FindInkBounds's own, more permissive 0.92f
-    // threshold, which is deliberately generous so faint anti-aliased edges
-    // still count toward the crop/pad region.
-    private const double InkBrightnessThreshold = 0.80;
-
-    // How many pixels to shrink every stroke inward by (in the 256x256
-    // render, before downsampling) via morphological erosion. This is what
-    // actually controls stroke thickness in the final low-res bitmap —
-    // raising CellInkCoverageThreshold alone could only trim cells the ink
-    // barely grazed; a cell a thick stroke fully covers stays "1" no matter
-    // how high that threshold goes (confirmed: raising it to 0.55 did not
-    // thin "甲" at 8x8 below 40/64 occupied cells). Erosion shrinks the
-    // stroke itself first, independent of how thick the installed font's
-    // weight happens to be. 0 disables erosion (behaves as before). Increase
-    // if strokes are still thicker than one cell after this; each +1 removes
-    // roughly one more pixel of stroke width per edge.
-    private const int ErosionRadius = 1;
-
-    // Fraction of a downsample cell's area that must be (post-erosion) ink
-    // for that cell to be marked occupied. With erosion now doing the actual
-    // thinning, this can stay lower than the 0.55 that was tried as a
-    // stroke-thinning substitute — it only needs to reject cells the eroded
-    // stroke merely grazes at an edge.
+    // Fraction of a downsample cell's area that must be ink for that cell to
+    // be marked occupied. Erosion (tried, then removed — see git history) is
+    // no longer in the picture; this is the only stroke-thickness lever now,
+    // and the Light weight font this switched to should need less help from
+    // it than Regular did.
     private const double CellInkCoverageThreshold = 0.35;
 
     private static Rectangle FindInkBounds(Bitmap image)
@@ -189,55 +172,17 @@ public static class GlyphReferenceRenderer
             : Rectangle.FromLTRB(minX, minY, maxX + 1, maxY + 1);
     }
 
-    private static bool[,] BuildInkMask(Bitmap image)
-    {
-        var mask = new bool[image.Width, image.Height];
-        for (int y = 0; y < image.Height; y++)
-        for (int x = 0; x < image.Width; x++)
-            mask[x, y] = image.GetPixel(x, y).GetBrightness() < InkBrightnessThreshold;
-        return mask;
-    }
-
-    /// <summary>
-    /// Morphological erosion: a pixel stays "ink" only if every pixel in its
-    /// (2*radius+1)-square neighborhood is also ink. Shrinks every stroke
-    /// edge inward by ~radius pixels, thinning strokes independent of the
-    /// source font's actual weight.
-    /// </summary>
-    private static bool[,] Erode(bool[,] mask, int radius)
-    {
-        if (radius <= 0) return mask;
-        int width = mask.GetLength(0), height = mask.GetLength(1);
-        var result = new bool[width, height];
-        for (int y = 0; y < height; y++)
-        for (int x = 0; x < width; x++)
-        {
-            if (!mask[x, y]) continue;
-            bool allInk = true;
-            for (int dy = -radius; dy <= radius && allInk; dy++)
-            for (int dx = -radius; dx <= radius && allInk; dx++)
-            {
-                int nx = x + dx, ny = y + dy;
-                if (nx < 0 || nx >= width || ny < 0 || ny >= height || !mask[nx, ny])
-                    allInk = false;
-            }
-            result[x, y] = allInk;
-        }
-        return result;
-    }
-
     private static List<string> Downsample(
-        bool[,] inkMask, Rectangle bounds, int rows, int cols)
+        Bitmap image, Rectangle bounds, int rows, int cols)
     {
-        int width = inkMask.GetLength(0), height = inkMask.GetLength(1);
         // Add proportional whitespace so endpoints and relative stroke lengths
         // remain visible to the judges instead of being cropped edge-to-edge.
         int padX = Math.Max(2, bounds.Width / 10);
         int padY = Math.Max(2, bounds.Height / 10);
         int left = Math.Max(0, bounds.Left - padX);
         int top = Math.Max(0, bounds.Top - padY);
-        int right = Math.Min(width, bounds.Right + padX);
-        int bottom = Math.Min(height, bounds.Bottom + padY);
+        int right = Math.Min(image.Width, bounds.Right + padX);
+        int bottom = Math.Min(image.Height, bounds.Bottom + padY);
         var area = Rectangle.FromLTRB(left, top, right, bottom);
 
         var result = new List<string>(rows);
@@ -255,7 +200,7 @@ public static class GlyphReferenceRenderer
                 for (int x = x0; x < Math.Max(x0 + 1, x1); x++)
                 {
                     total++;
-                    if (inkMask[x, y]) ink++;
+                    if (image.GetPixel(x, y).GetBrightness() < 0.80f) ink++;
                 }
                 line.Append(total > 0 && (double)ink / total >= CellInkCoverageThreshold ? '1' : '0');
             }
