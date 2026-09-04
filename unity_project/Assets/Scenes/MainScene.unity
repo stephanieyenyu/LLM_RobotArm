@@ -191,8 +191,8 @@ MonoBehaviour:
   targetZoneOriginX: 0.35
   targetZoneOriginY: 0.02
   cellSize: 0.035
-  gridRows: 5
-  gridCols: 5
+  gridRows: 6
+  gridCols: 6
   cubeSizeM: 0.025
   autoCreateWorkspace: 1
 --- !u!4 &447807164
