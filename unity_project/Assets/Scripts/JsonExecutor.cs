@@ -111,7 +111,7 @@ public class JsonExecutor : MonoBehaviour
 
     private const float SAFE_Z_OFFSET = 0.08f;
     private const float Z_CORRECTION = 0.02f;
-    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.30f;
+    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.24f;
     // Fine-angle correction is intentionally disabled. We retain only the two
     // discrete gripper directions: horizontal = 0 degrees, vertical = 90 degrees.
     // private const float SKEW_SIGN = 1f;
@@ -926,22 +926,9 @@ public class JsonExecutor : MonoBehaviour
                 yield break;
 
             Debug.LogWarning(
-                $"[Executor] Protective Stop recovery at {tag}: interrupted motion will NOT be retried; returning Home.");
-            yield return SendHome(tag + " safety return_home", stepEpoch, stepId);
-            bool homeSucceeded = lastMotionSucceeded;
-            string homeFailure = lastMotionError;
-            if (homeSucceeded)
-            {
-                // The stop may have happened after grasping. Reset the gripper at
-                // Home so the server can safely assign a different source cube.
-                Debug.LogWarning(
-                    "[Executor] Safety Home reached; releasing the gripper before selecting another cube.");
-                yield return SendRelease(stepEpoch, stepId);
-            }
-            lastMotionSucceeded = false; // The pick/place step itself still failed.
-            lastMotionError = homeSucceeded
-                ? $"UR protective stop during {tag}; returned Home without retrying the interrupted motion"
-                : $"UR protective stop during {tag}; Home recovery failed: {homeFailure}";
+                $"[Executor] Protective Stop recovery at {tag}: interrupted motion will NOT be retried; batch is stopped in place.");
+            lastMotionSucceeded = false;
+            lastMotionError = $"UR protective stop during {tag}; stopped in place without retrying the interrupted motion";
             yield break;
         }
 
