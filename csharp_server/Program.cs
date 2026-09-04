@@ -228,7 +228,15 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
         if (assignment == null)
         {
             Console.WriteLine("[Batch Layer 3] 沒有可執行的 assignment（supply 用完或不足）");
-            break;
+            Console.WriteLine("[Batch] 未排完全部 target，取消送出，避免只執行半成品。");
+            foreach (var t in remainingTargets)
+            {
+                Console.WriteLine(
+                    $"        missing r{t.Row}c{t.Col} {t.ExpectedColor}_{t.ExpectedShape} " +
+                    $"at ({t.WorldX:F3},{t.WorldY:F3})");
+            }
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
         }
 
         Console.WriteLine($"[Batch Layer 3] {assignment.Reasoning}");

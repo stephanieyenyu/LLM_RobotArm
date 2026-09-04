@@ -185,17 +185,17 @@ MonoBehaviour:
   sceneUrl: http://localhost:5000/scene
   sceneModeUrl: http://localhost:5000/scene/mode
   pollIntervalSec: 0.3
-  workspaceWidthM: 0.622
-  workspaceDepthM: 0.281
-  supplyZoneXMax: 0.3
-  targetZoneOriginX: 0.35
-  targetZoneOriginY: 0.02
-  cellSize: 0.035
-  gridRows: 6
-  gridCols: 6
+  workspaceWidthM: 0.85
+  workspaceDepthM: 0.375
+  supplyZoneXMax: 0.35
+  targetZoneOriginX: 0.49
+  targetZoneOriginY: 0.04
+  cellSize: 0.04
+  gridRows: 5
+  gridCols: 5
   cubeSizeM: 0.025
   autoCreateWorkspace: 1
-  visualScale: 1
+  visualScale: 0.8
 --- !u!4 &447807164
 Transform:
   m_ObjectHideFlags: 0

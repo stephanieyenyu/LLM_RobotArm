@@ -64,6 +64,7 @@ public class SyncGripper : MonoBehaviour
     void Update()
     {
         if (!initialized || leftFinger == null || rightFinger == null) return;
+        if (RobotArm.FreezeVisualFeedback) return;
 
         // 目標開合狀態：讀 RobotArm 的 Outputs（True = 夾住；False = 張開）
         bool targetClosed = robotArm != null

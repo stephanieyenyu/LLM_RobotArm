@@ -34,22 +34,22 @@ public class WorkspaceBounds
 {
     // Shared 2D/3D zoning in the QR frame. Objects are picked only from the
     // supply side; completed pattern blocks in the target side are never reused.
-    public double SupplyZoneXMax { get; set; } = 0.30;
+    public double SupplyZoneXMax { get; set; } = 0.35;
     public double TargetZoneXMin { get; set; } = 0.35;
     // 目標區左下角在 QR frame 的座標（bitmap 最後一列、第 0 欄的中心）。
     // 2D bitmap placement origin and cell spacing.
     // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
-    // Keep the complete 6x6 placement area away from the UR base while using
+    // Keep the complete 5x5 placement area away from the UR base while using
     // 5 cm center spacing (about 2.5 cm clear gap for a 2.5 cm cube).
     public double TargetOriginX { get; set; } = 0.49;
-    public double TargetOriginY { get; set; } = 0.00;
+    public double TargetOriginY { get; set; } = 0.04;
     public double CellSize { get; set; } = 0.05;
     public double DefaultBlockZ { get; set; } = 0.025;
-    public int MaxRows { get; set; } = 6;
-    public int MaxCols { get; set; } = 6;
+    public int MaxRows { get; set; } = 5;
+    public int MaxCols { get; set; } = 5;
     public int MaxLayers { get; set; } = 3;
     // 3D glyphs use their own fixed voxel volume.  Keep this separate from the
-    // 6x6 planar bitmap so changing 3D does not alter existing 2D layouts.
+    // 5x5 planar bitmap so changing 3D does not alter existing 2D layouts.
     // Y/depth is fixed to one row: the upright glyph is built on a single
     // front-view plane. X remains 3 cells wide and Z remains 3 cubes high.
     public int SpatialRows { get; set; } = 1;

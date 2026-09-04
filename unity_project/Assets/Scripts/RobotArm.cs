@@ -8,6 +8,8 @@ using UnityEngine;
 
 public class RobotArm : MonoBehaviour
 {
+    public static bool FreezeVisualFeedback { get; set; } = false;
+
     public Transform TCP;
     public Transform[] Transforms;
     public Axis[] RotationAxis;
@@ -24,6 +26,9 @@ public class RobotArm : MonoBehaviour
     // 留空的話就等使用者在 OnGUI 面板手動輸入 IP + 按 Connect
     [Header("Auto-connect")]
     public string autoConnectIP = "";
+
+    [Header("Visual feedback")]
+    public bool followRealRobotFeedback = true;
 
     public Vector3 TCPPosition;
     public Quaternion TCPRotation;
@@ -61,6 +66,9 @@ public class RobotArm : MonoBehaviour
 
     void Update()
     {
+        if (FreezeVisualFeedback || !followRealRobotFeedback)
+            return;
+
         // Alle Gelenkwinkel auf die Gelenkobjekte übertragen
         for(int i = 0; i < Transforms.Length; i++)
         {

@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using UnityEngine;
 
 #nullable enable
 
@@ -64,28 +65,39 @@ namespace Assets.Scripts
                 {
                     if (IsRealtime)
                     {
-                        stream.Read(packageHeadBuffer, 0, 4);
+                        if (!ReadExact(stream, packageHeadBuffer, 0, 4)) break;
                         int packageLength = URUtil.ArrayToInt32(packageHeadBuffer, 0);
+                        if (packageLength < 4) continue;
                         byte[] packageBuffer = new byte[packageLength - 4];
-                        stream.Read(packageBuffer, 0, packageBuffer.Length);
+                        if (!ReadExact(stream, packageBuffer, 0, packageBuffer.Length)) break;
                         RealtimePackage = URUtil.ArrayToStruct<RealtimePackage>(packageBuffer, 0);
                     }
                     else
                     {
-                        stream.Read(packageHeadBuffer, 0, 5);
+                        if (!ReadExact(stream, packageHeadBuffer, 0, 5)) break;
                         int packageLength = URUtil.ArrayToInt32(packageHeadBuffer, 0);
+                        if (packageLength < 5) continue;
                         byte robotMessageType = packageHeadBuffer[4];
 
                         byte[] packageBuffer = new byte[packageLength - 5];
-                        stream.Read(packageBuffer, 0, packageBuffer.Length);
+                        if (!ReadExact(stream, packageBuffer, 0, packageBuffer.Length)) break;
 
                         int pointer = 0;
                         // MESSAGE_TYPE_ROBOT_STATE
                         if (robotMessageType == 16)
                         {
-                            while (pointer < packageBuffer.Length)
+                            while (pointer + 5 <= packageBuffer.Length)
                             {
                                 int subPackageLength = URUtil.ArrayToInt32(packageBuffer, pointer);
+                                if (subPackageLength < 5 ||
+                                    pointer + subPackageLength > packageBuffer.Length)
+                                {
+                                    Debug.LogWarning(
+                                        $"[URPackageListener] Ignored malformed UR sub-package " +
+                                        $"length={subPackageLength}, pointer={pointer}, " +
+                                        $"buffer={packageBuffer.Length}");
+                                    break;
+                                }
                                 byte subPackageType = packageBuffer[pointer + 4];
                                 switch (subPackageType)
                                 {
@@ -116,7 +128,25 @@ namespace Assets.Scripts
                     }
                 }
                 catch (System.IO.IOException) { }
+                catch (SocketException) { }
+                catch (ObjectDisposedException) { break; }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[URPackageListener] Ignored malformed UR packet: {ex.Message}");
+                }
             }
+        }
+
+        static bool ReadExact(NetworkStream stream, byte[] buffer, int offset, int count)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int read = stream.Read(buffer, offset + total, count - total);
+                if (read <= 0) return false;
+                total += read;
+            }
+            return true;
         }
 
         public void SendCommand(string command)

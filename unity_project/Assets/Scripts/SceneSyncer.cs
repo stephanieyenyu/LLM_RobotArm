@@ -32,12 +32,12 @@ public class SceneSyncer : MonoBehaviour
     public float workspaceDepthM = 0.281f;       // QR1 → QR3 距離
 
     [Header("補貨區 / 擺放區邊界（跟 PlacementPlanner 常數對齊）")]
-    public float supplyZoneXMax = 0.30f;
-    public float targetZoneOriginX = 0.35f;
-    public float targetZoneOriginY = 0.02f;       // 往 QR1-QR2／畫面下方移 3 cm
-    public float cellSize = 0.035f;              // 2.5cm 立方體 + 1cm 間隙
-    public int gridRows = 6;
-    public int gridCols = 6;
+    public float supplyZoneXMax = 0.35f;
+    public float targetZoneOriginX = 0.49f;
+    public float targetZoneOriginY = 0.04f;
+    public float cellSize = 0.04f;               // 2.5cm 立方體 + 1.5cm 間隙
+    public int gridRows = 5;
+    public int gridCols = 5;
 
     [Header("積木顯示")]
     public float cubeSizeM = 0.025f;             // 2.5 cm 立方體
@@ -104,9 +104,9 @@ public class SceneSyncer : MonoBehaviour
         target.name = "TargetZone";
         target.transform.SetParent(workspaceRoot, false);
         target.transform.localPosition = new Vector3(
-            targetZoneOriginX + targetW / 2f,
+            targetZoneOriginX + (gridCols - 1) * cellSize / 2f,
             0.002f,
-            targetZoneOriginY + targetD / 2f
+            targetZoneOriginY + (gridRows - 1) * cellSize / 2f
         );
         target.transform.localScale = new Vector3(targetW, 0.001f, targetD);
         SetColor(target, new Color(1f, 0.85f, 0.4f, 0.5f));

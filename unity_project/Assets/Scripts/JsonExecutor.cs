@@ -92,6 +92,17 @@ public class JsonExecutor : MonoBehaviour
     public bool simulationOnly = true;
     public SceneSyncer sceneSyncer;         // 拖 PerceptionSync GameObject 進來
     public float simMoveSecPerStep = 1.2f;  // 每步動畫秒數（source→up→over→down）
+    public bool previewBatchInUnityBeforeRobot = true;
+    public bool freezeUnityRobotDuringRealBatch = true;
+    public float placeDescendExtraZ = 0f;
+
+    [Header("實機夾取校正（只影響 source，不影響放置矩陣）")]
+    public float pickOffsetX = -0.002f;
+    public float pickOffsetY = 0.002f;
+
+    [Header("安全預備姿勢（Teach Pendant 校正後再啟用）")]
+    public bool useReadyPose = false;
+    public float[] readyJointsRad = new float[6] { -1.5708f, -1.5708f, 1.5708f, -1.5708f, 0f, 0f };
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     private const float QR1_X = -0.38824f;
@@ -100,13 +111,16 @@ public class JsonExecutor : MonoBehaviour
 
     private const float SAFE_Z_OFFSET = 0.08f;
     private const float Z_CORRECTION = 0.02f;
-    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.22f;
+    private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.30f;
     // Fine-angle correction is intentionally disabled. We retain only the two
     // discrete gripper directions: horizontal = 0 degrees, vertical = 90 degrees.
     // private const float SKEW_SIGN = 1f;
     // Reject TCP targets too close to the base axis. Reaching into this cylinder
     // requires a tightly folded arm and can make adjacent UR3e links collide.
     private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
+    // Avoid poses that make the UR3e almost fully extend. Those IK solutions are
+    // fragile and can trigger a protective stop before the TCP reaches the block.
+    private const float MAX_REACH_RADIUS_M = 0.42f;
     // Do not advance merely because a fixed delay elapsed.  Every motion is
     // confirmed against the UR secondary-interface feedback first.
     private const float MOTION_START_GRACE_SEC = 0.35f;
@@ -159,6 +173,7 @@ public class JsonExecutor : MonoBehaviour
 
         if (simulationOnly)
         {
+            RobotArm.FreezeVisualFeedback = false;
             Debug.Log("[Executor] 模擬模式啟用：不連線實機、Unity 內部動畫演示");
             // 自動找 SceneSyncer（如果 Inspector 沒拖）
             if (sceneSyncer == null)
@@ -166,9 +181,7 @@ public class JsonExecutor : MonoBehaviour
         }
         else
         {
-            urListener = new URPackageListener();
-            urListener.Connect(urIP);
-            Debug.Log("嘗試連線至 UR：" + urIP);
+            EnsureUrConnectionStarted();
         }
 
         StartCoroutine(PollLoop());
@@ -193,6 +206,7 @@ public class JsonExecutor : MonoBehaviour
     public void ReleaseGripper()
     {
         if (simulationOnly) { Debug.Log("[Executor-sim] release (無實機)"); return; }
+        EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
             Debug.LogWarning("[Executor] UR 未連線，release 失敗");
@@ -205,6 +219,7 @@ public class JsonExecutor : MonoBehaviour
     public void GripGripper()
     {
         if (simulationOnly) { Debug.Log("[Executor-sim] grip (無實機)"); return; }
+        EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
             Debug.LogWarning("[Executor] UR 未連線，grip 失敗");
@@ -230,6 +245,7 @@ public class JsonExecutor : MonoBehaviour
             }
             return;
         }
+        EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
             Debug.LogWarning("[Executor] UR 未連線，home 失敗");
@@ -350,6 +366,7 @@ public class JsonExecutor : MonoBehaviour
             lastExecutedStepId = env.step_id;
             currentStepId = env.step_id;
             long stepEpoch = ++executionEpoch;
+            RobotArm.FreezeVisualFeedback = false;
             currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch));
             yield return currentStepCoroutine;
             currentStepCoroutine = null;
@@ -361,6 +378,65 @@ public class JsonExecutor : MonoBehaviour
     {
         Debug.Log($"[Executor] 收到 batch {batch.batch_id}: {batch.steps.Count} steps — {batch.comment}");
 
+        if (!simulationOnly)
+        {
+            EnsureUrConnectionStarted();
+            yield return StartCoroutine(SetPerceptionMode("executing"));
+            if (sceneSyncer == null)
+                sceneSyncer = FindObjectOfType<SceneSyncer>();
+            if (previewBatchInUnityBeforeRobot)
+                PreviewBatchFinalLayout(batch);
+            RobotArm.FreezeVisualFeedback = freezeUnityRobotDuringRealBatch;
+
+            float waited = 0f;
+            while (!urListener.Connected && waited < 3f)
+            {
+                yield return new WaitForSeconds(0.1f);
+                waited += 0.1f;
+            }
+            if (!urListener.Connected)
+            {
+                Debug.LogError("無法連線到 UR");
+                WriteStepDone(batch.batch_id, false, "UR 未連線", 0f);
+                RobotArm.FreezeVisualFeedback = false;
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                yield break;
+            }
+
+            if (IsRecoverableSafetyStop())
+            {
+                currentStepId = batch.batch_id;
+                long recoveryEpoch = ++executionEpoch;
+                yield return WaitForManualSafetyRecovery(
+                    "before executing the batch", recoveryEpoch, batch.batch_id);
+                currentStepId = -1;
+                if (!safetyRecoverySucceeded)
+                {
+                    string error = lastMotionError ?? "UR safety recovery failed";
+                    WriteStepDone(batch.batch_id, false, error, 0f);
+                    RobotArm.FreezeVisualFeedback = false;
+                    yield return StartCoroutine(SetPerceptionMode("idle"));
+                    yield break;
+                }
+            }
+
+            currentStepId = batch.batch_id;
+            long readyEpoch = ++executionEpoch;
+            yield return SendReady("batch initial ready", readyEpoch, batch.batch_id);
+            if (!lastMotionSucceeded)
+            {
+                string error = string.IsNullOrEmpty(lastMotionError)
+                    ? "UR initial Ready failed"
+                    : lastMotionError;
+                WriteStepDone(batch.batch_id, false, error, 0f);
+                RobotArm.FreezeVisualFeedback = false;
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                currentStepId = -1;
+                yield break;
+            }
+            currentStepId = -1;
+        }
+
         for (int i = 0; i < batch.steps.Count; i++)
         {
             StepEnvelope env = batch.steps[i];
@@ -370,13 +446,15 @@ public class JsonExecutor : MonoBehaviour
             {
                 Debug.LogWarning($"[Executor] batch step {env?.step_id} 缺少 source/target");
                 WriteStepDone(env != null ? env.step_id : batch.batch_id, false, "batch step missing source/target", 0f);
+                RobotArm.FreezeVisualFeedback = false;
+                if (!simulationOnly) yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
 
             lastExecutedStepId = env.step_id;
             currentStepId = env.step_id;
             long stepEpoch = ++executionEpoch;
-            currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch));
+            currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch, simulationOnly));
             yield return currentStepCoroutine;
             currentStepCoroutine = null;
             currentStepId = -1;
@@ -384,8 +462,61 @@ public class JsonExecutor : MonoBehaviour
             if (stepEpoch != executionEpoch || !lastStepReportedSuccess)
             {
                 Debug.LogWarning($"[Executor] batch {batch.batch_id} stopped after step {env.step_id}");
+                RobotArm.FreezeVisualFeedback = false;
+                if (!simulationOnly) yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
+        }
+
+        if (!simulationOnly)
+        {
+            currentStepId = batch.batch_id;
+            long finalLiftEpoch = ++executionEpoch;
+            yield return SendCurrentTcpLiftToTravelHeight(
+                QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE,
+                "batch final safe lift", finalLiftEpoch, batch.batch_id);
+            if (!lastMotionSucceeded)
+            {
+                string error = string.IsNullOrEmpty(lastMotionError)
+                    ? "UR final safe lift failed"
+                    : lastMotionError;
+                WriteStepDone(batch.batch_id, false, error, 0f);
+                RobotArm.FreezeVisualFeedback = false;
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                currentStepId = -1;
+                yield break;
+            }
+
+            long readyEpoch = ++executionEpoch;
+            yield return SendReady("batch final ready", readyEpoch, batch.batch_id);
+            if (!lastMotionSucceeded)
+            {
+                string error = string.IsNullOrEmpty(lastMotionError)
+                    ? "UR final Ready failed"
+                    : lastMotionError;
+                WriteStepDone(batch.batch_id, false, error, 0f);
+                RobotArm.FreezeVisualFeedback = false;
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                currentStepId = -1;
+                yield break;
+            }
+
+            long homeEpoch = ++executionEpoch;
+            yield return SendHome("batch final go_home", homeEpoch, batch.batch_id);
+            if (!lastMotionSucceeded)
+            {
+                string error = string.IsNullOrEmpty(lastMotionError)
+                    ? "UR final Home failed"
+                    : lastMotionError;
+                WriteStepDone(batch.batch_id, false, error, 0f);
+                RobotArm.FreezeVisualFeedback = false;
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                currentStepId = -1;
+                yield break;
+            }
+            currentStepId = -1;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            yield return new WaitForSeconds(1.5f);
         }
 
         currentStepId = batch.batch_id;
@@ -422,6 +553,7 @@ public class JsonExecutor : MonoBehaviour
                 env.source_position.x, env.source_position.y, env.source_position.z, guess);
             Debug.Log($"[Executor-sim] source cube 不存在，生成一顆代替 @ ({env.source_position.x:F3}, {env.source_position.y:F3})");
         }
+        cube.transform.localScale = SimScaleFor(env.source_position);
 
         // QR frame → Unity local (X, Z, Y)
         float halfHeight = sceneSyncer.cubeSizeM / 2f;
@@ -439,6 +571,7 @@ public class JsonExecutor : MonoBehaviour
         float segSec = simMoveSecPerStep / 4f;
         yield return AnimateLocalTo(cube.transform, sourceHover, segSec);
         yield return AnimateLocalTo(cube.transform, targetHover, segSec);
+        cube.transform.localScale = SimScaleFor(env.target_position);
         yield return AnimateLocalTo(cube.transform, targetLocal,  segSec);
         yield return new WaitForSeconds(0.1f);
 
@@ -446,6 +579,60 @@ public class JsonExecutor : MonoBehaviour
         float dur = (float)(DateTime.UtcNow - t0).TotalSeconds;
         WriteStepDone(env.step_id, true, null, dur);
         Debug.Log($"[Executor-sim] step {env.step_id} 完成，{dur:F2}s");
+    }
+
+    void PreviewBatchFinalLayout(BatchEnvelope batch)
+    {
+        if (sceneSyncer == null)
+        {
+            Debug.LogWarning("[Executor] SceneSyncer 未設定，略過 batch 最終畫面預覽");
+            return;
+        }
+
+        int previewed = 0;
+        foreach (StepEnvelope env in batch.steps)
+        {
+            if (env == null || env.done ||
+                env.source_position == null || env.target_position == null)
+                continue;
+
+            GameObject cube = sceneSyncer.FindNearestCube(
+                env.source_position.x, env.source_position.y, env.source_position.z);
+            if (cube == null)
+            {
+                Color guess = env.source_position.name != null && env.source_position.name.Contains("yellow")
+                    ? new Color(1f, 0.85f, 0.1f)
+                    : new Color(0.4f, 0.4f, 0.4f);
+                cube = sceneSyncer.SpawnCube(
+                    $"preview_cube_{env.step_id}",
+                    env.source_position.x, env.source_position.y, env.source_position.z, guess);
+            }
+
+            float halfHeight = sceneSyncer.cubeSizeM / 2f;
+            cube.transform.localScale = SimScaleFor(env.target_position);
+            cube.transform.localPosition = new Vector3(
+                env.target_position.x,
+                env.target_position.z - halfHeight,
+                env.target_position.y);
+            cube.name = $"preview_step{env.step_id}";
+            previewed++;
+        }
+
+        Debug.Log($"[Executor] 已先在 Unity 預覽 batch {batch.batch_id} 最終位置：{previewed} 個物件");
+    }
+
+    Vector3 SimScaleFor(NamedPosition pos)
+    {
+        if (sceneSyncer == null) return Vector3.one * 0.025f;
+
+        float size = sceneSyncer.cubeSizeM;
+        if (pos != null && pos.shape == "domino")
+        {
+            return pos.orientation == "vertical"
+                ? new Vector3(size, size, size * 2f)
+                : new Vector3(size * 2f, size, size);
+        }
+        return Vector3.one * size;
     }
 
     IEnumerator AnimateLocalTo(Transform t, Vector3 target, float seconds)
@@ -463,7 +650,15 @@ public class JsonExecutor : MonoBehaviour
         t.localPosition = target;
     }
 
-    IEnumerator ExecuteStep(StepEnvelope env, long stepEpoch)
+    void EnsureUrConnectionStarted()
+    {
+        if (urListener != null) return;
+        urListener = new URPackageListener();
+        urListener.Connect(urIP);
+        Debug.Log("嘗試連線至 UR：" + urIP);
+    }
+
+    IEnumerator ExecuteStep(StepEnvelope env, long stepEpoch, bool managePerceptionMode = true)
     {
         Debug.Log($"═══ Step {env.step_id} ═══ {env.comment}");
 
@@ -475,6 +670,7 @@ public class JsonExecutor : MonoBehaviour
         }
 
         // 等待連線
+        EnsureUrConnectionStarted();
         float waited = 0f;
         while (!urListener.Connected && waited < 3f)
         {
@@ -496,36 +692,42 @@ public class JsonExecutor : MonoBehaviour
             {
                 string error = lastMotionError ?? "UR safety recovery failed";
                 WriteStepDone(env.step_id, false, error, 0f);
-                yield return StartCoroutine(SetPerceptionMode("idle"));
+                if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
         }
 
         // 通知 perception 進入 executing，讓 SceneSyncer 凍結畫面。
-        yield return StartCoroutine(SetPerceptionMode("executing"));
+        if (managePerceptionMode)
+            yield return StartCoroutine(SetPerceptionMode("executing"));
 
         // 座標換算：QR 平面 → UR3 base
-        float ox = QR1_X + env.source_position.x;
-        float oy = QR1_Y + env.source_position.y;
+        float ox = QR1_X + env.source_position.x + pickOffsetX;
+        float oy = QR1_Y + env.source_position.y + pickOffsetY;
         float oz = QR1_Z + env.source_position.z + Z_CORRECTION;
         float tx = QR1_X + env.target_position.x;
         float ty = QR1_Y + env.target_position.y;
         float tz = QR1_Z + env.target_position.z + Z_CORRECTION;
         float travelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
+        Debug.Log(
+            $"[Executor] source UR=({ox:F4},{oy:F4},{oz:F4}) " +
+            $"pickOffset=({pickOffsetX:F4},{pickOffsetY:F4}); " +
+            $"target UR=({tx:F4},{ty:F4},{tz:F4})");
 
-        if (InsideBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty))
+        if (InsideBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty) ||
+            OutsideReachEnvelope(ox, oy) || OutsideReachEnvelope(tx, ty))
         {
-            string error = $"unsafe target near UR base: source radius={Mathf.Sqrt(ox * ox + oy * oy):F3}m, " +
+            string error = $"unsafe target reach: source radius={Mathf.Sqrt(ox * ox + oy * oy):F3}m, " +
                            $"target radius={Mathf.Sqrt(tx * tx + ty * ty):F3}m, " +
-                           $"minimum={BASE_EXCLUSION_RADIUS_M:F3}m";
+                           $"allowed={BASE_EXCLUSION_RADIUS_M:F3}..{MAX_REACH_RADIUS_M:F3}m";
             Debug.LogError("[Executor] " + error);
             WriteStepDone(env.step_id, false, error, 0f);
-            yield return StartCoroutine(SetPerceptionMode("idle"));
+            if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
             yield break;
         }
 
-        string srcOri = env.source_position.orientation ?? "";
-        string tgtOri = env.target_position.orientation ?? "";
+        string srcOri = EffectiveOrientation(env.source_position, true);
+        string tgtOri = EffectiveOrientation(env.target_position, false);
         // Disable camera-estimated fine skew. It was causing noisy wrist rotation.
         // float srcSkew = env.source_position.skew_deg;
         // float tgtSkew = env.target_position.skew_deg;
@@ -537,17 +739,27 @@ public class JsonExecutor : MonoBehaviour
         if (env.action_sequence == null || env.action_sequence.Count == 0)
         {
             WriteStepDone(env.step_id, false, "missing action_sequence", 0f);
-            yield return StartCoroutine(SetPerceptionMode("idle"));
+            if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
             yield break;
         }
 
         // Unity only interprets a closed whitelist. Raw URScript and arbitrary coordinates
         // are deliberately not part of the JSON contract.
+        bool holdingObject = false;
         for (int i = 0; i < env.action_sequence.Count; i++)
         {
             if (!IsExecutionCurrent(stepEpoch, env.step_id))
             {
                 Debug.LogWarning($"[Executor] Stale step {env.step_id} cancelled before action {i + 1}.");
+                yield break;
+            }
+            if (IsEmergencyStop() || IsRecoverableSafetyStop())
+            {
+                string error = IsEmergencyStop()
+                    ? $"UR emergency stop before action {i + 1}; batch stopped"
+                    : $"UR safety stop before action {i + 1}; batch stopped";
+                WriteStepDone(env.step_id, false, error, Time.realtimeSinceStartup - t0);
+                if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
 
@@ -564,23 +776,31 @@ public class JsonExecutor : MonoBehaviour
             switch (action.function)
             {
                 case "move_above":
-                    // Use the configured travel plane for lateral motion, then the LLM-selected
-                    // safe height. This preserves collision clearance while allowing variable plans.
+                    yield return SendCurrentTcpLiftToTravelHeight(travelZ,
+                        tag + " prelift", stepEpoch, env.step_id);
+                    if (!lastMotionSucceeded) break;
+
+                    // Travel only after the current TCP is already on the high
+                    // plane, so the arm does not sweep across the blocks.
                     yield return SendMove(x, y, travelZ, orientation, skew,
-                        tag + " travel", false, stepEpoch, env.step_id);
+                        tag + " travel", true, stepEpoch, env.step_id);
                     if (!lastMotionSucceeded) break;
                     yield return SendMove(x, y, z + height, orientation, skew,
                         tag + " above", true, stepEpoch, env.step_id);
                     break;
                 case "descend":
+                    if (!source && holdingObject)
+                        z += Mathf.Max(0f, placeDescendExtraZ);
                     yield return SendMove(x, y, z, orientation, skew,
                         tag, true, stepEpoch, env.step_id);
                     break;
                 case "grasp":
                     yield return SendGrasp(stepEpoch, env.step_id);
+                    holdingObject = true;
                     break;
                 case "release":
                     yield return SendRelease(stepEpoch, env.step_id);
+                    holdingObject = false;
                     break;
                 case "lift":
                     // A lift must be Cartesian-linear. movej can change IK branch and
@@ -596,7 +816,7 @@ public class JsonExecutor : MonoBehaviour
                     break;
                 default:
                     WriteStepDone(env.step_id, false, "unknown robot function: " + action.function, 0f);
-                    yield return StartCoroutine(SetPerceptionMode("idle"));
+                    if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
                     yield break;
             }
 
@@ -611,7 +831,7 @@ public class JsonExecutor : MonoBehaviour
                     : lastMotionError;
                 Debug.LogError($"[Executor] Step {env.step_id} stopped: {error}");
                 WriteStepDone(env.step_id, false, error, failedDuration);
-                yield return StartCoroutine(SetPerceptionMode("idle"));
+                if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
 
@@ -619,10 +839,12 @@ public class JsonExecutor : MonoBehaviour
 
         // 通知 perception 回到 idle，讓 SceneSyncer 擷取最新場景。
         if (!IsExecutionCurrent(stepEpoch, env.step_id)) yield break;
-        yield return StartCoroutine(SetPerceptionMode("idle"));
-
-        // 等待 perception 取得足夠影格以穩定偵測結果。
-        yield return new WaitForSeconds(1.5f);
+        if (managePerceptionMode)
+        {
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            // 等待 perception 取得足夠影格以穩定偵測結果。
+            yield return new WaitForSeconds(1.5f);
+        }
 
         if (!IsExecutionCurrent(stepEpoch, env.step_id))
         {
@@ -812,6 +1034,175 @@ public class JsonExecutor : MonoBehaviour
         lastMotionError = $"UR motion timeout during {tag}: home was not reached";
     }
 
+    IEnumerator SendReady(string tag, long stepEpoch, int stepId)
+    {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+
+        if (!useReadyPose)
+        {
+            lastMotionSucceeded = true;
+            Debug.Log($"  [{tag}] SKIP: Use Ready Pose is off");
+            yield break;
+        }
+
+        if (readyJointsRad == null || readyJointsRad.Length != 6)
+        {
+            lastMotionError = "Ready pose requires exactly 6 joint values";
+            Debug.LogError("[Executor] " + lastMotionError);
+            yield break;
+        }
+
+        float[] target = readyJointsRad;
+        string readyCmd = BuildJointMovejLine(target);
+        Debug.Log($"  [{tag}] SEND: {readyCmd}");
+        urListener.SendCommand(readyCmd);
+        yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
+
+        float startedAt = Time.realtimeSinceStartup;
+        bool sawProgramRunning = urListener.RobotModeData.isProgramRunning;
+        while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
+        {
+            if (!IsExecutionCurrent(stepEpoch, stepId))
+            {
+                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                yield break;
+            }
+            if (!urListener.Connected)
+            {
+                lastMotionError = $"UR disconnected during {tag}";
+                yield break;
+            }
+            if (IsEmergencyStop())
+            {
+                lastMotionError = $"UR emergency stop during {tag}; automatic resume is disabled";
+                yield break;
+            }
+            if (IsRecoverableSafetyStop())
+            {
+                lastMotionError = $"UR safety stop during {tag}";
+                yield break;
+            }
+            if (urListener.RobotModeData.isProgramRunning)
+                sawProgramRunning = true;
+
+            var joints = urListener.JointData.AsArray;
+            float maxError = 0f;
+            for (int i = 0; i < target.Length; i++)
+            {
+                float actual = (float)joints[i].q_actual;
+                float error = Mathf.Abs(Mathf.DeltaAngle(actual * Mathf.Rad2Deg,
+                    target[i] * Mathf.Rad2Deg)) * Mathf.Deg2Rad;
+                maxError = Mathf.Max(maxError, error);
+            }
+            if (maxError <= HOME_JOINT_TOLERANCE_RAD &&
+                !urListener.RobotModeData.isProgramRunning)
+            {
+                lastMotionSucceeded = true;
+                Debug.Log($"  [{tag}] REACHED: max joint error {maxError * Mathf.Rad2Deg:F2} deg");
+                yield break;
+            }
+            if (!sawProgramRunning && Time.realtimeSinceStartup - startedAt > 1.0f)
+            {
+                lastMotionError = $"UR did not start {tag}: {RobotStatusText()}";
+                Debug.LogError("[Executor] " + lastMotionError);
+                yield break;
+            }
+            yield return new WaitForSeconds(0.05f);
+        }
+
+        lastMotionError = $"UR motion timeout during {tag}: ready pose was not reached";
+    }
+
+    string BuildJointMovejLine(float[] joints)
+    {
+        return $"movej([{joints[0]:F4}, {joints[1]:F4}, {joints[2]:F4}, {joints[3]:F4}, {joints[4]:F4}, {joints[5]:F4}], a=1.2, v=0.8)";
+    }
+
+    IEnumerator SendCurrentTcpLiftToTravelHeight(
+        float targetZ, string tag, long stepEpoch, int stepId)
+    {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+
+        var tcp = urListener.CartesianInfo;
+        float x = (float)tcp.X;
+        float y = (float)tcp.Y;
+        float z = (float)tcp.Z;
+        if (z >= targetZ - TCP_POSITION_TOLERANCE_M)
+        {
+            lastMotionSucceeded = true;
+            Debug.Log($"  [{tag}] SKIP: TCP already lifted at Z={z:F4}");
+            yield break;
+        }
+
+        float rx = (float)tcp.Rx;
+        float ry = (float)tcp.Ry;
+        float rz = (float)tcp.Rz;
+        string cmd = $"movel(p[{x:F4}, {y:F4}, {targetZ:F4}, {rx:F4}, {ry:F4}, {rz:F4}], a=0.3, v=0.10)";
+        Debug.Log($"  [{tag}] SEND: {cmd}");
+        urListener.SendCommand(cmd);
+
+        yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
+        float startedAt = Time.realtimeSinceStartup;
+        bool protectiveStopDetected = false;
+        while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
+        {
+            if (!IsExecutionCurrent(stepEpoch, stepId))
+            {
+                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                yield break;
+            }
+            if (!urListener.Connected)
+            {
+                lastMotionError = $"UR disconnected during {tag}";
+                yield break;
+            }
+            if (IsEmergencyStop())
+            {
+                lastMotionError = $"UR emergency stop during {tag}; automatic resume is disabled";
+                yield break;
+            }
+            if (IsRecoverableSafetyStop())
+            {
+                protectiveStopDetected = true;
+                break;
+            }
+
+            var current = urListener.CartesianInfo;
+            float dx = (float)current.X - x;
+            float dy = (float)current.Y - y;
+            float dz = (float)current.Z - targetZ;
+            float distance = Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
+            if (distance <= TCP_POSITION_TOLERANCE_M &&
+                !urListener.RobotModeData.isProgramRunning)
+            {
+                lastMotionSucceeded = true;
+                Debug.Log($"  [{tag}] REACHED: TCP error {distance * 1000f:F1} mm");
+                yield break;
+            }
+            yield return new WaitForSeconds(0.05f);
+        }
+
+        if (protectiveStopDetected)
+        {
+            yield return WaitForManualSafetyRecovery(tag, stepEpoch, stepId);
+            if (!safetyRecoverySucceeded)
+                yield break;
+            lastMotionError = $"UR protective stop during {tag}; batch was not started";
+            yield break;
+        }
+
+        var finalTcp = urListener.CartesianInfo;
+        float finalDx = (float)finalTcp.X - x;
+        float finalDy = (float)finalTcp.Y - y;
+        float finalDz = (float)finalTcp.Z - targetZ;
+        float finalDistance = Mathf.Sqrt(finalDx * finalDx + finalDy * finalDy + finalDz * finalDz);
+        lastMotionError = $"UR motion timeout during {tag}: TCP remained {finalDistance * 1000f:F1} mm from lifted target";
+    }
+
     IEnumerator WaitForManualSafetyRecovery(
         string context, long stepEpoch, int stepId)
     {
@@ -892,9 +1283,54 @@ public class JsonExecutor : MonoBehaviour
                mode == SafetyMode.Fault;
     }
 
+    string RobotStatusText()
+    {
+        if (urListener == null)
+            return "UR listener is not started";
+
+        return $"connected={urListener.Connected}, " +
+               $"robotMode={urListener.RobotModeData.robotMode}, " +
+               $"safetyMode={urListener.MasterboardData.safetyMode}, " +
+               $"programRunning={urListener.RobotModeData.isProgramRunning}, " +
+               $"protectiveStopped={urListener.RobotModeData.isProtectiveStopped}, " +
+               $"emergencyStopped={urListener.RobotModeData.isEmergencyStopped}";
+    }
+
     bool InsideBaseExclusion(float x, float y)
     {
         return (x * x + y * y) < BASE_EXCLUSION_RADIUS_M * BASE_EXCLUSION_RADIUS_M;
+    }
+
+    bool OutsideReachEnvelope(float x, float y)
+    {
+        return (x * x + y * y) > MAX_REACH_RADIUS_M * MAX_REACH_RADIUS_M;
+    }
+
+    string EffectiveOrientation(NamedPosition pos, bool isSource)
+    {
+        if (pos == null)
+            return "horizontal";
+        if (pos.shape != "domino")
+            return isSource ? "vertical" : "horizontal";
+        return pos.orientation ?? "horizontal";
+    }
+
+    bool IsNearHomeJointPose()
+    {
+        if (urListener == null || !urListener.Connected)
+            return false;
+
+        float[] target = { -1.5708f, -1.5708f, 0f, -1.5708f, 0f, 0f };
+        var joints = urListener.JointData.AsArray;
+        float maxError = 0f;
+        for (int i = 0; i < target.Length; i++)
+        {
+            float actual = (float)joints[i].q_actual;
+            float error = Mathf.Abs(Mathf.DeltaAngle(actual * Mathf.Rad2Deg,
+                target[i] * Mathf.Rad2Deg)) * Mathf.Deg2Rad;
+            maxError = Mathf.Max(maxError, error);
+        }
+        return maxError <= 0.12f;
     }
 
     string BuildMovelLine(float x, float y, float z, string orientation, float skewDeg)
@@ -942,9 +1378,7 @@ public class JsonExecutor : MonoBehaviour
         float totalDeg = rotate ? 90f : 0f;
         float totalRad = totalDeg * Mathf.Deg2Rad;
 
-        // Keep the current elbow/wrist configuration as the IK seed. A fixed qnear
-        // can select the folded-back branch and make the forearm collide with the
-        // upper arm even though the requested TCP pose itself is reachable.
+        // Bias IK toward the robot's current joint configuration.
         const string qnear = "get_actual_joint_positions()";
 
         if (Mathf.Abs(totalDeg) > 0.01f)

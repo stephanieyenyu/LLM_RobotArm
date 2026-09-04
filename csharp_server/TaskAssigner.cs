@@ -18,7 +18,7 @@ using System.Linq;
 public static class TaskAssigner
 {
     // supply 篩選：只認補貨區內、指定顏色 + 形狀對的
-    private const double SUPPLY_ZONE_X_MAX = 0.30;
+    private const double SUPPLY_ZONE_X_MAX = 0.35;
 
     /// <summary>
     /// 挑下一步。回傳 null 代表沒有可執行的（供應不足 / 無 target）。
