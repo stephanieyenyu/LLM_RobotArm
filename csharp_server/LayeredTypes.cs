@@ -142,6 +142,25 @@ public class StepEnvelope
 }
 
 /// <summary>
+/// 傳給 Unity 的整批任務。C# 先用同一份 scene snapshot 排完所有步驟，
+/// Unity 收到後連續執行，不再等 C# 每步重新掃描與派工。
+/// </summary>
+public class BatchEnvelope
+{
+    [JsonPropertyName("batch_id")]
+    public int BatchId { get; set; }
+
+    [JsonPropertyName("done")]
+    public bool Done { get; set; }
+
+    [JsonPropertyName("comment")]
+    public string Comment { get; set; } = "";
+
+    [JsonPropertyName("steps")]
+    public List<StepEnvelope> Steps { get; set; } = new();
+}
+
+/// <summary>
 /// LLM Motion Planner may only compose these high-level robot functions.
 /// Unity translates them to the existing, bounded URScript implementation.
 /// </summary>

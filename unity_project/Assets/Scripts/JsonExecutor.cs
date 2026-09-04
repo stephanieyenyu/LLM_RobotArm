@@ -12,10 +12,10 @@ using Assets.Scripts;
 // Layer 4（Executor）：Unity 端
 // 分層架構中的單步執行器：
 //   - 持續 poll current_step.json
-//   - 收到新的 step_id 後，依 action_sequence 執行 URScript
+//   - 收到 steps batch 後連續執行整批；仍保留單 step 相容
 //   - 執行完寫入 step_done.json 回報結果
 //   - 收到 {"done": true} 後停止該批任務
-// 不再載入整批 batch plan，也不需要按 Space 執行。
+// 不需要按 Space 執行。
 // -----------------------------------------------------------------
 
 [System.Serializable]
@@ -43,6 +43,15 @@ public class StepEnvelope
     public NamedPosition target_position;
     public string comment;
     public List<RobotFunctionCall> action_sequence;
+}
+
+[System.Serializable]
+public class BatchEnvelope
+{
+    public int batch_id;
+    public bool done;
+    public string comment;
+    public List<StepEnvelope> steps;
 }
 
 [System.Serializable]
@@ -122,6 +131,7 @@ public class JsonExecutor : MonoBehaviour
     private int currentStepId = -1;
     private bool lastMotionSucceeded;
     private string lastMotionError;
+    private bool lastStepReportedSuccess;
     private bool safetyRecoverySucceeded;
     private long executionEpoch;
 
@@ -225,7 +235,6 @@ public class JsonExecutor : MonoBehaviour
             string path = Path.Combine(Application.streamingAssetsPath, currentStepFile);
             if (!File.Exists(path)) continue;
 
-            StepEnvelope env;
             string stepJson;
             DateTime stepWriteTimeUtc;
             try
@@ -234,6 +243,46 @@ public class JsonExecutor : MonoBehaviour
                 stepJson = File.ReadAllText(path);
                 if (stepJson == lastProcessedStepJson &&
                     stepWriteTimeUtc <= lastProcessedStepWriteTimeUtc) continue;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Executor] step json read failed: {ex.Message}");
+                continue;
+            }
+
+            lastProcessedStepJson = stepJson;
+            lastProcessedStepWriteTimeUtc = stepWriteTimeUtc;
+
+            if (stepJson.Contains("\"steps\""))
+            {
+                BatchEnvelope batch;
+                try
+                {
+                    batch = JsonUtility.FromJson<BatchEnvelope>(stepJson);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[Executor] batch json parse failed: {ex.Message}");
+                    continue;
+                }
+
+                if (batch == null || batch.steps == null || batch.steps.Count == 0)
+                {
+                    Debug.LogWarning("[Executor] batch 缺少 steps");
+                    continue;
+                }
+
+                executionEpoch++;
+                currentStepCoroutine = StartCoroutine(ExecuteBatch(batch));
+                yield return currentStepCoroutine;
+                currentStepCoroutine = null;
+                currentStepId = -1;
+                continue;
+            }
+
+            StepEnvelope env;
+            try
+            {
                 env = JsonUtility.FromJson<StepEnvelope>(stepJson);
             }
             catch (Exception ex)
@@ -243,8 +292,6 @@ public class JsonExecutor : MonoBehaviour
             }
 
             if (env == null) continue;
-            lastProcessedStepJson = stepJson;
-            lastProcessedStepWriteTimeUtc = stepWriteTimeUtc;
 
             if (env.done)
             {
@@ -276,6 +323,43 @@ public class JsonExecutor : MonoBehaviour
             currentStepCoroutine = null;
             currentStepId = -1;
         }
+    }
+
+    IEnumerator ExecuteBatch(BatchEnvelope batch)
+    {
+        Debug.Log($"[Executor] 收到 batch {batch.batch_id}: {batch.steps.Count} steps — {batch.comment}");
+
+        for (int i = 0; i < batch.steps.Count; i++)
+        {
+            StepEnvelope env = batch.steps[i];
+            if (env == null || env.done) continue;
+
+            if (env.source_position == null || env.target_position == null)
+            {
+                Debug.LogWarning($"[Executor] batch step {env?.step_id} 缺少 source/target");
+                WriteStepDone(env != null ? env.step_id : batch.batch_id, false, "batch step missing source/target", 0f);
+                yield break;
+            }
+
+            lastExecutedStepId = env.step_id;
+            currentStepId = env.step_id;
+            long stepEpoch = ++executionEpoch;
+            currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch));
+            yield return currentStepCoroutine;
+            currentStepCoroutine = null;
+            currentStepId = -1;
+
+            if (stepEpoch != executionEpoch || !lastStepReportedSuccess)
+            {
+                Debug.LogWarning($"[Executor] batch {batch.batch_id} stopped after step {env.step_id}");
+                yield break;
+            }
+        }
+
+        currentStepId = batch.batch_id;
+        WriteStepDone(batch.batch_id, true, null, 0f);
+        currentStepId = -1;
+        Debug.Log($"[Executor] batch {batch.batch_id} 全部完成");
     }
 
     // --- 執行單一步驟：依序解讀 LLM Motion Planner 的 robot functions ---
@@ -781,6 +865,7 @@ public class JsonExecutor : MonoBehaviour
 
     void WriteStepDone(int stepId, bool completed, string error, float duration)
     {
+        lastStepReportedSuccess = completed;
         var report = new StepDoneReport
         {
             step_id = stepId,

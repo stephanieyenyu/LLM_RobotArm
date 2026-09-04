@@ -151,13 +151,13 @@ public class UIManager : MonoBehaviour
 
     IEnumerator WaitAndExecute()
     {
-        // 分層架構下：csharp_server 的 orchestrator 會逐步寫 current_step.json、
-        // JsonExecutor 自己 poll 這個檔案來執行。UI 只要等到「至少一步」被 Unity 收到就代表任務啟動了。
+        // Batch 架構下：csharp_server 先用一張 scene snapshot 排完所有步驟，
+        // 再一次寫 current_step.json；JsonExecutor 收到後連續執行整批。
         // 這裡等 current_step.json 出現 / 更新，log 一下讓使用者知道 pipeline 通了。
         string stepPath = Path.Combine(SHARED_DIR, "current_step.json");
         var lastWrite = File.Exists(stepPath) ? File.GetLastWriteTime(stepPath) : System.DateTime.MinValue;
 
-        float timeout = 120f;     // gpt-5 設計 pattern 有時要一分鐘以上
+        float timeout = 600f;     // batch 會先完成所有 LLM motion plans 才開始執行
         float waited = 0f;
         float lastLogAt = 0f;
 
@@ -168,17 +168,17 @@ public class UIManager : MonoBehaviour
 
             if (File.Exists(stepPath) && File.GetLastWriteTime(stepPath) > lastWrite)
             {
-                Debug.Log($"[UI] current_step.json 已更新（等了 {waited:F1} 秒），Executor 會自動 poll 執行");
+                Debug.Log($"[UI] batch current_step.json 已更新（等了 {waited:F1} 秒），Executor 會自動連續執行");
                 yield break;
             }
 
             if (waited - lastLogAt >= 15f)
             {
-                Debug.Log($"[UI] 仍在等 csharp_server 產生第一步...（已等 {waited:F0} 秒 / 上限 {timeout:F0} 秒）");
+                Debug.Log($"[UI] 仍在等 csharp_server 排完整批步驟...（已等 {waited:F0} 秒 / 上限 {timeout:F0} 秒）");
                 lastLogAt = waited;
             }
         }
 
-        Debug.LogWarning($"[UI] 等待 current_step.json 逾時（{timeout} 秒）— 檢查 csharp_server / perception_server 是否在跑");
+        Debug.LogWarning($"[UI] 等待 batch current_step.json 逾時（{timeout} 秒）— 檢查 csharp_server / perception_server 是否在跑");
     }
 }

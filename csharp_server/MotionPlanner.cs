@@ -49,13 +49,14 @@ public sealed class MotionPlanner
                 - release(): open gripper; only at target after descend(target)
                 - lift(location, height_m): lift vertically above source or target
                 - wait(seconds): wait for settling, 0.1 to 3.0 seconds
-                - go_home(): return to the configured home pose
+                - go_home(): return to the configured home pose; use only when explicitly requested
 
                 Safety rules:
                 1. Approach source from above, descend, grasp, then lift before traveling.
                 2. Travel to target only while lifted/safe.
                 3. Approach target from above, descend, release, then lift.
-                4. Finish with go_home.
+                4. Do not finish each step with go_home. End after lifting safely above the target
+                   so a batch can continue directly into the next step.
                 5. height_m must be between 0.05 and 0.15.
                 6. Use no more than 20 function calls.
                 7. Use at least 0.08 m clearance above both endpoints. Increase it when

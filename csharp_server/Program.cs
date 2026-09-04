@@ -134,19 +134,19 @@ async Task RunTaskAsync(string userCommand)
     switch (routed.Action)
     {
         case "arrange_pattern":
-            await RunPatternTaskAsync(userCommand);
+            await RunPatternTaskBatchAsync(userCommand, initialScene);
             break;
         case "arrange_3d_pattern":
-            await RunSpatialPatternTaskAsync(userCommand, initialScene);
+            await RunSpatialPatternTaskBatchAsync(userCommand, initialScene);
             break;
         case "move_relative":
-            await RunSingleObjectTaskAsync(routed, initialScene);
+            await RunSingleObjectTaskBatchAsync(routed, initialScene);
             break;
         case "stack":
             if (routed.StackSequence.Count > 2 || (routed.ObjectCount ?? 2) > 2)
-                await RunMultiStackTaskAsync(routed, initialScene);
+                await RunMultiStackTaskBatchAsync(routed, initialScene);
             else
-                await RunSingleObjectTaskAsync(routed, initialScene);
+                await RunSingleObjectTaskBatchAsync(routed, initialScene);
             break;
         default:
             Console.WriteLine($"[CommandRouter] Unsupported action: {routed.Action}");
@@ -154,6 +154,306 @@ async Task RunTaskAsync(string userCommand)
     }
 }
 
+async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initialSnap)
+{
+    string blockColor = GuessBlockColor(userCommand, initialSnap);
+    int cubeBudget = initialSnap.Count(s =>
+        s.Name == $"{blockColor}_cube" && s.X < workspace.SupplyZoneXMax);
+    int dominoBudget = initialSnap.Count(s =>
+        s.Name == $"{blockColor}_domino" && s.X < workspace.SupplyZoneXMax);
+
+    Console.WriteLine($"[Batch] 使用任務開始時的單一 scene snapshot 規劃全部步驟。");
+    Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={blockColor})...");
+
+    CanonicalPattern pattern;
+    try
+    {
+        pattern = await patternDesigner.DesignAsync(
+            userCommand, blockColor, cubeBudget, dominoBudget);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Layer 1] pattern 設計失敗：{ex.Message}");
+        Console.WriteLine(ex.ToString());
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    int br = pattern.Bitmap!.GetLength(0), bc = pattern.Bitmap.GetLength(1);
+    var rows = new List<string>();
+    Console.WriteLine($"[Layer 1] pattern={pattern.PatternId}, bitmap={br}x{bc}");
+    for (int r = 0; r < br; r++)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int c = 0; c < bc; c++) sb.Append(pattern.Bitmap[r, c] == 1 ? "■" : "□");
+        rows.Add(sb.ToString());
+        Console.WriteLine("           " + sb);
+    }
+
+    File.WriteAllText(
+        Path.Combine(localOutputDir, $"pattern_{pattern.PatternId}.json"),
+        JsonSerializer.Serialize(new
+        {
+            pattern_id = pattern.PatternId,
+            block_color = pattern.BlockColor,
+            bitmap = rows,
+            rows = br,
+            cols = bc,
+            timestamp = DateTime.Now.ToString("s"),
+        }, jsonOptions));
+
+    var realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
+    if (realize.Error != null || realize.Targets == null)
+    {
+        Console.WriteLine($"[Layer 2] {realize.Error}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    Console.WriteLine($"[Layer 2] 展開成 {realize.Targets.Count} 個 target cells "
+                      + $"({realize.Targets.Count(t => t.ExpectedShape == "domino")} domino + "
+                      + $"{realize.Targets.Count(t => t.ExpectedShape == "cube")} cube)");
+
+    var virtualScene = CloneScene(initialSnap);
+    var remainingTargets = new List<TargetCell>(realize.Targets);
+    var plannedTargets = new List<TargetCell>();
+    var steps = new List<StepEnvelope>();
+
+    while (remainingTargets.Count > 0)
+    {
+        int stepId = ++globalStepId;
+        var assignment = TaskAssigner.Assign(
+            remainingTargets, virtualScene, stepId,
+            recoveryMode: false, protectedTargets: plannedTargets);
+        if (assignment == null)
+        {
+            Console.WriteLine("[Batch Layer 3] 沒有可執行的 assignment（supply 用完或不足）");
+            break;
+        }
+
+        Console.WriteLine($"[Batch Layer 3] {assignment.Reasoning}");
+        var envelope = await BuildStepEnvelopeAsync(assignment, virtualScene);
+        if (envelope == null)
+        {
+            Console.WriteLine("[Batch] 規劃中止；尚未送給 Unity 執行。");
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+
+        steps.Add(envelope);
+        UpdateVirtualSceneAfterPlannedStep(virtualScene, assignment);
+        plannedTargets.Add(assignment.Target!);
+        remainingTargets.RemoveAll(t => t.Row == assignment.Target!.Row && t.Col == assignment.Target.Col);
+    }
+
+    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps);
+}
+
+async Task RunSingleObjectTaskBatchAsync(RoutedCommand routed, List<SceneObject> initialScene)
+{
+    Assignment assignment;
+    try
+    {
+        assignment = SingleObjectTaskBuilder.Build(routed, initialScene, ++globalStepId);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[SingleObject Batch] Cannot build task: {ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    Console.WriteLine($"[SingleObject Batch] {assignment.Reasoning}");
+    var envelope = await BuildStepEnvelopeAsync(assignment, initialScene);
+    if (envelope == null)
+    {
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    await ExecuteBatchAsync(routed.Action, new List<StepEnvelope> { envelope });
+}
+
+async Task RunMultiStackTaskBatchAsync(RoutedCommand routed, List<SceneObject> initialScene)
+{
+    List<string> sequence = routed.StackSequence.Count >= 2
+        ? routed.StackSequence
+        : Enumerable.Repeat(routed.ObjectName ?? "", routed.ObjectCount ?? 2).ToList();
+    if (sequence.Count < 2 || sequence.Any(string.IsNullOrWhiteSpace))
+    {
+        Console.WriteLine("[MultiStack Batch] Invalid stack sequence.");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    if (sequence.Any(name => !name.EndsWith("_cube", StringComparison.Ordinal)))
+    {
+        Console.WriteLine("[MultiStack Batch] Multi-layer stacking currently supports cubes only.");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    var virtualScene = CloneScene(initialScene);
+    string baseName = sequence[0];
+    SceneObject towerBase = virtualScene
+        .Where(o => o.Name == baseName)
+        .OrderByDescending(o => o.X >= 0.30)
+        .ThenByDescending(o => o.X)
+        .FirstOrDefault()
+        ?? throw new InvalidOperationException($"Base object '{baseName}' was not found.");
+
+    double towerX = towerBase.X;
+    double towerY = towerBase.Y;
+    double towerTopZ = towerBase.Z;
+    var failedStackSources = new List<SceneObject>();
+    var steps = new List<StepEnvelope>();
+
+    Console.WriteLine(
+        $"[MultiStack Batch] Planning {sequence.Count}-cube tower at " +
+        $"({towerX:F3}, {towerY:F3}); sequence={string.Join(" -> ", sequence)}.");
+
+    for (int layer = 2; layer <= sequence.Count; layer++)
+    {
+        Assignment assignment;
+        try
+        {
+            assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
+                sequence[layer - 1], virtualScene, towerX, towerY, towerTopZ,
+                ++globalStepId, failedStackSources);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MultiStack Batch] Cannot build layer {layer}: {ex.Message}");
+            break;
+        }
+
+        Console.WriteLine($"[MultiStack Batch] Layer {layer}/{sequence.Count}: {assignment.Reasoning}");
+        var envelope = await BuildStepEnvelopeAsync(assignment, virtualScene);
+        if (envelope == null)
+        {
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+        steps.Add(envelope);
+        UpdateVirtualSceneAfterPlannedStep(virtualScene, assignment);
+        towerTopZ += assignment.Source!.Z;
+    }
+
+    await ExecuteBatchAsync("multi-stack", steps);
+}
+
+async Task RunSpatialPatternTaskBatchAsync(string userCommand, List<SceneObject> initialScene)
+{
+    string color = GuessBlockColor(userCommand, initialScene);
+    string cubeName = $"{color}_cube";
+    int cubeBudget = initialScene.Count(o =>
+        o.Name == cubeName && o.X < workspace.SupplyZoneXMax);
+
+    Console.WriteLine(
+        $"[3D Batch Layer 1] Asking LLM for a self-supporting voxel glyph " +
+        $"(color={color}, cubes={cubeBudget}, volume=" +
+        $"{workspace.SpatialRows}x{workspace.SpatialCols}x{workspace.SpatialLayers})...");
+
+    SpatialPattern pattern;
+    try
+    {
+        pattern = await spatialPatternDesigner.DesignAsync(userCommand, color, cubeBudget);
+    }
+    catch (SpatialPatternInfeasibleException ex)
+    {
+        Console.WriteLine($"[3D Batch Layer 1] 不可執行：{ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[3D Batch Layer 1] 設計服務失敗：{ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    int[,] heights = pattern.ColumnHeights!;
+    int rows = heights.GetLength(0), cols = heights.GetLength(1);
+    var columns = new List<(int Row, int Col, int Height, double X, double Y)>();
+    for (int r = 0; r < rows; r++)
+    for (int c = 0; c < cols; c++)
+        if (heights[r, c] > 0)
+        {
+            double targetX = workspace.TargetOriginX + c * workspace.CellSize;
+            double targetY = workspace.SpatialTargetOriginY + (rows - 1 - r) * workspace.CellSize;
+            columns.Add((r, c, heights[r, c], targetX, targetY));
+        }
+    columns = columns.OrderByDescending(x => x.Y).ThenByDescending(x => x.X).ToList();
+
+    var virtualScene = CloneScene(initialScene);
+    var steps = new List<StepEnvelope>();
+    var placedColumns = new List<(int Row, int Col, int Height, double X, double Y, double TopZ)>();
+
+    foreach (var column in columns)
+    {
+        var target = new TargetCell
+        {
+            Row = column.Row,
+            Col = column.Col,
+            WorldX = column.X,
+            WorldY = column.Y,
+            WorldZ = workspace.DefaultBlockZ,
+            ExpectedShape = "cube",
+            ExpectedColor = color,
+        };
+        var assignment = TaskAssigner.Assign(
+            new List<TargetCell> { target }, virtualScene, ++globalStepId);
+        if (assignment == null)
+        {
+            Console.WriteLine($"[3D Batch base] No {cubeName} remains for r{column.Row}c{column.Col}.");
+            break;
+        }
+
+        var envelope = await BuildStepEnvelopeAsync(assignment, virtualScene);
+        if (envelope == null)
+        {
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+        steps.Add(envelope);
+        UpdateVirtualSceneAfterPlannedStep(virtualScene, assignment);
+        placedColumns.Add((column.Row, column.Col, column.Height,
+            column.X, column.Y, assignment.Source!.Z));
+    }
+
+    for (int layer = 2; layer <= workspace.SpatialLayers; layer++)
+    {
+        foreach (var column in placedColumns.Where(c => c.Height >= layer).ToList())
+        {
+            int index = placedColumns.FindIndex(c => c.Row == column.Row && c.Col == column.Col);
+            Assignment assignment;
+            try
+            {
+                assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
+                    cubeName, virtualScene, column.X, column.Y, column.TopZ,
+                    ++globalStepId, sourceZoneXMax: workspace.SupplyZoneXMax);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[3D Batch layer {layer}] {ex.Message}");
+                continue;
+            }
+
+            var envelope = await BuildStepEnvelopeAsync(assignment, virtualScene);
+            if (envelope == null)
+            {
+                WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+                return;
+            }
+            steps.Add(envelope);
+            UpdateVirtualSceneAfterPlannedStep(virtualScene, assignment);
+            placedColumns[index] = (column.Row, column.Col, column.Height,
+                column.X, column.Y, column.TopZ + assignment.Source!.Z);
+        }
+    }
+
+    await ExecuteBatchAsync($"3D pattern {pattern.PatternId}", steps);
+}
+
+#pragma warning disable CS8321 // Legacy closed-loop mode kept as a fallback while batch mode is active.
 async Task RunPatternTaskAsync(string userCommand)
 {
     // 先掃一次，取得 supplies 與 block color 的決策依據
@@ -904,6 +1204,8 @@ async Task RunMultiStackTaskAsync(RoutedCommand routed, List<SceneObject> initia
     WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
 }
 
+#pragma warning restore CS8321
+
 async Task<List<SceneObject>> FetchSceneAsync()
 {
     try
@@ -931,6 +1233,129 @@ async Task<List<SceneObject>> FetchSceneAsync()
     }
 }
 
+async Task<StepEnvelope?> BuildStepEnvelopeAsync(
+    Assignment assignment,
+    IReadOnlyList<SceneObject> planningScene)
+{
+    MotionPlan? motionPlan = null;
+    string validationError = "";
+    for (int planAttempt = 1; planAttempt <= 3; planAttempt++)
+    {
+        try
+        {
+            motionPlan = await motionPlanner.PlanAsync(
+                assignment, planningScene, validationError);
+        }
+        catch (Exception ex)
+        {
+            validationError = "Motion Planner call failed: " + ex.Message;
+            Console.WriteLine($"[Batch Layer 4A] 第 {planAttempt} 次規劃呼叫失敗：{ex.Message}");
+            motionPlan = null;
+            continue;
+        }
+
+        if (MotionPlanValidator.TryValidate(
+                motionPlan, assignment, planningScene, out validationError))
+            break;
+
+        Console.WriteLine($"[Batch Layer 4A] 第 {planAttempt} 次規劃未通過安全驗證：{validationError}");
+        motionPlan = null;
+    }
+
+    if (motionPlan == null)
+    {
+        Console.WriteLine("[Batch Layer 4A] 無法取得安全的動作規劃");
+        return null;
+    }
+
+    Console.WriteLine(
+        $"[Batch Layer 4A] step {assignment.StepId}: " +
+        $"{motionPlan.ActionSequence.Count} functions — {motionPlan.Reasoning}");
+
+    return new StepEnvelope
+    {
+        StepId = assignment.StepId,
+        Done = false,
+        SourcePosition = assignment.Source,
+        TargetPosition = new SceneObject
+        {
+            Name = $"target_{assignment.Target!.ExpectedShape}_r{assignment.Target.Row}_c{assignment.Target.Col}",
+            X = assignment.Target.WorldX,
+            Y = assignment.Target.WorldY,
+            Z = assignment.Target.WorldZ,
+            Shape = assignment.Target.ExpectedShape,
+            Orientation = assignment.Target.ExpectedOrientation,
+        },
+        Comment = assignment.Reasoning + " | Motion: " + motionPlan.Reasoning,
+        ActionSequence = motionPlan.ActionSequence,
+    };
+}
+
+async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps)
+{
+    if (steps.Count == 0)
+    {
+        Console.WriteLine("[Batch] 沒有可執行步驟。");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    int batchId = ++globalStepId;
+    var batch = new BatchEnvelope
+    {
+        BatchId = batchId,
+        Done = false,
+        Comment = comment,
+        Steps = steps,
+    };
+    WriteBatchFile(batch);
+
+    Console.WriteLine($"[Batch] 已一次送出 {steps.Count} steps 給 Unity（batch {batchId}），等待整批完成...");
+    var execResult = await WaitForStepDoneAsync(
+        batchId, timeoutSec: UNITY_STEP_TIMEOUT_SEC * Math.Max(1, steps.Count));
+    if (execResult == null || !execResult.Completed)
+    {
+        Console.WriteLine($"[Batch] Unity batch timeout 或失敗：{execResult?.Error}");
+        return;
+    }
+
+    Console.WriteLine($"[Batch] Unity 回報 batch {batchId} 全部完成。");
+}
+
+List<SceneObject> CloneScene(IEnumerable<SceneObject> scene) =>
+    scene.Select(o => new SceneObject
+    {
+        Name = o.Name,
+        X = o.X,
+        Y = o.Y,
+        Z = o.Z,
+        Shape = o.Shape,
+        Orientation = o.Orientation,
+        SkewDeg = o.SkewDeg,
+    }).ToList();
+
+void UpdateVirtualSceneAfterPlannedStep(List<SceneObject> scene, Assignment assignment)
+{
+    if (assignment.Source == null || assignment.Target == null) return;
+
+    const double samePieceRadiusM = 0.035;
+    scene.RemoveAll(o =>
+        o.Name == assignment.Source.Name &&
+        Math.Sqrt(Math.Pow(o.X - assignment.Source.X, 2) +
+                  Math.Pow(o.Y - assignment.Source.Y, 2)) < samePieceRadiusM);
+
+    scene.Add(new SceneObject
+    {
+        Name = $"{assignment.Target.ExpectedColor}_{assignment.Target.ExpectedShape}",
+        X = assignment.Target.WorldX,
+        Y = assignment.Target.WorldY,
+        Z = assignment.Target.WorldZ,
+        Shape = assignment.Target.ExpectedShape,
+        Orientation = assignment.Target.ExpectedOrientation,
+        SkewDeg = 0,
+    });
+}
+
 string GuessBlockColor(string userCommand, List<SceneObject> snap)
 {
     if (userCommand.Contains("black") || userCommand.Contains("黑")) return "black";
@@ -946,6 +1371,13 @@ void WriteStepFile(StepEnvelope env)
     string json = JsonSerializer.Serialize(env, jsonOptions);
     File.WriteAllText(currentStepPath, json);
     File.WriteAllText(Path.Combine(localOutputDir, $"step_{env.StepId}.json"), json);
+}
+
+void WriteBatchFile(BatchEnvelope env)
+{
+    string json = JsonSerializer.Serialize(env, jsonOptions);
+    File.WriteAllText(currentStepPath, json);
+    File.WriteAllText(Path.Combine(localOutputDir, $"batch_{env.BatchId}.json"), json);
 }
 
 async Task<ExecutionResult?> WaitForStepDoneAsync(int stepId, double timeoutSec)

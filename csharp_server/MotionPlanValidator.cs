@@ -153,8 +153,8 @@ public static class MotionPlanValidator
             }
         }
 
-        if (!released || holding || phase != "home")
-            return Fail("plan must release, retreat, and finish at home", out error);
+        if (!released || holding || phase is not ("retreated" or "home"))
+            return Fail("plan must release and retreat safely above the target", out error);
         return true;
     }
 
