@@ -41,7 +41,7 @@ public class WorkspaceBounds
     // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
     // Keep the complete 5x5 placement area away from the UR base while using
     // 5 cm center spacing (about 2.5 cm clear gap for a 2.5 cm cube).
-    public double TargetOriginX { get; set; } = 0.49;
+    public double TargetOriginX { get; set; } = 0.51;
     public double TargetOriginY { get; set; } = 0.04;
     public double CellSize { get; set; } = 0.05;
     public double DefaultBlockZ { get; set; } = 0.025;
