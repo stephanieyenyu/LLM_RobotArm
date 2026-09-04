@@ -195,6 +195,7 @@ MonoBehaviour:
   gridCols: 6
   cubeSizeM: 0.025
   autoCreateWorkspace: 1
+  visualScale: 1
 --- !u!4 &447807164
 Transform:
   m_ObjectHideFlags: 0
@@ -302,10 +303,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 819b8c8af3f3cd44bbd4df121854a55a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  jsonFileName: robot_plan.json
+  currentStepFile: current_step.json
+  stepDoneFile: step_done.json
   urIP: 192.168.50.204
+  pollIntervalSec: 0.3
   perceptionModeUrl: http://localhost:5000/scene/mode
   uiManager: {fileID: 0}
+  simulationOnly: 1
+  sceneSyncer: {fileID: 0}
+  simMoveSecPerStep: 1.2
 --- !u!1001 &1427722103
 PrefabInstance:
   m_ObjectHideFlags: 0

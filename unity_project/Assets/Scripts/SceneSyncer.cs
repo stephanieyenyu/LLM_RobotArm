@@ -43,6 +43,11 @@ public class SceneSyncer : MonoBehaviour
     public float cubeSizeM = 0.025f;             // 2.5 cm 立方體
     public bool autoCreateWorkspace = true;      // 啟動時自動建工作平面 + QR 標記
 
+    [Header("桌面顯示放大")]
+    // 只放大視覺，不改任何座標邏輯（cube localPosition 仍是真實公尺）
+    // 1.0 = 原本大小；> 1 放大；< 1 縮小
+    public float visualScale = 1.0f;
+
     // ---- 內部狀態 ----
     private Transform workspaceRoot;
     private Transform cubeContainer;
@@ -109,6 +114,49 @@ public class SceneSyncer : MonoBehaviour
         // 積木容器
         cubeContainer = new GameObject("CubeContainer").transform;
         cubeContainer.SetParent(workspaceRoot, false);
+
+        // 應用視覺放大（只影響顯示大小，不影響 cube 內部座標）
+        if (visualScale > 0f && Mathf.Abs(visualScale - 1f) > 0.001f)
+        {
+            workspaceRoot.localScale = Vector3.one * visualScale;
+        }
+    }
+
+    // 讓外部（JsonExecutor 模擬模式）依 QR frame 座標找最近的 cube
+    // qrPos: 感知/csharp_server 用的 QR frame (x=水平寬, y=水平深, z=高)
+    public GameObject FindNearestCube(float qrX, float qrY, float qrZ, float maxDistM = 0.10f)
+    {
+        // QR frame → Unity local: (x, z, y)
+        float halfHeight = cubeSizeM / 2f;
+        Vector3 target = new Vector3(qrX, qrZ - halfHeight, qrY);
+        GameObject best = null;
+        float bestD = float.MaxValue;
+        foreach (var c in currentCubes)
+        {
+            if (c == null) continue;
+            float d = Vector3.Distance(c.transform.localPosition, target);
+            if (d < bestD)
+            {
+                bestD = d;
+                best = c;
+            }
+        }
+        return bestD <= maxDistM ? best : null;
+    }
+
+    // 讓外部（JsonExecutor 模擬模式）以 QR frame 座標建立新 cube
+    public GameObject SpawnCube(string name, float qrX, float qrY, float qrZ, Color color)
+    {
+        if (cubeContainer == null) return null;
+        GameObject cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        cube.name = name;
+        cube.transform.SetParent(cubeContainer, false);
+        cube.transform.localScale = Vector3.one * cubeSizeM;
+        float halfHeight = cubeSizeM / 2f;
+        cube.transform.localPosition = new Vector3(qrX, qrZ - halfHeight, qrY);
+        SetColor(cube, color);
+        currentCubes.Add(cube);
+        return cube;
     }
 
     void MakeQrMarker(string name, Vector3 pos, Color color)

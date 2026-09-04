@@ -88,6 +88,11 @@ public class JsonExecutor : MonoBehaviour
     [Header("UI（保留既有按鈕相容性）")]
     public UIManager uiManager;
 
+    [Header("模擬模式（不接實機、Unity 內部演示 pick-and-place）")]
+    public bool simulationOnly = true;
+    public SceneSyncer sceneSyncer;         // 拖 PerceptionSync GameObject 進來
+    public float simMoveSecPerStep = 1.2f;  // 每步動畫秒數（source→up→over→down）
+
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     private const float QR1_X = -0.38824f;
     private const float QR1_Y = -0.35973f+0.005f;
@@ -151,9 +156,20 @@ public class JsonExecutor : MonoBehaviour
     void Start()
     {
         if (!enabled) return;
-        urListener = new URPackageListener();
-        urListener.Connect(urIP);
-        Debug.Log("嘗試連線至 UR：" + urIP);
+
+        if (simulationOnly)
+        {
+            Debug.Log("[Executor] 模擬模式啟用：不連線實機、Unity 內部動畫演示");
+            // 自動找 SceneSyncer（如果 Inspector 沒拖）
+            if (sceneSyncer == null)
+                sceneSyncer = FindObjectOfType<SceneSyncer>();
+        }
+        else
+        {
+            urListener = new URPackageListener();
+            urListener.Connect(urIP);
+            Debug.Log("嘗試連線至 UR：" + urIP);
+        }
 
         StartCoroutine(PollLoop());
     }
@@ -176,6 +192,7 @@ public class JsonExecutor : MonoBehaviour
     // -----------------------------------------------------------
     public void ReleaseGripper()
     {
+        if (simulationOnly) { Debug.Log("[Executor-sim] release (無實機)"); return; }
         if (urListener == null || !urListener.Connected)
         {
             Debug.LogWarning("[Executor] UR 未連線，release 失敗");
@@ -187,6 +204,7 @@ public class JsonExecutor : MonoBehaviour
 
     public void GripGripper()
     {
+        if (simulationOnly) { Debug.Log("[Executor-sim] grip (無實機)"); return; }
         if (urListener == null || !urListener.Connected)
         {
             Debug.LogWarning("[Executor] UR 未連線，grip 失敗");
@@ -198,6 +216,20 @@ public class JsonExecutor : MonoBehaviour
 
     public void GoHome()
     {
+        if (simulationOnly)
+        {
+            Debug.Log("[Executor-sim] home (無實機)，中止當前 step");
+            if (currentStepCoroutine != null)
+            {
+                executionEpoch++;
+                int abortedStepId = currentStepId;
+                StopCoroutine(currentStepCoroutine);
+                currentStepCoroutine = null;
+                currentStepId = -1;
+                WriteStepDone(abortedStepId, false, "aborted by user (GoHome sim)", 0f);
+            }
+            return;
+        }
         if (urListener == null || !urListener.Connected)
         {
             Debug.LogWarning("[Executor] UR 未連線，home 失敗");
@@ -363,9 +395,84 @@ public class JsonExecutor : MonoBehaviour
     }
 
     // --- 執行單一步驟：依序解讀 LLM Motion Planner 的 robot functions ---
+    // ----------------------------------------------------------
+    // 模擬模式：不接實機，直接在 Unity 桌面上動畫演示 pick-and-place
+    // ----------------------------------------------------------
+    IEnumerator ExecuteStepSimulated(StepEnvelope env)
+    {
+        DateTime t0 = DateTime.UtcNow;
+
+        if (sceneSyncer == null)
+        {
+            Debug.LogWarning("[Executor-sim] SceneSyncer 未設定，跳過此 step");
+            WriteStepDone(env.step_id, false, "sceneSyncer missing", 0f);
+            yield break;
+        }
+
+        // 找 source 位置最接近的 cube；找不到就自動生一顆代替（用 target 期望顏色）
+        GameObject cube = sceneSyncer.FindNearestCube(
+            env.source_position.x, env.source_position.y, env.source_position.z);
+
+        if (cube == null)
+        {
+            Color guess = env.source_position.name != null && env.source_position.name.Contains("yellow")
+                ? new Color(1f, 0.85f, 0.1f) : new Color(0.4f, 0.4f, 0.4f);
+            cube = sceneSyncer.SpawnCube(
+                $"sim_cube_{env.step_id}",
+                env.source_position.x, env.source_position.y, env.source_position.z, guess);
+            Debug.Log($"[Executor-sim] source cube 不存在，生成一顆代替 @ ({env.source_position.x:F3}, {env.source_position.y:F3})");
+        }
+
+        // QR frame → Unity local (X, Z, Y)
+        float halfHeight = sceneSyncer.cubeSizeM / 2f;
+        Vector3 sourceLocal = cube.transform.localPosition;
+        Vector3 targetLocal = new Vector3(env.target_position.x,
+                                          env.target_position.z - halfHeight,
+                                          env.target_position.y);
+        float hoverY = Mathf.Max(sourceLocal.y, targetLocal.y) + 0.08f;
+        Vector3 sourceHover = new Vector3(sourceLocal.x, hoverY, sourceLocal.z);
+        Vector3 targetHover = new Vector3(targetLocal.x, hoverY, targetLocal.z);
+
+        Debug.Log($"[Executor-sim] step {env.step_id}: source local={sourceLocal} → target local={targetLocal}");
+
+        // 4 段動畫：source→up→over→down
+        float segSec = simMoveSecPerStep / 4f;
+        yield return AnimateLocalTo(cube.transform, sourceHover, segSec);
+        yield return AnimateLocalTo(cube.transform, targetHover, segSec);
+        yield return AnimateLocalTo(cube.transform, targetLocal,  segSec);
+        yield return new WaitForSeconds(0.1f);
+
+        cube.name = $"placed_step{env.step_id}";
+        float dur = (float)(DateTime.UtcNow - t0).TotalSeconds;
+        WriteStepDone(env.step_id, true, null, dur);
+        Debug.Log($"[Executor-sim] step {env.step_id} 完成，{dur:F2}s");
+    }
+
+    IEnumerator AnimateLocalTo(Transform t, Vector3 target, float seconds)
+    {
+        Vector3 start = t.localPosition;
+        float elapsed = 0f;
+        while (elapsed < seconds)
+        {
+            elapsed += Time.deltaTime;
+            float k = Mathf.Clamp01(elapsed / seconds);
+            k = Mathf.SmoothStep(0f, 1f, k);
+            t.localPosition = Vector3.Lerp(start, target, k);
+            yield return null;
+        }
+        t.localPosition = target;
+    }
+
     IEnumerator ExecuteStep(StepEnvelope env, long stepEpoch)
     {
         Debug.Log($"═══ Step {env.step_id} ═══ {env.comment}");
+
+        // 模擬模式：直接動畫演示 cube，不走 URScript 那條路
+        if (simulationOnly)
+        {
+            yield return StartCoroutine(ExecuteStepSimulated(env));
+            yield break;
+        }
 
         // 等待連線
         float waited = 0f;

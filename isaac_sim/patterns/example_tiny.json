@@ -1,0 +1,9 @@
+{
+  "description": "3 顆並排一列，測 pick-and-place 最基本流程",
+  "settle_seconds": 2.0,
+  "blocks": [
+    { "pos": [0.50, 0.00, 0.025], "size": [0.05, 0.05, 0.05], "color": "yellow" },
+    { "pos": [0.55, 0.00, 0.025], "size": [0.05, 0.05, 0.05], "color": "yellow" },
+    { "pos": [0.60, 0.00, 0.025], "size": [0.05, 0.05, 0.05], "color": "yellow" }
+  ]
+}
