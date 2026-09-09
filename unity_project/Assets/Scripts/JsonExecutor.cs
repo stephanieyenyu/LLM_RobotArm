@@ -91,7 +91,10 @@ public class JsonExecutor : MonoBehaviour
     [Header("模擬模式（不接實機、Unity 內部演示 pick-and-place）")]
     public bool simulationOnly = true;
     public SceneSyncer sceneSyncer;         // 拖 PerceptionSync GameObject 進來
-    public float simMoveSecPerStep = 1.2f;  // 每步動畫秒數（source→up→over→down）
+    public RobotArm robotArm;                // 拖 UR3 GameObject 進來，null 會自動找
+    public float simMoveSecPerStep = 2.5f;   // 每步動畫秒數（含手臂 + 方塊）
+    public float simYawOffsetDeg = 0f;       // 基座 yaw 校正（若手臂反方向轉，調 180）
+    public bool simAnimateArm = true;        // 是否讓虛擬手臂跟著動
     public bool previewBatchInUnityBeforeRobot = true;
     public bool freezeUnityRobotDuringRealBatch = true;
     public float placeDescendExtraZ = 0f;
@@ -175,9 +178,13 @@ public class JsonExecutor : MonoBehaviour
         {
             RobotArm.FreezeVisualFeedback = false;
             Debug.Log("[Executor] 模擬模式啟用：不連線實機、Unity 內部動畫演示");
-            // 自動找 SceneSyncer（如果 Inspector 沒拖）
+            // 自動找 SceneSyncer / RobotArm（如果 Inspector 沒拖）
             if (sceneSyncer == null)
                 sceneSyncer = FindObjectOfType<SceneSyncer>();
+            if (robotArm == null)
+                robotArm = FindObjectOfType<RobotArm>();
+            if (robotArm == null)
+                Debug.LogWarning("[Executor-sim] 找不到 RobotArm，手臂不會動");
         }
         else
         {
@@ -529,6 +536,10 @@ public class JsonExecutor : MonoBehaviour
     // ----------------------------------------------------------
     // 模擬模式：不接實機，直接在 Unity 桌面上動畫演示 pick-and-place
     // ----------------------------------------------------------
+    // 模擬手臂預設姿態（單位：度；順序 [base, shoulder, elbow, wrist_1, wrist_2, wrist_3]）
+    static readonly float[] SIM_POSE_HOME  = { -90f, -90f,   0f, -90f,  0f, 0f };  // 折疊立起
+    static readonly float[] SIM_POSE_REACH = {   0f, -60f,  90f, -30f, 90f, 0f };  // 前伸姿態（base yaw 動態填入）
+
     IEnumerator ExecuteStepSimulated(StepEnvelope env)
     {
         DateTime t0 = DateTime.UtcNow;
@@ -567,18 +578,95 @@ public class JsonExecutor : MonoBehaviour
 
         Debug.Log($"[Executor-sim] step {env.step_id}: source local={sourceLocal} → target local={targetLocal}");
 
-        // 4 段動畫：source→up→over→down
-        float segSec = simMoveSecPerStep / 4f;
-        yield return AnimateLocalTo(cube.transform, sourceHover, segSec);
-        yield return AnimateLocalTo(cube.transform, targetHover, segSec);
+        // 手臂夾爪 transform（用最後一個 joint；null 就無手臂動畫）
+        Transform gripper = null;
+        bool armEnabled = simAnimateArm && robotArm != null &&
+                          robotArm.Transforms != null && robotArm.Transforms.Length > 0;
+        if (armEnabled)
+        {
+            gripper = robotArm.Transforms[robotArm.Transforms.Length - 1];
+        }
+
+        Transform cubeOriginalParent = cube.transform.parent;
+
+        // 計算 source / target 所需的手臂基座 yaw
+        float sourceYaw = ComputeBaseYawDegForQR(env.source_position.x, env.source_position.y);
+        float targetYaw = ComputeBaseYawDegForQR(env.target_position.x, env.target_position.y);
+        float[] poseAtSource = (float[])SIM_POSE_REACH.Clone();
+        float[] poseAtTarget = (float[])SIM_POSE_REACH.Clone();
+        poseAtSource[0] = sourceYaw;
+        poseAtTarget[0] = targetYaw;
+
+        // 時間分配（總長 simMoveSecPerStep）
+        float total = simMoveSecPerStep;
+        float t_toSource = total * 0.30f;
+        float t_lift     = total * 0.15f;
+        float t_swing    = total * 0.30f;
+        float t_drop     = total * 0.15f;
+        float t_home     = total * 0.10f;
+
+        // A. 手臂旋到 source 上方
+        if (armEnabled) yield return AnimateJointsTo(poseAtSource, t_toSource);
+        else            yield return new WaitForSeconds(t_toSource * 0.1f);  // 沒手臂就跳過
+
+        // B. cube 抬起
+        yield return AnimateLocalTo(cube.transform, sourceHover, t_lift);
+
+        // C. cube 黏到夾爪 → 手臂旋到 target
+        if (armEnabled && gripper != null)
+            cube.transform.SetParent(gripper, worldPositionStays: true);
+        if (armEnabled) yield return AnimateJointsTo(poseAtTarget, t_swing);
+        else            yield return AnimateLocalTo(cube.transform, targetHover, t_swing);
+        // cube 解除夾爪，回到原本 parent（保留 world 位置）
+        if (armEnabled && gripper != null)
+        {
+            if (cubeOriginalParent != null)
+                cube.transform.SetParent(cubeOriginalParent, worldPositionStays: true);
+            else
+                cube.transform.SetParent(null, worldPositionStays: true);
+        }
+
+        // D. cube 落到 target
         cube.transform.localScale = SimScaleFor(env.target_position);
-        yield return AnimateLocalTo(cube.transform, targetLocal,  segSec);
+        yield return AnimateLocalTo(cube.transform, targetLocal, t_drop);
+
+        // E. 手臂回 home
+        if (armEnabled) yield return AnimateJointsTo(SIM_POSE_HOME, t_home);
         yield return new WaitForSeconds(0.1f);
 
         cube.name = $"placed_step{env.step_id}";
         float dur = (float)(DateTime.UtcNow - t0).TotalSeconds;
         WriteStepDone(env.step_id, true, null, dur);
         Debug.Log($"[Executor-sim] step {env.step_id} 完成，{dur:F2}s");
+    }
+
+    // 依 QR frame (x, y) 計算 UR base 平面上的基座 yaw（度）
+    float ComputeBaseYawDegForQR(float qrX, float qrY)
+    {
+        float urX = QR1_X + qrX;
+        float urY = QR1_Y + qrY;
+        float yawRad = Mathf.Atan2(urY, urX);
+        return yawRad * Mathf.Rad2Deg + simYawOffsetDeg;
+    }
+
+    // 將 robotArm.Angles 從目前值平滑插值到 targetDeg
+    IEnumerator AnimateJointsTo(float[] targetDeg, float seconds)
+    {
+        if (robotArm == null || robotArm.Angles == null || robotArm.Angles.Length == 0)
+            yield break;
+        int n = Mathf.Min(robotArm.Angles.Length, targetDeg.Length);
+        float[] start = new float[n];
+        for (int i = 0; i < n; i++) start[i] = robotArm.Angles[i];
+        float elapsed = 0f;
+        while (elapsed < seconds)
+        {
+            elapsed += Time.deltaTime;
+            float k = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / seconds));
+            for (int i = 0; i < n; i++)
+                robotArm.Angles[i] = Mathf.Lerp(start[i], targetDeg[i], k);
+            yield return null;
+        }
+        for (int i = 0; i < n; i++) robotArm.Angles[i] = targetDeg[i];
     }
 
     void PreviewBatchFinalLayout(BatchEnvelope batch)
