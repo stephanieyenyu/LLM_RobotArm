@@ -310,8 +310,58 @@ MonoBehaviour:
   perceptionModeUrl: http://localhost:5000/scene/mode
   uiManager: {fileID: 0}
   simulationOnly: 1
-  sceneSyncer: {fileID: 0}
+  sceneSyncer: {fileID: 447807163}
+  robotArm: {fileID: 834001153}
   simMoveSecPerStep: 1.2
+  simHoldSec: 0.35
+  simAnimateArm: 1
+  simUseAutoReach: 1
+  simArmL1: 0.244
+  simArmL2: 0.213
+  simShoulderHeightM: 0.15
+  simFixedArmZ: 0.3
+  simShoulderTilt: -30
+  simElbowSign: 1
+  simShoulderSign: -1
+  simAutoWrist1: 1
+  simWrist1Extra: 0
+  simWrist2Down: -90
+  simPlaceOffsetX: 0
+  simPlaceOffsetY: 0
+  simPlaceOffsetZ: 0
+  simSnapTransitionSec: 0.5
+  simPickGripperOffsetX: -0.04
+  simPickGripperOffsetY: 0.05
+  simPlaceGripperOffsetX: -0.2
+  simPlaceGripperOffsetY: 0
+  simYawInvert: 1
+  simYawOffsetDeg: 0
+  simFlipX: 1
+  simFlipY: 0
+  simReachShoulder: -60
+  simReachElbow: 90
+  simReachWrist1: -30
+  simReachWrist2: 90
+  simReachWrist3: 0
+  simHomeBase: -90
+  simHomeShoulder: -90
+  simHomeElbow: 0
+  simHomeWrist1: -90
+  simHomeWrist2: 0
+  simHomeWrist3: 0
+  previewBatchInUnityBeforeRobot: 1
+  freezeUnityRobotDuringRealBatch: 1
+  placeDescendExtraZ: 0
+  pickOffsetX: 0.002
+  pickOffsetY: 0.002
+  useReadyPose: 0
+  readyJointsRad:
+  - -1.5708
+  - -1.5708
+  - 1.5708
+  - -1.5708
+  - 0
+  - 0
 --- !u!1001 &1427722103
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -334,15 +384,15 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 7670045228100350077, guid: b1afbb00f8903e848baeb69f6a494bb7, type: 3}
       propertyPath: m_LocalPosition.x
-      value: 0.3394
+      value: 0.388
       objectReference: {fileID: 0}
     - target: {fileID: 7670045228100350077, guid: b1afbb00f8903e848baeb69f6a494bb7, type: 3}
       propertyPath: m_LocalPosition.y
-      value: -0.035
+      value: -0.03
       objectReference: {fileID: 0}
     - target: {fileID: 7670045228100350077, guid: b1afbb00f8903e848baeb69f6a494bb7, type: 3}
       propertyPath: m_LocalPosition.z
-      value: 0.41087
+      value: 0.355
       objectReference: {fileID: 0}
     - target: {fileID: 7670045228100350077, guid: b1afbb00f8903e848baeb69f6a494bb7, type: 3}
       propertyPath: m_LocalRotation.w
@@ -709,6 +759,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   uiDocument: {fileID: 1993866154}
   executor: {fileID: 1353763073}
+  sceneSyncer: {fileID: 0}
 --- !u!114 &1993866154
 MonoBehaviour:
   m_ObjectHideFlags: 0

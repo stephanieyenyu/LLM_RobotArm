@@ -1,12 +1,15 @@
 using UnityEngine;
 using UnityEngine.UIElements;
 using System.Collections;
+using System.Collections.Generic;
 using System.IO;
+using System.Text;
 
 public class UIManager : MonoBehaviour
 {
     public UIDocument uiDocument;
     public JsonExecutor executor;
+    public SceneSyncer sceneSyncer;   // 拖 PerceptionSync 進來（新增方塊用）
 
     // 兩邊共用的資料夾（Unity / csharp_server 都指到這裡）
     // 如果之後換電腦或換路徑，只要改這一行
@@ -15,6 +18,9 @@ public class UIManager : MonoBehaviour
     private TextField inputField;
     private Button sendButton;
     private Label statusLabel;
+
+    // 手動生方塊的計數（決定下一顆放哪）
+    private int manualSpawnCount = 0;
 
     void OnEnable()
     {
@@ -103,6 +109,166 @@ public class UIManager : MonoBehaviour
         controlPanel.Add(gripBtn);
         controlPanel.Add(homeBtn);
         root.Add(controlPanel);
+
+        // ---------------------------------------------------------
+        // 左上角模擬工具：手動新增黃色方塊 / 清空
+        // 讓沒接相機的情況下也能測試 pick-and-place
+        // ---------------------------------------------------------
+        var simPanel = new VisualElement();
+        simPanel.style.position = UnityEngine.UIElements.Position.Absolute;
+        simPanel.style.top = 10;
+        simPanel.style.left = 10;
+        simPanel.style.flexDirection = FlexDirection.Column;
+        simPanel.style.backgroundColor = new Color(0, 0, 0, 0.7f);
+        simPanel.style.paddingTop = 6;
+        simPanel.style.paddingBottom = 6;
+        simPanel.style.paddingLeft = 6;
+        simPanel.style.paddingRight = 6;
+
+        var simLabel = new Label("模擬工具");
+        simLabel.style.color = Color.white;
+        simLabel.style.marginBottom = 4;
+        simPanel.Add(simLabel);
+
+        var addYellowBtn = new Button(() => OnAddManualCube("yellow"));
+        addYellowBtn.text = "＋ 黃色方塊";
+        addYellowBtn.style.height = 36;
+        addYellowBtn.style.width = 130;
+        addYellowBtn.style.marginBottom = 4;
+        simPanel.Add(addYellowBtn);
+
+        var addBlackBtn = new Button(() => OnAddManualCube("black"));
+        addBlackBtn.text = "＋ 黑色方塊";
+        addBlackBtn.style.height = 36;
+        addBlackBtn.style.width = 130;
+        addBlackBtn.style.marginBottom = 4;
+        simPanel.Add(addBlackBtn);
+
+        var clearBtn = new Button(() => OnClearManualCubes());
+        clearBtn.text = "清空所有方塊";
+        clearBtn.style.height = 36;
+        clearBtn.style.width = 130;
+        simPanel.Add(clearBtn);
+
+        root.Add(simPanel);
+    }
+
+    // ---------------------------------------------------------
+    // 模擬工具實作
+    // ---------------------------------------------------------
+    SceneSyncer ResolveSceneSyncer()
+    {
+        if (sceneSyncer != null) return sceneSyncer;
+        if (executor != null && executor.sceneSyncer != null)
+        {
+            sceneSyncer = executor.sceneSyncer;
+            return sceneSyncer;
+        }
+        sceneSyncer = FindObjectOfType<SceneSyncer>();
+        return sceneSyncer;
+    }
+
+    void OnAddManualCube(string color)
+    {
+        var syncer = ResolveSceneSyncer();
+        if (syncer == null)
+        {
+            Debug.LogWarning("[UI] 找不到 SceneSyncer，無法生方塊");
+            return;
+        }
+
+        // 在補貨區內按 grid 依序排：從左下角開始，每列 6 顆
+        const float xMargin = 0.03f;
+        const float yMargin = 0.03f;
+        const float spacing = 0.04f;   // cube 2.5cm + 1.5cm gap
+        const int colsPerRow = 6;
+
+        int col = manualSpawnCount % colsPerRow;
+        int row = manualSpawnCount / colsPerRow;
+        float qrX = xMargin + col * spacing;
+        float qrY = yMargin + row * spacing;
+        float qrZ = syncer.cubeSizeM;  // Z 是 cube 頂面高度
+
+        Color c = color == "black"
+            ? new Color(0.1f, 0.1f, 0.1f)
+            : new Color(1f, 0.85f, 0.1f);
+
+        string name = color + "_manual_" + manualSpawnCount;
+        var go = syncer.SpawnCube(name, qrX, qrY, qrZ, c);
+        manualSpawnCount++;
+
+        Debug.Log($"[UI] 已新增 {color} 方塊 #{manualSpawnCount} @ QR({qrX:F3}, {qrY:F3})");
+        SaveManualSceneToFile();
+    }
+
+    void OnClearManualCubes()
+    {
+        var syncer = ResolveSceneSyncer();
+        if (syncer == null) return;
+        var cubes = syncer.GetCurrentCubes();
+        int n = cubes.Count;
+        for (int i = cubes.Count - 1; i >= 0; i--)
+        {
+            if (cubes[i] != null) Destroy(cubes[i]);
+        }
+        cubes.Clear();
+        manualSpawnCount = 0;
+        Debug.Log($"[UI] 已清空 {n} 個方塊");
+        SaveManualSceneToFile();
+    }
+
+    // 把目前所有 cube 位置寫成 manual_scene.json，供 fake_perception.py 讀取
+    void SaveManualSceneToFile()
+    {
+        var syncer = ResolveSceneSyncer();
+        if (syncer == null) return;
+
+        var cubes = syncer.GetCurrentCubes();
+        float halfHeight = syncer.cubeSizeM / 2f;
+        var sb = new StringBuilder();
+        sb.Append("{\"image_width\":1280,\"image_height\":720,\"qrcodes\":[],\"objects\":[");
+
+        bool first = true;
+        foreach (var cube in cubes)
+        {
+            if (cube == null) continue;
+            Vector3 p = cube.transform.localPosition;
+            float qrX = p.x;
+            float qrY = p.z;                    // Unity Z → QR Y
+            float qrZ = p.y + halfHeight;       // 頂面高度
+
+            string colorName = cube.name.Contains("black") ? "black" : "yellow";
+            if (!first) sb.Append(",");
+            first = false;
+            string sx = qrX.ToString("F4", System.Globalization.CultureInfo.InvariantCulture);
+            string sy = qrY.ToString("F4", System.Globalization.CultureInfo.InvariantCulture);
+            string sz = qrZ.ToString("F4", System.Globalization.CultureInfo.InvariantCulture);
+            sb.Append("{");
+            sb.Append("\"name\":\"").Append(colorName).Append("_cube\",");
+            sb.Append("\"confidence\":1.0,");
+            sb.Append("\"shape\":\"cube\",");
+            sb.Append("\"orientation\":null,");    // 跟實機一致：cube 無方向用 null
+            sb.Append("\"skew_deg\":0.0,");         // domino 才會有非 0 值
+            sb.Append("\"source\":\"manual\",");
+            sb.Append("\"position\":{\"x\":").Append(sx)
+              .Append(",\"y\":").Append(sy)
+              .Append(",\"z\":").Append(sz)
+              .Append(",\"source\":\"manual\"}");
+            sb.Append("}");
+        }
+        long ts = System.DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        sb.Append("],\"timestamp\":").Append(ts).Append("}");
+
+        try
+        {
+            string path = Path.Combine(SHARED_DIR, "manual_scene.json");
+            File.WriteAllText(path, sb.ToString());
+            Debug.Log($"[UI] 已寫入 manual_scene.json ({cubes.Count} 顆方塊)");
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"[UI] 寫 manual_scene.json 失敗: {ex.Message}");
+        }
     }
 
     public void ShowMessage(string message)

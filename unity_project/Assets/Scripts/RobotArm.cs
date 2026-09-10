@@ -66,15 +66,17 @@ public class RobotArm : MonoBehaviour
 
     void Update()
     {
-        if (FreezeVisualFeedback || !followRealRobotFeedback)
+        if (FreezeVisualFeedback)
             return;
 
         // Alle Gelenkwinkel auf die Gelenkobjekte übertragen
         for(int i = 0; i < Transforms.Length; i++)
         {
-            if(urListener != null && urListener.Connected)
+            // 只有 followRealRobotFeedback=true 才從實機讀 Angles；
+            // sim 模式關掉這個，讓外部（JsonExecutor）自己寫 Angles
+            if(followRealRobotFeedback && urListener != null && urListener.Connected)
                 Angles[i] = (float)urListener.JointData.AsArray[i].q_actual * 180f / MathF.PI;
-            
+
             Transforms[i].localRotation = startRotations[i];
             Transforms[i].Rotate(axisTovector3(RotationAxis[i]), Angles[i] + RotationOffsets[i], Space.Self);
         }

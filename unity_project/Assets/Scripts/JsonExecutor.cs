@@ -92,9 +92,56 @@ public class JsonExecutor : MonoBehaviour
     public bool simulationOnly = true;
     public SceneSyncer sceneSyncer;         // 拖 PerceptionSync GameObject 進來
     public RobotArm robotArm;                // 拖 UR3 GameObject 進來，null 會自動找
-    public float simMoveSecPerStep = 2.5f;   // 每步動畫秒數（含手臂 + 方塊）
-    public float simYawOffsetDeg = 0f;       // 基座 yaw 校正（若手臂反方向轉，調 180）
+    public float simMoveSecPerStep = 10.0f;  // 每步動畫秒數（含手臂 + 方塊）
+    public float simHoldSec = 0.7f;          // 每段動作之間停頓秒數（讓觀察更清楚）
     public bool simAnimateArm = true;        // 是否讓虛擬手臂跟著動
+
+    [Header("模擬手臂 - IK 參數")]
+    public bool simUseAutoReach = true;
+    public float simArmL1 = 0.244f;
+    public float simArmL2 = 0.213f;
+    public float simShoulderHeightM = 0.152f;
+    public float simFixedArmZ = 0.30f;       // 手臂固定的絕對 Z 高度
+    public float simShoulderTilt = 0f;
+    public float simElbowSign = 1f;
+    public float simShoulderSign = 1f;
+    public bool simAutoWrist1 = true;
+    public float simWrist1Extra = 0f;
+    public float simWrist2Down = 0f;
+
+    [Header("模擬 - 放置位置微調（歸零，不做偏移校正）")]
+    public float simPlaceOffsetX = 0f;
+    public float simPlaceOffsetY = 0f;
+    public float simPlaceOffsetZ = 0f;
+    public float simSnapTransitionSec = 0.5f;
+
+    [Header("模擬 - Gripper 對位偏移（歸零，不做校正）")]
+    public float simPickGripperOffsetX = 0f;
+    public float simPickGripperOffsetY = 0f;
+    public float simPlaceGripperOffsetX = 0f;
+    public float simPlaceGripperOffsetY = 0f;
+
+    [Header("模擬手臂 - 軸向對映（歸零；假設 Unity model 座標系已對齊實機）")]
+    public bool simYawInvert = false;
+    public float simYawOffsetDeg = 0f;
+    public bool simFlipX = false;
+    public bool simFlipY = false;
+
+    [Header("模擬手臂 - 前伸姿態（度；順序 base/shoulder/elbow/wrist_1/wrist_2/wrist_3）")]
+    // 到達 source/target 上方時的姿態，base 會被動態覆蓋成計算的 yaw
+    public float simReachShoulder = -60f;
+    public float simReachElbow    =  90f;
+    public float simReachWrist1   = -30f;
+    public float simReachWrist2   =  90f;
+    public float simReachWrist3   =   0f;
+
+    [Header("模擬手臂 - Home 姿態")]
+    public float simHomeBase     = -90f;
+    public float simHomeShoulder = -90f;
+    public float simHomeElbow    =   0f;
+    public float simHomeWrist1   = -90f;
+    public float simHomeWrist2   =   0f;
+    public float simHomeWrist3   =   0f;
     public bool previewBatchInUnityBeforeRobot = true;
     public bool freezeUnityRobotDuringRealBatch = true;
     public float placeDescendExtraZ = 0f;
@@ -184,7 +231,20 @@ public class JsonExecutor : MonoBehaviour
             if (robotArm == null)
                 robotArm = FindObjectOfType<RobotArm>();
             if (robotArm == null)
+            {
                 Debug.LogWarning("[Executor-sim] 找不到 RobotArm，手臂不會動");
+            }
+            else
+            {
+                // 模擬模式：關掉 followRealRobotFeedback，避免 URPackageListener 每 frame
+                // 用 q_actual=0 覆蓋我們的 Angles。RobotArm.Update() 仍會套 Angles → Transforms。
+                robotArm.followRealRobotFeedback = false;
+                int tCount = robotArm.Transforms != null ? robotArm.Transforms.Length : 0;
+                int aCount = robotArm.Angles != null ? robotArm.Angles.Length : 0;
+                Debug.Log($"[Executor-sim] RobotArm='{robotArm.name}', Transforms={tCount}, Angles={aCount}, followFeedback={robotArm.followRealRobotFeedback} (sim 模式已關實機 feedback)");
+                if (tCount == 0 || aCount == 0)
+                    Debug.LogWarning("[Executor-sim] RobotArm 的 Transforms 或 Angles 陣列為空！請到 Inspector 檢查 UR3 的 Transforms/RotationAxis/RotationOffsets 有沒有配好");
+            }
         }
         else
         {
@@ -391,8 +451,18 @@ public class JsonExecutor : MonoBehaviour
             yield return StartCoroutine(SetPerceptionMode("executing"));
             if (sceneSyncer == null)
                 sceneSyncer = FindObjectOfType<SceneSyncer>();
+            if (robotArm == null)
+                robotArm = FindObjectOfType<RobotArm>();
             if (previewBatchInUnityBeforeRobot)
-                PreviewBatchFinalLayout(batch);
+            {
+                // 動畫預覽：手臂 + 方塊完整演示（跑完自動復原）
+                // 預覽期間關 followRealRobotFeedback，讓 Update() 用我們設的 Angles 而非實機 q_actual
+                if (robotArm != null) robotArm.followRealRobotFeedback = false;
+                RobotArm.FreezeVisualFeedback = false;
+                yield return StartCoroutine(PreviewBatchAnimated(batch));
+            }
+            // 預覽結束、實機開始：Unity 手臂改由實機 feedback 驅動
+            if (robotArm != null) robotArm.followRealRobotFeedback = true;
             RobotArm.FreezeVisualFeedback = freezeUnityRobotDuringRealBatch;
 
             float waited = 0f;
@@ -535,10 +605,72 @@ public class JsonExecutor : MonoBehaviour
     // --- 執行單一步驟：依序解讀 LLM Motion Planner 的 robot functions ---
     // ----------------------------------------------------------
     // 模擬模式：不接實機，直接在 Unity 桌面上動畫演示 pick-and-place
-    // ----------------------------------------------------------
-    // 模擬手臂預設姿態（單位：度；順序 [base, shoulder, elbow, wrist_1, wrist_2, wrist_3]）
-    static readonly float[] SIM_POSE_HOME  = { -90f, -90f,   0f, -90f,  0f, 0f };  // 折疊立起
-    static readonly float[] SIM_POSE_REACH = {   0f, -60f,  90f, -30f, 90f, 0f };  // 前伸姿態（base yaw 動態填入）
+    // 模擬手臂預設姿態（從 Inspector 讀，方便動態調整）
+    float[] BuildHomePose() => new float[] {
+        simHomeBase, simHomeShoulder, simHomeElbow, simHomeWrist1, simHomeWrist2, simHomeWrist3
+    };
+    float[] BuildReachPose(float baseYawDeg) => new float[] {
+        baseYawDeg, simReachShoulder, simReachElbow, simReachWrist1, simReachWrist2, simReachWrist3
+    };
+
+    // 依 QR 位置算 6 個 joint 讓 gripper 到目標 (x, y, z) 附近
+    // qrZ 通常是 cube 頂面高度（例如 0.025 for 2.5cm cube）
+    // hoverOverride >= 0 時取代 simHoverAboveCubeM（讓 arm 下降到 cube 用）
+    float[] BuildReachPoseForQR(float qrX, float qrY, float qrZ = 0.025f, float hoverOverride = -1f)
+    {
+        float baseYawDeg = ComputeBaseYawDegForQR(qrX, qrY);
+        if (!simUseAutoReach)
+            return BuildReachPose(baseYawDeg);
+
+        // 水平距離
+        float urX = QR1_X + qrX;
+        float urY = QR1_Y + qrY;
+        if (simFlipX) urX = -urX;
+        if (simFlipY) urY = -urY;
+        float r = Mathf.Sqrt(urX * urX + urY * urY);
+
+        // 垂直距離：目標 z 固定用 simFixedArmZ（不依 cube 高度變化）
+        float zTargetFromBase = hoverOverride >= 0f ? (qrZ + hoverOverride) : simFixedArmZ;
+        float zFromShoulder = zTargetFromBase - simShoulderHeightM;
+
+        // 2D 垂直平面 IK：從 shoulder pivot 到 target 的向量 (r, zFromShoulder)
+        float d = Mathf.Sqrt(r * r + zFromShoulder * zFromShoulder);
+        float dMax = simArmL1 + simArmL2 - 0.01f;
+        if (d > dMax) d = dMax;
+        if (d < 0.02f) d = 0.02f;
+
+        // 三角形內角
+        float cosAlpha = (simArmL1 * simArmL1 + d * d - simArmL2 * simArmL2)
+                         / (2f * simArmL1 * d);
+        cosAlpha = Mathf.Clamp(cosAlpha, -1f, 1f);
+        float alpha = Mathf.Acos(cosAlpha);          // shoulder 到目標線與上臂夾角
+
+        float cosBeta = (simArmL1 * simArmL1 + simArmL2 * simArmL2 - d * d)
+                        / (2f * simArmL1 * simArmL2);
+        cosBeta = Mathf.Clamp(cosBeta, -1f, 1f);
+        float beta = Mathf.Acos(cosBeta);            // elbow 內角
+
+        // 從水平算起的目標仰角
+        float phi = Mathf.Atan2(zFromShoulder, r);
+
+        // shoulder 關節角度（從水平起）：elbow-up 姿態
+        float shoulderRad = phi + alpha;
+        float elbowRad = Mathf.PI - beta;            // elbow 彎折角度
+
+        float shoulderDeg = simShoulderSign * shoulderRad * Mathf.Rad2Deg + simShoulderTilt;
+        float elbowDeg = simElbowSign * elbowRad * Mathf.Rad2Deg;
+
+        // wrist_1 讓 gripper 朝下：sum = -180 度
+        float wrist1Deg = simAutoWrist1
+            ? -(shoulderDeg + elbowDeg) - 90f + simWrist1Extra
+            : simReachWrist1;
+        float wrist2Deg = simAutoWrist1 ? simWrist2Down : simReachWrist2;
+
+        return new float[] {
+            baseYawDeg, shoulderDeg, elbowDeg,
+            wrist1Deg, wrist2Deg, simReachWrist3
+        };
+    }
 
     IEnumerator ExecuteStepSimulated(StepEnvelope env)
     {
@@ -551,6 +683,19 @@ public class JsonExecutor : MonoBehaviour
             yield break;
         }
 
+        yield return AnimateOneStep(env, "sim");
+
+        float dur = (float)(DateTime.UtcNow - t0).TotalSeconds;
+        WriteStepDone(env.step_id, true, null, dur);
+        Debug.Log($"[Executor-sim] step {env.step_id} 完成，{dur:F2}s");
+    }
+
+    // 純動畫：pick-and-place 一步（手臂 + 方塊），不寫 step_done
+    // 給 simulation mode 和實機執行前的預覽共用
+    IEnumerator AnimateOneStep(StepEnvelope env, string tag)
+    {
+        if (sceneSyncer == null) yield break;
+
         // 找 source 位置最接近的 cube；找不到就自動生一顆代替（用 target 期望顏色）
         GameObject cube = sceneSyncer.FindNearestCube(
             env.source_position.x, env.source_position.y, env.source_position.z);
@@ -560,23 +705,23 @@ public class JsonExecutor : MonoBehaviour
             Color guess = env.source_position.name != null && env.source_position.name.Contains("yellow")
                 ? new Color(1f, 0.85f, 0.1f) : new Color(0.4f, 0.4f, 0.4f);
             cube = sceneSyncer.SpawnCube(
-                $"sim_cube_{env.step_id}",
+                $"{tag}_cube_{env.step_id}",
                 env.source_position.x, env.source_position.y, env.source_position.z, guess);
-            Debug.Log($"[Executor-sim] source cube 不存在，生成一顆代替 @ ({env.source_position.x:F3}, {env.source_position.y:F3})");
+            Debug.Log($"[Executor-{tag}] source cube 不存在，生成一顆代替 @ ({env.source_position.x:F3}, {env.source_position.y:F3})");
         }
         cube.transform.localScale = SimScaleFor(env.source_position);
 
-        // QR frame → Unity local (X, Z, Y)
+        // QR frame → Unity local (X, Z, Y)，加上 Inspector 放置微調
         float halfHeight = sceneSyncer.cubeSizeM / 2f;
         Vector3 sourceLocal = cube.transform.localPosition;
-        Vector3 targetLocal = new Vector3(env.target_position.x,
-                                          env.target_position.z - halfHeight,
-                                          env.target_position.y);
+        Vector3 targetLocal = new Vector3(env.target_position.x + simPlaceOffsetX,
+                                          env.target_position.z - halfHeight + simPlaceOffsetZ,
+                                          env.target_position.y + simPlaceOffsetY);
         float hoverY = Mathf.Max(sourceLocal.y, targetLocal.y) + 0.08f;
         Vector3 sourceHover = new Vector3(sourceLocal.x, hoverY, sourceLocal.z);
         Vector3 targetHover = new Vector3(targetLocal.x, hoverY, targetLocal.z);
 
-        Debug.Log($"[Executor-sim] step {env.step_id}: source local={sourceLocal} → target local={targetLocal}");
+        Debug.Log($"[Executor-{tag}] step {env.step_id}: source local={sourceLocal} → target local={targetLocal}");
 
         // 手臂夾爪 transform（用最後一個 joint；null 就無手臂動畫）
         Transform gripper = null;
@@ -587,37 +732,47 @@ public class JsonExecutor : MonoBehaviour
             gripper = robotArm.Transforms[robotArm.Transforms.Length - 1];
         }
 
+        // 保留 cube 原始 parent (CubeContainer)，之後 restore 用
         Transform cubeOriginalParent = cube.transform.parent;
 
-        // 計算 source / target 所需的手臂基座 yaw
-        float sourceYaw = ComputeBaseYawDegForQR(env.source_position.x, env.source_position.y);
-        float targetYaw = ComputeBaseYawDegForQR(env.target_position.x, env.target_position.y);
-        float[] poseAtSource = (float[])SIM_POSE_REACH.Clone();
-        float[] poseAtTarget = (float[])SIM_POSE_REACH.Clone();
-        poseAtSource[0] = sourceYaw;
-        poseAtTarget[0] = targetYaw;
+        // 計算 source/target 姿態，Z 統一用 hover 高度（不下降），XY 可用 Inspector 偏移對位
+        float[] poseAtSource = BuildReachPoseForQR(
+            env.source_position.x + simPickGripperOffsetX,
+            env.source_position.y + simPickGripperOffsetY,
+            env.source_position.z);
+        float[] poseAtTarget = BuildReachPoseForQR(
+            env.target_position.x + simPlaceGripperOffsetX,
+            env.target_position.y + simPlaceGripperOffsetY,
+            env.target_position.z);
 
-        // 時間分配（總長 simMoveSecPerStep）
+        // 時間分配（總長 simMoveSecPerStep）：Z 固定 hover 高度，不做上下升降
         float total = simMoveSecPerStep;
         float t_toSource = total * 0.30f;
-        float t_lift     = total * 0.15f;
+        float t_pickUp   = total * 0.15f;
         float t_swing    = total * 0.30f;
-        float t_drop     = total * 0.15f;
+        float t_release  = total * 0.05f;
         float t_home     = total * 0.10f;
 
-        // A. 手臂旋到 source 上方
+        // A. arm 旋到 source 上方（Z 固定 hover）
         if (armEnabled) yield return AnimateJointsTo(poseAtSource, t_toSource);
-        else            yield return new WaitForSeconds(t_toSource * 0.1f);  // 沒手臂就跳過
+        else            yield return new WaitForSeconds(t_toSource * 0.1f);
+        yield return new WaitForSeconds(simHoldSec);
 
-        // B. cube 抬起
-        yield return AnimateLocalTo(cube.transform, sourceHover, t_lift);
-
-        // C. cube 黏到夾爪 → 手臂旋到 target
+        // B. cube 抬到 hover 位置
+        yield return AnimateLocalTo(cube.transform, sourceHover, t_pickUp);
         if (armEnabled && gripper != null)
+        {
+            cube.transform.position = gripper.position;
             cube.transform.SetParent(gripper, worldPositionStays: true);
+        }
+        yield return new WaitForSeconds(simHoldSec);
+
+        // C. arm 旋到 target 上方（cube 跟著飛，全程 hover 高度）
         if (armEnabled) yield return AnimateJointsTo(poseAtTarget, t_swing);
         else            yield return AnimateLocalTo(cube.transform, targetHover, t_swing);
-        // cube 解除夾爪，回到原本 parent（保留 world 位置）
+        yield return new WaitForSeconds(simHoldSec);
+
+        // D. 解 parent + 平滑過渡到 targetHover
         if (armEnabled && gripper != null)
         {
             if (cubeOriginalParent != null)
@@ -625,19 +780,21 @@ public class JsonExecutor : MonoBehaviour
             else
                 cube.transform.SetParent(null, worldPositionStays: true);
         }
-
-        // D. cube 落到 target
         cube.transform.localScale = SimScaleFor(env.target_position);
-        yield return AnimateLocalTo(cube.transform, targetLocal, t_drop);
+        if (simSnapTransitionSec > 0f)
+            yield return AnimateLocalTo(cube.transform, targetHover, simSnapTransitionSec);
+        else
+            cube.transform.localPosition = targetHover;
 
-        // E. 手臂回 home
-        if (armEnabled) yield return AnimateJointsTo(SIM_POSE_HOME, t_home);
-        yield return new WaitForSeconds(0.1f);
+        // E. cube 垂直下降到 targetLocal（精確位置）
+        yield return AnimateLocalTo(cube.transform, targetLocal, t_release);
+        yield return new WaitForSeconds(simHoldSec);
 
-        cube.name = $"placed_step{env.step_id}";
-        float dur = (float)(DateTime.UtcNow - t0).TotalSeconds;
-        WriteStepDone(env.step_id, true, null, dur);
-        Debug.Log($"[Executor-sim] step {env.step_id} 完成，{dur:F2}s");
+        // F. arm 回 home
+        if (armEnabled) yield return AnimateJointsTo(BuildHomePose(), t_home);
+        yield return new WaitForSeconds(0.15f);
+
+        cube.name = $"{tag}_step{env.step_id}";
     }
 
     // 依 QR frame (x, y) 計算 UR base 平面上的基座 yaw（度）
@@ -645,18 +802,26 @@ public class JsonExecutor : MonoBehaviour
     {
         float urX = QR1_X + qrX;
         float urY = QR1_Y + qrY;
+        if (simFlipX) urX = -urX;
+        if (simFlipY) urY = -urY;
         float yawRad = Mathf.Atan2(urY, urX);
-        return yawRad * Mathf.Rad2Deg + simYawOffsetDeg;
+        float yawDeg = yawRad * Mathf.Rad2Deg;
+        if (simYawInvert) yawDeg = -yawDeg;
+        return yawDeg + simYawOffsetDeg;
     }
 
     // 將 robotArm.Angles 從目前值平滑插值到 targetDeg
     IEnumerator AnimateJointsTo(float[] targetDeg, float seconds)
     {
         if (robotArm == null || robotArm.Angles == null || robotArm.Angles.Length == 0)
+        {
+            Debug.LogWarning("[Executor-sim] AnimateJointsTo bail：robotArm 或 Angles 陣列為 null/空");
             yield break;
+        }
         int n = Mathf.Min(robotArm.Angles.Length, targetDeg.Length);
         float[] start = new float[n];
         for (int i = 0; i < n; i++) start[i] = robotArm.Angles[i];
+        Debug.Log($"[Executor-sim] AnimateJointsTo: {string.Join(",", start.Select(a => a.ToString("F1")))} → {string.Join(",", targetDeg.Take(n).Select(a => a.ToString("F1")))} in {seconds:F2}s");
         float elapsed = 0f;
         while (elapsed < seconds)
         {
@@ -669,6 +834,7 @@ public class JsonExecutor : MonoBehaviour
         for (int i = 0; i < n; i++) robotArm.Angles[i] = targetDeg[i];
     }
 
+    // 舊版：直接把方塊瞬移到最終位置（沒動畫）。保留給需要 fast preview 的情境。
     void PreviewBatchFinalLayout(BatchEnvelope batch)
     {
         if (sceneSyncer == null)
@@ -707,6 +873,81 @@ public class JsonExecutor : MonoBehaviour
         }
 
         Debug.Log($"[Executor] 已先在 Unity 預覽 batch {batch.batch_id} 最終位置：{previewed} 個物件");
+    }
+
+    // 新版：完整動畫 preview（手臂 + 方塊逐 step 演示），跑完後復原初始狀態，實機才開始動
+    IEnumerator PreviewBatchAnimated(BatchEnvelope batch)
+    {
+        if (sceneSyncer == null)
+        {
+            Debug.LogWarning("[Executor] SceneSyncer 未設定，略過動畫預覽");
+            yield break;
+        }
+
+        Debug.Log($"[Executor-preview] 開始動畫預覽 batch {batch.batch_id}: {batch.steps.Count} steps");
+
+        // 儲存目前所有 cube 的 local position（動畫結束要復原）
+        var cubes = sceneSyncer.GetCurrentCubes();
+        var initialCubePositions = new Dictionary<GameObject, Vector3>();
+        var initialCubeParents = new Dictionary<GameObject, Transform>();
+        var initialCubeScales = new Dictionary<GameObject, Vector3>();
+        var initialCubeNames = new Dictionary<GameObject, string>();
+        foreach (var cube in cubes)
+        {
+            if (cube == null) continue;
+            initialCubePositions[cube] = cube.transform.localPosition;
+            initialCubeParents[cube] = cube.transform.parent;
+            initialCubeScales[cube] = cube.transform.localScale;
+            initialCubeNames[cube] = cube.name;
+        }
+
+        // 儲存手臂當前 Angles
+        float[] initialArmAngles = null;
+        if (robotArm != null && robotArm.Angles != null)
+            initialArmAngles = (float[])robotArm.Angles.Clone();
+
+        // 記錄 preview 過程中新生成的 cube（結束時要刪掉，不留垃圾）
+        int cubesBeforePreview = cubes.Count;
+
+        // 對每個 step 跑 AnimateOneStep
+        foreach (StepEnvelope env in batch.steps)
+        {
+            if (env == null || env.done ||
+                env.source_position == null || env.target_position == null)
+                continue;
+            yield return AnimateOneStep(env, "preview");
+        }
+
+        // 復原：手臂角度
+        if (initialArmAngles != null && robotArm != null && robotArm.Angles != null)
+        {
+            int n = Mathf.Min(initialArmAngles.Length, robotArm.Angles.Length);
+            for (int i = 0; i < n; i++) robotArm.Angles[i] = initialArmAngles[i];
+        }
+
+        // 復原：原本 cube 的位置/名稱；preview 過程中新增的 cube 直接刪除
+        var currentCubes = sceneSyncer.GetCurrentCubes();
+        for (int i = currentCubes.Count - 1; i >= 0; i--)
+        {
+            var cube = currentCubes[i];
+            if (cube == null) { currentCubes.RemoveAt(i); continue; }
+            if (initialCubePositions.ContainsKey(cube))
+            {
+                if (initialCubeParents[cube] != null && cube.transform.parent != initialCubeParents[cube])
+                    cube.transform.SetParent(initialCubeParents[cube], worldPositionStays: false);
+                cube.transform.localPosition = initialCubePositions[cube];
+                cube.transform.localScale = initialCubeScales[cube];
+                cube.name = initialCubeNames[cube];
+            }
+            else
+            {
+                // preview 過程新生成的臨時 cube
+                Destroy(cube);
+                currentCubes.RemoveAt(i);
+            }
+        }
+
+        Debug.Log($"[Executor-preview] 動畫預覽結束，已復原場景。實機開始執行");
     }
 
     Vector3 SimScaleFor(NamedPosition pos)
