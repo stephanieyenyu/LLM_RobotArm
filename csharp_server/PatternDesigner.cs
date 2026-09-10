@@ -10,6 +10,9 @@ public sealed class PatternDesigner
     const int MaxRounds = 2;
     const double OpenAiVoteWeight = 0.80;
     const double GeminiVoteWeight = 0.20;
+    // 跳過雙模型交叉審查與投票，只呼叫 OpenAI 生成一次 bitmap 就直接採用。
+    // 用於已知感知/驗證跟不上（例如 fake_perception 快照不會即時更新）的測試場景。
+    static readonly bool SkipReview = Environment.GetEnvironmentVariable("SKIP_PATTERN_REVIEW") == "1";
     readonly ChatClient openAi;
     readonly HttpClient gemini;
     readonly string geminiModel;
@@ -35,6 +38,23 @@ public sealed class PatternDesigner
     {
         if (string.IsNullOrWhiteSpace(command)) throw new ArgumentException("User command is empty.");
         int capacity = cubes + dominoes * 2;
+
+        if (SkipReview)
+        {
+            Console.WriteLine("[Layer 1] SKIP_PATTERN_REVIEW=1：只生成一次 bitmap，不做交叉審查/投票。");
+            var single = await GenerateOpenAi(command, color, cubes, dominoes, "");
+            PrintCandidate("OpenAI", single);
+            var localCheck = Validate(single, capacity);
+            if (!localCheck.Valid)
+                throw new InvalidOperationException($"單次生成的 bitmap 未通過格式/庫存檢查：{localCheck.Error}");
+            return new CanonicalPattern
+            {
+                PatternId = string.IsNullOrWhiteSpace(single.PatternId) ? command : single.PatternId,
+                Bitmap = BitmapParser.Parse(single.Bitmap!),
+                BlockColor = color,
+            };
+        }
+
         string openFeedback = "", geminiFeedback = "";
 
         for (int round = 1; round <= MaxRounds; round++)
