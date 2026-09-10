@@ -154,7 +154,7 @@ public class JsonExecutor : MonoBehaviour
     public bool useReadyPose = false;
     public float[] readyJointsRad = new float[6] { -1.5708f, -1.5708f, 1.5708f, -1.5708f, 0f, 0f };
 
-    [Header("⚠ 除錯用：關閉 reach 驗證（僅限 simulationOnly 測試，絕對不要在接真機時打開）")]
+    [Header("關閉驗證")]
     // 只關閉 InsideBaseExclusion/OutsideReachEnvelope 這一項幾何驗證（見下方
     // ExecuteStep 裡的 unsafe target reach 檢查）。protective stop 偵測、到位
     // 確認等即時硬體狀態檢查完全不受此開關影響，一律照常執行。
