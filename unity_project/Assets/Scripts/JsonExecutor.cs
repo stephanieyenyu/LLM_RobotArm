@@ -158,6 +158,14 @@ public class JsonExecutor : MonoBehaviour
     // 只關閉 InsideBaseExclusion/OutsideReachEnvelope 這一項幾何驗證（見下方
     // ExecuteStep 裡的 unsafe target reach 檢查）。protective stop 偵測、到位
     // 確認等即時硬體狀態檢查完全不受此開關影響，一律照常執行。
+    [Tooltip("每一步移動前，會先算 source/target 位置離 UR base 的水平距離：" +
+             "太近（< 0.16m，手臂會折得太緊，容易撞到自己）或太遠" +
+             "（> 0.42m，手臂快伸直，容易觸發 protective stop）就直接判定這步" +
+             "「不安全」，不執行、直接回報失敗（unsafe target reach）。" +
+             "勾起來就是跳過這項距離檢查。" +
+             "不會受影響：UR controller 真正的 protective stop / emergency " +
+             "stop 偵測，以及每步移動後「有沒有真的到位」的確認——這兩個一律" +
+             "照常執行，跟這個開關無關。")]
     public bool disableReachValidation = false;
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
