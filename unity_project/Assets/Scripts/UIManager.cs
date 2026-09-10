@@ -150,7 +150,48 @@ public class UIManager : MonoBehaviour
         clearBtn.style.width = 130;
         simPanel.Add(clearBtn);
 
+        // 跳過 pattern 審查：寫進跟 csharp_server 共用的檔案，C# server 每次
+        // 排 pattern 前都會重讀這個檔案，所以這裡勾選/取消隨時生效，不用重開
+        // Unity 或 csharp_server。
+        var skipReviewToggle = new Toggle("跳過 pattern 審查");
+        skipReviewToggle.style.marginTop = 4;
+        skipReviewToggle.style.color = Color.white;
+        skipReviewToggle.value = ReadSkipPatternReviewFlag();
+        skipReviewToggle.RegisterValueChangedCallback(evt => WriteSkipPatternReviewFlag(evt.newValue));
+        simPanel.Add(skipReviewToggle);
+
         root.Add(simPanel);
+    }
+
+    // ---------------------------------------------------------
+    // 跳過 pattern 審查開關：跟 csharp_server/PatternDesigner.cs 共用同一個
+    // StreamingAssets 底下的旗標檔，寫 "1"/"0"。
+    // ---------------------------------------------------------
+    string SkipPatternReviewFlagPath => Path.Combine(SHARED_DIR, "skip_pattern_review.txt");
+
+    bool ReadSkipPatternReviewFlag()
+    {
+        try
+        {
+            return File.Exists(SkipPatternReviewFlagPath) &&
+                   File.ReadAllText(SkipPatternReviewFlagPath).Trim() == "1";
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    void WriteSkipPatternReviewFlag(bool value)
+    {
+        try
+        {
+            File.WriteAllText(SkipPatternReviewFlagPath, value ? "1" : "0");
+        }
+        catch (IOException e)
+        {
+            Debug.LogWarning($"[UI] 寫入 skip_pattern_review.txt 失敗：{e.Message}");
+        }
     }
 
     // ---------------------------------------------------------
