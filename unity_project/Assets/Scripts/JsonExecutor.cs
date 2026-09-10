@@ -171,6 +171,10 @@ public class JsonExecutor : MonoBehaviour
     // Picking needs more clearance than placing because the source-side tool
     // orientation and attached gripper can fold the wrist/forearm toward the base.
     private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.23f;
+    // High-plane lateral travel is routed around this radius when a direct
+    // Cartesian chord would cut through the base exclusion cylinder.
+    private const float BASE_DETOUR_RADIUS_M = 0.28f;
+    private const float BASE_DETOUR_MAX_ANGLE_STEP_DEG = 25f;
     // Avoid poses that make the UR3e almost fully extend. Those IK solutions are
     // fragile and can trigger a protective stop before the TCP reaches the block.
     private const float MAX_REACH_RADIUS_M = 0.42f;
@@ -1119,8 +1123,8 @@ public class JsonExecutor : MonoBehaviour
 
                     // Travel only after the current TCP is already on the high
                     // plane, so the arm does not sweep across the blocks.
-                    yield return SendMove(x, y, travelZ, orientation, skew,
-                        tag + " travel", true, stepEpoch, env.step_id);
+                    yield return SendTravelMoveWithBaseDetour(x, y, travelZ,
+                        orientation, skew, tag + " travel", stepEpoch, env.step_id);
                     if (!lastMotionSucceeded) break;
                     yield return SendMove(x, y, z + height, orientation, skew,
                         tag + " above", true, stepEpoch, env.step_id);
@@ -1199,7 +1203,7 @@ public class JsonExecutor : MonoBehaviour
         bool linear, long stepEpoch, int stepId)
     {
         if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
-        if (linear && !disableReachValidation &&
+        if (linear &&
             !IsLinearTcpPathClearOfBase(x, y, out float minimumPathRadius))
         {
             lastMotionSucceeded = false;
@@ -1632,6 +1636,57 @@ public class JsonExecutor : MonoBehaviour
     bool InsideBaseExclusion(float x, float y)
     {
         return (x * x + y * y) < BASE_EXCLUSION_RADIUS_M * BASE_EXCLUSION_RADIUS_M;
+    }
+
+    IEnumerator SendTravelMoveWithBaseDetour(
+        float targetX, float targetY, float targetZ, string orientation,
+        float skewDeg, string tag, long stepEpoch, int stepId)
+    {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+
+        if (IsLinearTcpPathClearOfBase(targetX, targetY, out _))
+        {
+            yield return SendMove(targetX, targetY, targetZ, orientation, skewDeg,
+                tag, true, stepEpoch, stepId);
+            yield break;
+        }
+
+        var tcp = urListener.CartesianInfo;
+        float startX = (float)tcp.X;
+        float startY = (float)tcp.Y;
+        float startAngle = Mathf.Atan2(startY, startX) * Mathf.Rad2Deg;
+        float targetAngle = Mathf.Atan2(targetY, targetX) * Mathf.Rad2Deg;
+        float angleDelta = Mathf.DeltaAngle(startAngle, targetAngle);
+        int arcSteps = Mathf.Max(1,
+            Mathf.CeilToInt(Mathf.Abs(angleDelta) / BASE_DETOUR_MAX_ANGLE_STEP_DEG));
+
+        Debug.Log($"  [{tag}] Direct path crosses base exclusion; routing " +
+                  $"around R={BASE_DETOUR_RADIUS_M:F3}m in {arcSteps} arc segment(s).");
+
+        // Move radially to the routing circle, trace a short polygonal arc, then
+        // move radially to the destination. Every segment remains outside the
+        // exclusion cylinder and is independently checked by SendMove.
+        float startRad = startAngle * Mathf.Deg2Rad;
+        yield return SendMove(
+            BASE_DETOUR_RADIUS_M * Mathf.Cos(startRad),
+            BASE_DETOUR_RADIUS_M * Mathf.Sin(startRad),
+            targetZ, orientation, skewDeg, tag + " detour-entry", true,
+            stepEpoch, stepId);
+        if (!lastMotionSucceeded) yield break;
+
+        for (int i = 1; i <= arcSteps; i++)
+        {
+            float angle = (startAngle + angleDelta * i / arcSteps) * Mathf.Deg2Rad;
+            yield return SendMove(
+                BASE_DETOUR_RADIUS_M * Mathf.Cos(angle),
+                BASE_DETOUR_RADIUS_M * Mathf.Sin(angle),
+                targetZ, orientation, skewDeg, $"{tag} detour-arc {i}/{arcSteps}",
+                true, stepEpoch, stepId);
+            if (!lastMotionSucceeded) yield break;
+        }
+
+        yield return SendMove(targetX, targetY, targetZ, orientation, skewDeg,
+            tag + " detour-exit", true, stepEpoch, stepId);
     }
 
     bool InsideSourceBaseExclusion(float x, float y)
