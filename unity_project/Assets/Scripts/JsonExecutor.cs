@@ -154,6 +154,12 @@ public class JsonExecutor : MonoBehaviour
     public bool useReadyPose = false;
     public float[] readyJointsRad = new float[6] { -1.5708f, -1.5708f, 1.5708f, -1.5708f, 0f, 0f };
 
+    [Header("關閉驗證")]
+    // 只關閉 InsideBaseExclusion/OutsideReachEnvelope 這一項幾何驗證（見下方
+    // ExecuteStep 裡的 unsafe target reach 檢查）。protective stop 偵測、到位
+    // 確認等即時硬體狀態檢查完全不受此開關影響，一律照常執行。
+    public bool disableReachValidation = false;
+
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     private const float QR1_X = -0.38824f;
     private const float QR1_Y = -0.35973f+0.005f;
@@ -1043,8 +1049,9 @@ public class JsonExecutor : MonoBehaviour
             $"pickOffset=({pickOffsetX:F4},{pickOffsetY:F4}); " +
             $"target UR=({tx:F4},{ty:F4},{tz:F4})");
 
-        if (InsideBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty) ||
-            OutsideReachEnvelope(ox, oy) || OutsideReachEnvelope(tx, ty))
+        if (!disableReachValidation &&
+            (InsideBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty) ||
+             OutsideReachEnvelope(ox, oy) || OutsideReachEnvelope(tx, ty)))
         {
             string error = $"unsafe target reach: source radius={Mathf.Sqrt(ox * ox + oy * oy):F3}m, " +
                            $"target radius={Mathf.Sqrt(tx * tx + ty * ty):F3}m, " +
