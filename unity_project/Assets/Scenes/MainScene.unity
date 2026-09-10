@@ -309,7 +309,7 @@ MonoBehaviour:
   pollIntervalSec: 0.3
   perceptionModeUrl: http://localhost:5000/scene/mode
   uiManager: {fileID: 0}
-  simulationOnly: 1
+  simulationOnly: 0
   sceneSyncer: {fileID: 447807163}
   robotArm: {fileID: 834001153}
   simMoveSecPerStep: 1.2
@@ -354,14 +354,15 @@ MonoBehaviour:
   placeDescendExtraZ: 0
   pickOffsetX: 0.002
   pickOffsetY: 0.002
-  useReadyPose: 0
+  useReadyPose: 1
   readyJointsRad:
+  - -2.35
   - -1.5708
+  - -1.0472
   - -1.5708
   - 1.5708
-  - -1.5708
   - 0
-  - 0
+  disableReachValidation: 0
 --- !u!1001 &1427722103
 PrefabInstance:
   m_ObjectHideFlags: 0

@@ -19,6 +19,13 @@ public static class TaskAssigner
 {
     // supply 篩選：只認補貨區內、指定顏色 + 形狀對的
     private const double SUPPLY_ZONE_X_MAX = 0.35;
+    // Keep supply picks far enough from the UR base for the forearm, wrist and
+    // attached gripper to remain clear.  The old 0.16 m TCP-only check allowed
+    // a source at 0.215 m whose valid TCP pose folded the links into each other.
+    private const double QR1_TO_UR_X = -0.38824;
+    private const double QR1_TO_UR_Y = -0.35473;
+    private const double MIN_SAFE_SOURCE_RADIUS_M = 0.23;
+    private const double MAX_SAFE_SOURCE_RADIUS_M = 0.42;
 
     /// <summary>
     /// 挑下一步。回傳 null 代表沒有可執行的（供應不足 / 無 target）。
@@ -50,6 +57,7 @@ public static class TaskAssigner
                 .Where(s => s != null
                             && string.Equals(s.Name, expectedName, StringComparison.Ordinal)
                             && (recoveryMode || s.X < SUPPLY_ZONE_X_MAX)
+                            && IsSourceReachSafe(s)
                             && !OccupiesProtectedTarget(s, protectedTargets))
                 .ToList();
 
@@ -128,6 +136,15 @@ public static class TaskAssigner
         double dx = a.X - b.WorldX;
         double dy = a.Y - b.WorldY;
         return dx * dx + dy * dy;
+    }
+
+    public static bool IsSourceReachSafe(SceneObject source)
+    {
+        double urX = QR1_TO_UR_X + source.X;
+        double urY = QR1_TO_UR_Y + source.Y;
+        double radiusSquared = urX * urX + urY * urY;
+        return radiusSquared >= MIN_SAFE_SOURCE_RADIUS_M * MIN_SAFE_SOURCE_RADIUS_M &&
+               radiusSquared <= MAX_SAFE_SOURCE_RADIUS_M * MAX_SAFE_SOURCE_RADIUS_M;
     }
 
     private static bool OccupiesProtectedTarget(

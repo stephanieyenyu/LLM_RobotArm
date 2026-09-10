@@ -157,10 +157,19 @@ async Task RunTaskAsync(string userCommand)
 async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initialSnap)
 {
     string blockColor = GuessBlockColor(userCommand, initialSnap);
-    int cubeBudget = initialSnap.Count(s =>
-        s.Name == $"{blockColor}_cube" && s.X < workspace.SupplyZoneXMax);
-    int dominoBudget = initialSnap.Count(s =>
-        s.Name == $"{blockColor}_domino" && s.X < workspace.SupplyZoneXMax);
+    var colorSupplies = initialSnap
+        .Where(s => s.X < workspace.SupplyZoneXMax &&
+                    (s.Name == $"{blockColor}_cube" ||
+                     s.Name == $"{blockColor}_domino"))
+        .ToList();
+    var safeColorSupplies = colorSupplies
+        .Where(TaskAssigner.IsSourceReachSafe)
+        .ToList();
+    int cubeBudget = safeColorSupplies.Count(s => s.Name == $"{blockColor}_cube");
+    int dominoBudget = safeColorSupplies.Count(s => s.Name == $"{blockColor}_domino");
+
+    Console.WriteLine($"[Batch] 安全可用庫存：{cubeBudget} cube + {dominoBudget} domino; " +
+                      $"排除 {colorSupplies.Count - safeColorSupplies.Count} 顆不可安全到達的積木。");
 
     Console.WriteLine($"[Batch] 使用任務開始時的單一 scene snapshot 規劃全部步驟。");
     Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={blockColor})...");
@@ -468,11 +477,12 @@ async Task RunPatternTaskAsync(string userCommand)
     var initialSnap = await FetchSceneAsync();
     string blockColor = GuessBlockColor(userCommand, initialSnap);
     
-    int cubeBudget = initialSnap.Count(s =>
-    s.Name == $"{blockColor}_cube" && s.X < workspace.SupplyZoneXMax);
-
-    int dominoBudget = initialSnap.Count(s =>
-    s.Name == $"{blockColor}_domino" && s.X < workspace.SupplyZoneXMax);
+    var safeColorSupplies = initialSnap.Where(s =>
+        s.X < workspace.SupplyZoneXMax &&
+        (s.Name == $"{blockColor}_cube" || s.Name == $"{blockColor}_domino") &&
+        TaskAssigner.IsSourceReachSafe(s)).ToList();
+    int cubeBudget = safeColorSupplies.Count(s => s.Name == $"{blockColor}_cube");
+    int dominoBudget = safeColorSupplies.Count(s => s.Name == $"{blockColor}_domino");
 
     int maxCoveredCells = cubeBudget + dominoBudget * 2;
     Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={blockColor})...");

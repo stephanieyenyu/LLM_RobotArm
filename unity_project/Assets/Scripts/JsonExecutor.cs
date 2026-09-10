@@ -168,6 +168,9 @@ public class JsonExecutor : MonoBehaviour
     // Reject TCP targets too close to the base axis. Reaching into this cylinder
     // requires a tightly folded arm and can make adjacent UR3e links collide.
     private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
+    // Picking needs more clearance than placing because the source-side tool
+    // orientation and attached gripper can fold the wrist/forearm toward the base.
+    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.23f;
     // Avoid poses that make the UR3e almost fully extend. Those IK solutions are
     // fragile and can trigger a protective stop before the TCP reaches the block.
     private const float MAX_REACH_RADIUS_M = 0.42f;
@@ -1043,12 +1046,13 @@ public class JsonExecutor : MonoBehaviour
             $"pickOffset=({pickOffsetX:F4},{pickOffsetY:F4}); " +
             $"target UR=({tx:F4},{ty:F4},{tz:F4})");
 
-        if (InsideBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty) ||
+        if (InsideSourceBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty) ||
             OutsideReachEnvelope(ox, oy) || OutsideReachEnvelope(tx, ty))
         {
             string error = $"unsafe target reach: source radius={Mathf.Sqrt(ox * ox + oy * oy):F3}m, " +
                            $"target radius={Mathf.Sqrt(tx * tx + ty * ty):F3}m, " +
-                           $"allowed={BASE_EXCLUSION_RADIUS_M:F3}..{MAX_REACH_RADIUS_M:F3}m";
+                           $"source allowed={SOURCE_BASE_EXCLUSION_RADIUS_M:F3}..{MAX_REACH_RADIUS_M:F3}m, " +
+                           $"target allowed={BASE_EXCLUSION_RADIUS_M:F3}..{MAX_REACH_RADIUS_M:F3}m";
             Debug.LogError("[Executor] " + error);
             WriteStepDone(env.step_id, false, error, 0f);
             if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
@@ -1191,6 +1195,15 @@ public class JsonExecutor : MonoBehaviour
         bool linear, long stepEpoch, int stepId)
     {
         if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+        if (linear && !disableReachValidation &&
+            !IsLinearTcpPathClearOfBase(x, y, out float minimumPathRadius))
+        {
+            lastMotionSucceeded = false;
+            lastMotionError = $"unsafe linear TCP path during {tag}: minimum base radius " +
+                              $"{minimumPathRadius:F3}m is below {BASE_EXCLUSION_RADIUS_M:F3}m";
+            Debug.LogError("[Executor] " + lastMotionError);
+            yield break;
+        }
         string cmd = linear
             ? BuildMovelLine(x, y, z, orientation, skewDeg)
             : BuildMovejLine(x, y, z, orientation, skewDeg);
@@ -1617,6 +1630,29 @@ public class JsonExecutor : MonoBehaviour
         return (x * x + y * y) < BASE_EXCLUSION_RADIUS_M * BASE_EXCLUSION_RADIUS_M;
     }
 
+    bool InsideSourceBaseExclusion(float x, float y)
+    {
+        return (x * x + y * y) <
+               SOURCE_BASE_EXCLUSION_RADIUS_M * SOURCE_BASE_EXCLUSION_RADIUS_M;
+    }
+
+    bool IsLinearTcpPathClearOfBase(float targetX, float targetY, out float minimumRadius)
+    {
+        var tcp = urListener.CartesianInfo;
+        float startX = (float)tcp.X;
+        float startY = (float)tcp.Y;
+        float dx = targetX - startX;
+        float dy = targetY - startY;
+        float lengthSquared = dx * dx + dy * dy;
+        float t = lengthSquared <= 1e-8f
+            ? 0f
+            : Mathf.Clamp01(-(startX * dx + startY * dy) / lengthSquared);
+        float nearestX = startX + t * dx;
+        float nearestY = startY + t * dy;
+        minimumRadius = Mathf.Sqrt(nearestX * nearestX + nearestY * nearestY);
+        return minimumRadius >= BASE_EXCLUSION_RADIUS_M;
+    }
+
     bool OutsideReachEnvelope(float x, float y)
     {
         return (x * x + y * y) > MAX_REACH_RADIUS_M * MAX_REACH_RADIUS_M;
@@ -1626,8 +1662,10 @@ public class JsonExecutor : MonoBehaviour
     {
         if (pos == null)
             return "horizontal";
+        // A cube is rotationally symmetric around the tool axis. Do not add a
+        // needless 90-degree wrist rotation merely because it is a source pick.
         if (pos.shape != "domino")
-            return isSource ? "vertical" : "horizontal";
+            return "horizontal";
         return pos.orientation ?? "horizontal";
     }
 
