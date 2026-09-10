@@ -723,13 +723,17 @@ public class JsonExecutor : MonoBehaviour
 
         Debug.Log($"[Executor-{tag}] step {env.step_id}: source local={sourceLocal} → target local={targetLocal}");
 
-        // 手臂夾爪 transform（用最後一個 joint；null 就無手臂動畫）
+        // 手臂夾爪 transform：優先用 RobotArm.TCP（場景裡的 RealTCP，標記夾爪
+        // 指尖實際位置）；沒指定才退回用最後一個 joint（wrist_3 的旋轉樞紐，
+        // 不是指尖，退回用這個只是保底，不是正確位置）。null 就無手臂動畫。
         Transform gripper = null;
         bool armEnabled = simAnimateArm && robotArm != null &&
                           robotArm.Transforms != null && robotArm.Transforms.Length > 0;
         if (armEnabled)
         {
-            gripper = robotArm.Transforms[robotArm.Transforms.Length - 1];
+            gripper = robotArm.TCP != null
+                ? robotArm.TCP
+                : robotArm.Transforms[robotArm.Transforms.Length - 1];
         }
 
         // 保留 cube 原始 parent (CubeContainer)，之後 restore 用
