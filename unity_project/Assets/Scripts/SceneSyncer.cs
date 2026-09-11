@@ -47,12 +47,16 @@ public class SceneSyncer : MonoBehaviour
     public float workspaceWidthM = 0.622f;       // QR1 → QR2 距離
     public float workspaceDepthM = 0.281f;       // QR1 → QR3 距離
 
-    // 手臂實際站在拿取區（supplyZoneXMax）跟放置區（targetZoneOriginX）的
-    // 交界，不是桌寬正中間、也不是 QR3 角落（確認過，QR3 只是桌面邊角的標記，
-    // 不是手臂站的點）。改算成即時算出來的屬性，不再是獨立可調的欄位，避免跟
-    // workspaceWidthM/workspaceDepthM 或 supplyZoneXMax/targetZoneOriginX
-    // 改了之後沒有一起更新、兩邊對不上時桌子偏移/歪掉的問題。
-    public float armBaseAtQrX => (supplyZoneXMax + targetZoneOriginX) / 2f;
+    [Header("手臂對齊微調（方向沒驗證過，往哪邊移要自己試；兩區交界會自動跟著算，這裡只是微調）")]
+    // armBaseAtQrX 的基準點是拿取區（supplyZoneXMax）跟放置區（targetZoneOriginX）
+    // 的交界，不是桌寬正中間、也不是 QR3 角落——這個基準會自動跟著兩個 zone 的
+    // 邊界算，不用手動同步，避免像之前那樣兩邊數字對不上時桌子偏移/歪掉。
+    // 這個 offset 欄位是拿來微調、在 Play 模式試「桌面要不要再往左/右移一點」
+    // 用的：改這一個數字就好，不用去改 Supply Zone X Max / Target Zone Origin X
+    // 本身（那兩個是拿取區/放置區的實際大小，不是拿來喬桌面位置的）。
+    public float armBaseAtQrXOffset = 0f;
+
+    public float armBaseAtQrX => (supplyZoneXMax + targetZoneOriginX) / 2f + armBaseAtQrXOffset;
     public float armBaseAtQrY => workspaceDepthM;
 
     [Header("手臂錨點（拖 UR3 底座進來；沒指定才假設本物件已站在手臂位置）")]
