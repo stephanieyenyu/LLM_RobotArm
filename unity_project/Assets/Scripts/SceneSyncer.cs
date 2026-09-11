@@ -53,6 +53,14 @@ public class SceneSyncer : MonoBehaviour
     public float armBaseAtQrX = 0.311f;   // = workspaceWidthM / 2
     public float armBaseAtQrY = 0.281f;   // = workspaceDepthM（QR3-QR4 邊）
 
+    [Header("手臂錨點（拖 UR3 底座進來；沒指定才假設本物件已站在手臂位置）")]
+    // 下面 armInWorkspace 的算法假設「這個 GameObject 自己的世界座標」就是手臂
+    // 底座的位置——但 PerceptionSync 跟 UR3 是 Hierarchy 裡兩個獨立物件，各自
+    // Inspector 手動設 Position，很容易對不上（症狀：桌面飄到手臂旁邊而不是
+    // 疊在手臂位置展開）。指定這個之後，Start() 會先把本物件的世界座標同步
+    // 成 armAnchor 的座標，不用再手動對兩個 Transform 的數字。
+    public Transform armAnchor;
+
     [Header("Workspace 視覺旋轉")]
     // 繞 Unity Y 軸轉整個 workspace（含 cubes / QR 標記 / zones）
     // 90 = 順時針 90°；只影響視覺不影響 QR→Unity 的 IK 計算
@@ -87,6 +95,9 @@ public class SceneSyncer : MonoBehaviour
 
     void Start()
     {
+        if (armAnchor != null)
+            transform.position = armAnchor.position;
+
         if (autoCreateWorkspace)
             BuildWorkspaceVisuals();
 
