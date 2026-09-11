@@ -47,14 +47,11 @@ public class SceneSyncer : MonoBehaviour
     public float workspaceWidthM = 0.622f;       // QR1 → QR2 距離
     public float workspaceDepthM = 0.281f;       // QR1 → QR3 距離
 
-    // 手臂實際站在補貨區（supplyZoneXMax）跟擺放區（targetZoneOriginX）的交
-    // 界，不是整個桌寬的正中間——手臂一邊伸進補貨區拿料、一邊伸到擺放區排列，
-    // 兩區的分界線才是手臂實際站的位置。改算成即時算出來的屬性，不再是獨立
-    // 可調的欄位：原本 armBaseAtQrX/Y 是各自手動設定的數字，跟 workspaceWidthM
-    // /workspaceDepthM 或 supplyZoneXMax/targetZoneOriginX 改了之後沒有一起
-    // 更新，兩邊對不上時桌子就會偏移/歪掉。
-    // Y 維持站在 QR3-QR4 邊（workspaceDepthM）；如果實際上手臂是站在 QR1-QR2
-    // 邊（Y=0）而不是對面那條邊，跟我說一聲，這裡再改。
+    // 手臂實際站在拿取區（supplyZoneXMax）跟放置區（targetZoneOriginX）的
+    // 交界，不是桌寬正中間、也不是 QR3 角落（確認過，QR3 只是桌面邊角的標記，
+    // 不是手臂站的點）。改算成即時算出來的屬性，不再是獨立可調的欄位，避免跟
+    // workspaceWidthM/workspaceDepthM 或 supplyZoneXMax/targetZoneOriginX
+    // 改了之後沒有一起更新、兩邊對不上時桌子偏移/歪掉的問題。
     public float armBaseAtQrX => (supplyZoneXMax + targetZoneOriginX) / 2f;
     public float armBaseAtQrY => workspaceDepthM;
 
