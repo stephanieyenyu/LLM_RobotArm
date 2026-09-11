@@ -12,16 +12,32 @@ using UnityEngine.Networking;
 //   3. 若 mode == "idle" 且上次是 executing（或首次啟動）→ GET /scene 一次，refresh 所有 cube
 //   4. 否則什麼都不做（perception 端持續在更新，但 Unity 不覆蓋顯示）
 //
-// 座標系轉換：
-//   perception 端 QR frame 是右手系（Y 是水平深度、Z 是高度）
-//   Unity 是左手系（Y 是高度）
-//   映射：QR (x, y, z) → Unity local (x, z, y)
-//         QR X (QR1→QR2)   → Unity X
-//         QR Y (QR1→QR3)   → Unity Z（水平深度）
-//         QR Z (高度)      → Unity Y（往上）
+// 座標系轉換（跟 Unity UR3 base 目前朝向對齊）：
+//   Robot/QR 是右手系 Z-up（X 前伸、Y 左、Z 上）
+//   Unity 是左手系 Y-up
+//   Mapping：Robot (X, Y, Z) → Unity (-Y, Z, X)
+//     Robot +X（前伸）→ Unity +Z
+//     Robot +Y（左）  → Unity -X
+//     Robot +Z（上）  → Unity +Y
+//   統一走 QRToUnity(qrX, qrY, qrZ) helper，不要在別的地方硬 code
 
 public class SceneSyncer : MonoBehaviour
 {
+    // ★ Robot/QR → Unity local 座標轉換（single source of truth）
+    // 呼叫端拿到 Vector3 後可再加 halfHeight 之類的 offset
+    public static Vector3 QRToUnity(float qrX, float qrY, float qrZ)
+    {
+        return new Vector3(-qrY, qrZ, qrX);
+    }
+    public static Vector3 QRToUnity(Vector3 qr) => QRToUnity(qr.x, qr.y, qr.z);
+
+    // Unity local → Robot/QR frame（反向）
+    public static Vector3 UnityToQR(float ux, float uy, float uz)
+    {
+        return new Vector3(uz, -ux, uy);
+    }
+    public static Vector3 UnityToQR(Vector3 u) => UnityToQR(u.x, u.y, u.z);
+
     [Header("Perception Server")]
     public string sceneUrl = "http://localhost:5000/scene";
     public string sceneModeUrl = "http://localhost:5000/scene/mode";
@@ -30,6 +46,17 @@ public class SceneSyncer : MonoBehaviour
     [Header("工作平面尺寸（公尺，對應真實工作台）")]
     public float workspaceWidthM = 0.622f;       // QR1 → QR2 距離
     public float workspaceDepthM = 0.281f;       // QR1 → QR3 距離
+
+    [Header("手臂 base 在 QR frame 中的位置（把 workspace 對齊到手臂）")]
+    // 預設：手臂在 QR3-QR4 邊的中點（近手臂側邊的中央）
+    // 若實際擺法不同，改這個 X/Y（QR frame 座標）
+    public float armBaseAtQrX = 0.311f;   // = workspaceWidthM / 2
+    public float armBaseAtQrY = 0.281f;   // = workspaceDepthM（QR3-QR4 邊）
+
+    [Header("Workspace 視覺旋轉")]
+    // 繞 Unity Y 軸轉整個 workspace（含 cubes / QR 標記 / zones）
+    // 90 = 順時針 90°；只影響視覺不影響 QR→Unity 的 IK 計算
+    public float workspaceYawDeg = 90f;
 
     [Header("補貨區 / 擺放區邊界（跟 PlacementPlanner 常數對齊）")]
     public float supplyZoneXMax = 0.35f;
@@ -75,40 +102,52 @@ public class SceneSyncer : MonoBehaviour
         workspaceRoot = new GameObject("Workspace").transform;
         workspaceRoot.SetParent(transform, false);
 
+        // 把整組 workspace 位移，讓 QR(armBaseAtQrX, armBaseAtQrY, 0) 對到 Unity (0,0,0)
+        // 這樣手臂（在 world 原點）視覺上就落在 QR frame 指定的位置
+        Vector3 armInWorkspace = QRToUnity(armBaseAtQrX, armBaseAtQrY, 0f);
+        workspaceRoot.localPosition = -armInWorkspace;
+
         // 工作平面（薄薄的白色 Cube 當桌板）
+        // Robot X 沿 workspaceWidthM，Y 沿 workspaceDepthM；在 Unity 是 Z 沿 width、-X 沿 depth
         GameObject plane = GameObject.CreatePrimitive(PrimitiveType.Cube);
         plane.name = "WorkspacePlane";
         plane.transform.SetParent(workspaceRoot, false);
-        plane.transform.localPosition = new Vector3(workspaceWidthM / 2f, -0.005f, workspaceDepthM / 2f);
-        plane.transform.localScale = new Vector3(workspaceWidthM, 0.01f, workspaceDepthM);
+        Vector3 planeCenter = QRToUnity(workspaceWidthM / 2f, workspaceDepthM / 2f, 0f);
+        planeCenter.y = -0.005f;
+        plane.transform.localPosition = planeCenter;
+        // Unity local scale: X 是 depth（robot Y 方向）、Z 是 width（robot X 方向）
+        plane.transform.localScale = new Vector3(workspaceDepthM, 0.01f, workspaceWidthM);
         SetColor(plane, new Color(0.92f, 0.92f, 0.92f));
 
-        // 4 個 QR 角落標記（用小色塊）
-        MakeQrMarker("QR1", new Vector3(0f, 0f, 0f), Color.red);
-        MakeQrMarker("QR2", new Vector3(workspaceWidthM, 0f, 0f), Color.green);
-        MakeQrMarker("QR3", new Vector3(0f, 0f, workspaceDepthM), Color.blue);
-        MakeQrMarker("QR4", new Vector3(workspaceWidthM, 0f, workspaceDepthM), Color.magenta);
+        // 4 個 QR 角落標記（QR frame 座標）
+        MakeQrMarker("QR1", 0f, 0f, Color.red);
+        MakeQrMarker("QR2", workspaceWidthM, 0f, Color.green);
+        MakeQrMarker("QR3", 0f, workspaceDepthM, Color.blue);
+        MakeQrMarker("QR4", workspaceWidthM, workspaceDepthM, Color.magenta);
 
         // 補貨區（藍色半透明）
         GameObject supply = GameObject.CreatePrimitive(PrimitiveType.Cube);
         supply.name = "SupplyZone";
         supply.transform.SetParent(workspaceRoot, false);
-        supply.transform.localPosition = new Vector3(supplyZoneXMax / 2f, 0.002f, workspaceDepthM / 2f);
-        supply.transform.localScale = new Vector3(supplyZoneXMax, 0.001f, workspaceDepthM);
+        Vector3 supplyCenter = QRToUnity(supplyZoneXMax / 2f, workspaceDepthM / 2f, 0f);
+        supplyCenter.y = 0.002f;
+        supply.transform.localPosition = supplyCenter;
+        supply.transform.localScale = new Vector3(workspaceDepthM, 0.001f, supplyZoneXMax);
         SetColor(supply, new Color(0.4f, 0.7f, 1f, 0.5f));
 
-        // 擺放區（黃色半透明，6×6 grid 實體邊界）
-        float targetW = gridCols * cellSize;
-        float targetD = gridRows * cellSize;
+        // 擺放區（黃色半透明，grid 實體邊界）
+        float targetW = gridCols * cellSize;  // robot X 方向
+        float targetD = gridRows * cellSize;  // robot Y 方向
         GameObject target = GameObject.CreatePrimitive(PrimitiveType.Cube);
         target.name = "TargetZone";
         target.transform.SetParent(workspaceRoot, false);
-        target.transform.localPosition = new Vector3(
+        Vector3 targetCenter = QRToUnity(
             targetZoneOriginX + (gridCols - 1) * cellSize / 2f,
-            0.002f,
-            targetZoneOriginY + (gridRows - 1) * cellSize / 2f
-        );
-        target.transform.localScale = new Vector3(targetW, 0.001f, targetD);
+            targetZoneOriginY + (gridRows - 1) * cellSize / 2f,
+            0f);
+        targetCenter.y = 0.002f;
+        target.transform.localPosition = targetCenter;
+        target.transform.localScale = new Vector3(targetD, 0.001f, targetW);
         SetColor(target, new Color(1f, 0.85f, 0.4f, 0.5f));
 
         // 積木容器
@@ -126,9 +165,9 @@ public class SceneSyncer : MonoBehaviour
     // qrPos: 感知/csharp_server 用的 QR frame (x=水平寬, y=水平深, z=高)
     public GameObject FindNearestCube(float qrX, float qrY, float qrZ, float maxDistM = 0.10f)
     {
-        // QR frame → Unity local: (x, z, y)
         float halfHeight = cubeSizeM / 2f;
-        Vector3 target = new Vector3(qrX, qrZ - halfHeight, qrY);
+        Vector3 target = QRToUnity(qrX, qrY, qrZ);
+        target.y -= halfHeight;
         GameObject best = null;
         float bestD = float.MaxValue;
         foreach (var c in currentCubes)
@@ -153,18 +192,22 @@ public class SceneSyncer : MonoBehaviour
         cube.transform.SetParent(cubeContainer, false);
         cube.transform.localScale = Vector3.one * cubeSizeM;
         float halfHeight = cubeSizeM / 2f;
-        cube.transform.localPosition = new Vector3(qrX, qrZ - halfHeight, qrY);
+        Vector3 pos = QRToUnity(qrX, qrY, qrZ);
+        pos.y -= halfHeight;
+        cube.transform.localPosition = pos;
         SetColor(cube, color);
         currentCubes.Add(cube);
         return cube;
     }
 
-    void MakeQrMarker(string name, Vector3 pos, Color color)
+    void MakeQrMarker(string name, float qrX, float qrY, Color color)
     {
         GameObject go = GameObject.CreatePrimitive(PrimitiveType.Cube);
         go.name = name;
         go.transform.SetParent(workspaceRoot, false);
-        go.transform.localPosition = new Vector3(pos.x, 0.006f, pos.z);
+        Vector3 pos = QRToUnity(qrX, qrY, 0f);
+        pos.y = 0.006f;
+        go.transform.localPosition = pos;
         go.transform.localScale = new Vector3(0.02f, 0.012f, 0.02f);
         SetColor(go, color);
     }
@@ -319,14 +362,15 @@ public class SceneSyncer : MonoBehaviour
             var go = currentCubes[i];
 
             // Scale：cube 是正方；domino 沿長軸 5cm、短軸 2.5cm
-            //   horizontal → 長軸沿 Unity X（= QR X）
-            //   vertical   → 長軸沿 Unity Z（= QR Y）
+            //   robot X 方向 → Unity +Z；robot Y 方向 → Unity -X
+            //   horizontal → 長軸沿 robot X（= Unity Z）
+            //   vertical   → 長軸沿 robot Y（= Unity X 反向；scale 只需要絕對值）
             Vector3 scale;
             if (obj.shape == "domino")
             {
                 scale = obj.orientation == "vertical"
-                    ? new Vector3(cubeSizeM, cubeSizeM, cubeSizeM * 2f)
-                    : new Vector3(cubeSizeM * 2f, cubeSizeM, cubeSizeM);
+                    ? new Vector3(cubeSizeM * 2f, cubeSizeM, cubeSizeM)
+                    : new Vector3(cubeSizeM, cubeSizeM, cubeSizeM * 2f);
             }
             else
             {
@@ -334,14 +378,12 @@ public class SceneSyncer : MonoBehaviour
             }
             go.transform.localScale = scale;
 
-            // QR frame → Unity local
-            //   QR X = Unity X（水平寬度）
-            //   QR Y = Unity Z（水平深度）
-            //   QR Z = Unity Y（高度）
+            // QR frame → Unity local（統一走 helper）
             //   物件中心 Y = position.z - halfHeight（position.z 是頂面）
             float halfHeight = cubeSizeM / 2f;    // domino 高度也是 2.5 cm
-            float cy = obj.position.z - halfHeight;
-            go.transform.localPosition = new Vector3(obj.position.x, cy, obj.position.y);
+            Vector3 unityPos = QRToUnity(obj.position.x, obj.position.y, obj.position.z);
+            unityPos.y -= halfHeight;
+            go.transform.localPosition = unityPos;
 
             // 顏色依 name 判斷
             Color color = Color.gray;

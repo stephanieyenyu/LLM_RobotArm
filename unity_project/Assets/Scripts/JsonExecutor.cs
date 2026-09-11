@@ -96,7 +96,23 @@ public class JsonExecutor : MonoBehaviour
     public float simHoldSec = 0.7f;          // 每段動作之間停頓秒數（讓觀察更清楚）
     public bool simAnimateArm = true;        // 是否讓虛擬手臂跟著動
 
-    [Header("模擬手臂 - IK 參數")]
+    [Header("模擬手臂 - Canonical Kinematics（UR3e 官方 DH）")]
+    // ★ 建議開啟：改用 UR3eKinematics 算 IK，才能當 pre-flight verifier
+    //   若手臂視覺不對，需要先做 RobotArm 的 RotationAxis/Offsets 校準（Task 12）
+    public bool useCanonicalKinematics = false;
+    // Preview 前先掃全 batch，任一步不可達就 abort，不動實機
+    public bool verifyBatchReachability = true;
+    // TCP hover 高度（cube 頂端上方 m）
+    public float simGripperHoverM = 0.08f;
+    // TCP 接觸高度（cube 頂端加這個）— pick/place 下降時用
+    public float simGripperContactM = 0.005f;
+    // Gripper 朝下的 TCP rotation vector（URScript axis-angle）
+    // 預設 (π,0,0) = TCP z 軸朝下（工具指向地面）
+    public Vector3 simGripperDownRotVec = new Vector3(Mathf.PI, 0f, 0f);
+    // IK 起始參考 q（度）；連續動作會以上次解為參考維持分支連續性
+    public float[] simIKReferenceDeg = new float[] { 0f, -90f, 0f, -90f, 0f, 0f };
+
+    [Header("模擬手臂 - IK 參數（舊版 2D 平面 IK，useCanonicalKinematics=false 才用）")]
     public bool simUseAutoReach = true;
     public float simArmL1 = 0.244f;
     public float simArmL2 = 0.213f;
@@ -452,6 +468,21 @@ public class JsonExecutor : MonoBehaviour
     {
         Debug.Log($"[Executor] 收到 batch {batch.batch_id}: {batch.steps.Count} steps — {batch.comment}");
 
+        // ★ Pre-flight kinematics 檢查：任一步不可達/奇點就 abort，不動實機
+        if (useCanonicalKinematics && verifyBatchReachability)
+        {
+            var failures = VerifyBatchReachability(batch);
+            if (failures.Count > 0)
+            {
+                string summary = $"batch {batch.batch_id} 有 {failures.Count} 個不可達或奇點位置，abort：\n  - "
+                                 + string.Join("\n  - ", failures);
+                Debug.LogError($"[Executor-precheck] {summary}");
+                WriteStepDone(batch.batch_id, false, summary, 0f);
+                yield break;
+            }
+            Debug.Log($"[Executor-precheck] ✓ batch {batch.batch_id} 全部 {batch.steps.Count} steps 通過 UR3e kinematics 檢查");
+        }
+
         if (!simulationOnly)
         {
             EnsureUrConnectionStarted();
@@ -626,6 +657,18 @@ public class JsonExecutor : MonoBehaviour
     float[] BuildReachPoseForQR(float qrX, float qrY, float qrZ = 0.025f, float hoverOverride = -1f)
     {
         float baseYawDeg = ComputeBaseYawDegForQR(qrX, qrY);
+
+        // Canonical UR3e kinematics 分支（★ 建議走這條）
+        if (useCanonicalKinematics)
+        {
+            bool hoverAbove = hoverOverride < 0f;
+            if (TryBuildKinematicsPose(qrX, qrY, qrZ, hoverAbove, out float[] kinJoints, out string kinErr))
+                return kinJoints;
+            Debug.LogError($"[Executor-sim] Canonical IK failed for QR ({qrX:F3},{qrY:F3},{qrZ:F3}): {kinErr}");
+            // fallback: 退回舊 heuristic，讓動畫至少能動；但 batch 檢查會在上游擋住
+            return BuildReachPose(baseYawDeg);
+        }
+
         if (!simUseAutoReach)
             return BuildReachPose(baseYawDeg);
 
@@ -679,6 +722,102 @@ public class JsonExecutor : MonoBehaviour
         };
     }
 
+    // ============================================================
+    // Canonical UR3e Kinematics 分支
+    // ============================================================
+    // 上次 IK 解，作為下一步的參考 q（維持分支連續性）
+    private double[] _lastIKJointsRad = null;
+
+    // 目標：TCP 到 (QR frame qrX, qrY, cube 頂端 qrZ + hover 高度)，gripper 朝下
+    // 回傳 6 個 joint 角度（度，UR 順序 base/shoulder/elbow/wrist1/wrist2/wrist3）
+    bool TryBuildKinematicsPose(float qrX, float qrY, float qrZ, bool hoverAbove,
+                                 out float[] jointsDeg, out string error)
+    {
+        // QR frame → UR base frame（保留 simFlipX/Y 相容）
+        double urX = QR1_X + qrX;
+        double urY = QR1_Y + qrY;
+        if (simFlipX) urX = -urX;
+        if (simFlipY) urY = -urY;
+        double urZ = QR1_Z + qrZ + (hoverAbove ? simGripperHoverM : simGripperContactM);
+
+        var target = new UR3eKinematics.Pose
+        {
+            x = urX, y = urY, z = urZ,
+            rx = simGripperDownRotVec.x,
+            ry = simGripperDownRotVec.y,
+            rz = simGripperDownRotVec.z
+        };
+
+        double[] refQ = _lastIKJointsRad ?? DegArrayToRad(simIKReferenceDeg);
+        var sol = UR3eKinematics.IKNearest(target, refQ);
+        if (!sol.ok)
+        {
+            jointsDeg = null;
+            error = $"{sol.error} — {sol.message}";
+            return false;
+        }
+        _lastIKJointsRad = sol.q;
+        jointsDeg = new float[6];
+        for (int i = 0; i < 6; i++) jointsDeg[i] = (float)(sol.q[i] * 180.0 / System.Math.PI);
+        error = null;
+        return true;
+    }
+
+    static double[] DegArrayToRad(float[] deg)
+    {
+        var r = new double[6];
+        for (int i = 0; i < System.Math.Min(6, deg.Length); i++) r[i] = deg[i] * System.Math.PI / 180.0;
+        return r;
+    }
+
+    // Pre-flight：掃全 batch，任一步 source/target 不可達或奇點就回報
+    // 回傳 unreachable step 清單（空 = 全部可達）
+    List<string> VerifyBatchReachability(BatchEnvelope batch)
+    {
+        var failures = new List<string>();
+        if (batch == null || batch.steps == null) return failures;
+
+        // 用暫時的 reference q，不影響實際執行時的 continuity
+        double[] refQ = _lastIKJointsRad != null
+            ? (double[])_lastIKJointsRad.Clone()
+            : DegArrayToRad(simIKReferenceDeg);
+
+        foreach (var env in batch.steps)
+        {
+            if (env == null || env.done) continue;
+            if (env.source_position == null || env.target_position == null) continue;
+
+            foreach (var (label, pos, hover) in new[]
+            {
+                ($"step {env.step_id} source hover",  env.source_position, true),
+                ($"step {env.step_id} source contact",env.source_position, false),
+                ($"step {env.step_id} target hover",  env.target_position, true),
+                ($"step {env.step_id} target contact",env.target_position, false),
+            })
+            {
+                double urX = QR1_X + pos.x; double urY = QR1_Y + pos.y;
+                if (simFlipX) urX = -urX;
+                if (simFlipY) urY = -urY;
+                double urZ = QR1_Z + pos.z + (hover ? simGripperHoverM : simGripperContactM);
+                var tgt = new UR3eKinematics.Pose
+                {
+                    x = urX, y = urY, z = urZ,
+                    rx = simGripperDownRotVec.x, ry = simGripperDownRotVec.y, rz = simGripperDownRotVec.z
+                };
+                var sol = UR3eKinematics.IKNearest(tgt, refQ);
+                if (!sol.ok)
+                {
+                    failures.Add($"{label} @ UR({urX:F3},{urY:F3},{urZ:F3}) → {sol.error}: {sol.message}");
+                }
+                else
+                {
+                    refQ = sol.q; // 沿路更新，讓下一步的參考 q 有連續性
+                }
+            }
+        }
+        return failures;
+    }
+
     IEnumerator ExecuteStepSimulated(StepEnvelope env)
     {
         DateTime t0 = DateTime.UtcNow;
@@ -718,12 +857,15 @@ public class JsonExecutor : MonoBehaviour
         }
         cube.transform.localScale = SimScaleFor(env.source_position);
 
-        // QR frame → Unity local (X, Z, Y)，加上 Inspector 放置微調
+        // QR frame → Unity local（統一走 SceneSyncer.QRToUnity）
+        // 加上 Inspector 放置微調（simPlaceOffsetX/Y/Z 也視為 QR frame 的偏移）
         float halfHeight = sceneSyncer.cubeSizeM / 2f;
         Vector3 sourceLocal = cube.transform.localPosition;
-        Vector3 targetLocal = new Vector3(env.target_position.x + simPlaceOffsetX,
-                                          env.target_position.z - halfHeight + simPlaceOffsetZ,
-                                          env.target_position.y + simPlaceOffsetY);
+        Vector3 targetLocal = SceneSyncer.QRToUnity(
+            env.target_position.x + simPlaceOffsetX,
+            env.target_position.y + simPlaceOffsetY,
+            env.target_position.z + simPlaceOffsetZ);
+        targetLocal.y -= halfHeight;
         float hoverY = Mathf.Max(sourceLocal.y, targetLocal.y) + 0.08f;
         Vector3 sourceHover = new Vector3(sourceLocal.x, hoverY, sourceLocal.z);
         Vector3 targetHover = new Vector3(targetLocal.x, hoverY, targetLocal.z);
@@ -875,10 +1017,10 @@ public class JsonExecutor : MonoBehaviour
 
             float halfHeight = sceneSyncer.cubeSizeM / 2f;
             cube.transform.localScale = SimScaleFor(env.target_position);
-            cube.transform.localPosition = new Vector3(
-                env.target_position.x,
-                env.target_position.z - halfHeight,
-                env.target_position.y);
+            Vector3 previewPos = SceneSyncer.QRToUnity(
+                env.target_position.x, env.target_position.y, env.target_position.z);
+            previewPos.y -= halfHeight;
+            cube.transform.localPosition = previewPos;
             cube.name = $"preview_step{env.step_id}";
             previewed++;
         }
@@ -968,9 +1110,10 @@ public class JsonExecutor : MonoBehaviour
         float size = sceneSyncer.cubeSizeM;
         if (pos != null && pos.shape == "domino")
         {
+            // domino 長軸：horizontal 沿 robot X（= Unity +Z）；vertical 沿 robot Y（= Unity -X）
             return pos.orientation == "vertical"
-                ? new Vector3(size, size, size * 2f)
-                : new Vector3(size * 2f, size, size);
+                ? new Vector3(size * 2f, size, size)
+                : new Vector3(size, size, size * 2f);
         }
         return Vector3.one * size;
     }

@@ -187,6 +187,9 @@ MonoBehaviour:
   pollIntervalSec: 0.3
   workspaceWidthM: 0.85
   workspaceDepthM: 0.375
+  armBaseAtQrX: 0.311
+  armBaseAtQrY: 0.281
+  workspaceYawDeg: 90
   supplyZoneXMax: 0.35
   targetZoneOriginX: 0.49
   targetZoneOriginY: 0.04
@@ -315,6 +318,18 @@ MonoBehaviour:
   simMoveSecPerStep: 1.2
   simHoldSec: 0.35
   simAnimateArm: 1
+  useCanonicalKinematics: 0
+  verifyBatchReachability: 1
+  simGripperHoverM: 0.08
+  simGripperContactM: 0.005
+  simGripperDownRotVec: {x: 3.1415927, y: 0, z: 0}
+  simIKReferenceDeg:
+  - 0
+  - -90
+  - 0
+  - -90
+  - 0
+  - 0
   simUseAutoReach: 1
   simArmL1: 0.244
   simArmL2: 0.213
@@ -362,7 +377,6 @@ MonoBehaviour:
   - -1.5708
   - 1.5708
   - 0
-  disableReachValidation: 0
 --- !u!1001 &1427722103
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -621,6 +635,59 @@ Transform:
   m_CorrespondingSourceObject: {fileID: 6490627870361726774, guid: b1afbb00f8903e848baeb69f6a494bb7, type: 3}
   m_PrefabInstance: {fileID: 1427722103}
   m_PrefabAsset: {fileID: 0}
+--- !u!1 &1806859843
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1806859845}
+  - component: {fileID: 1806859844}
+  m_Layer: 0
+  m_Name: KinematicsTester
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1806859844
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1806859843}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 6bb25dfd14d1f8b4ab2873c1e89153c2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  robotArm: {fileID: 834001153}
+  base_deg: 0
+  shoulder_deg: 0
+  elbow_deg: 0
+  wrist1_deg: 0
+  wrist2_deg: 0
+  wrist3_deg: 0
+  lastKinematicsInfo: "Driven arm to [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]\xB0\nExpected
+    TCP (UR base frame):\n  x = 0.0000 m\n  y = -0.2232 m\n  z = 0.6940 m"
+--- !u!4 &1806859845
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1806859843}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0.38920015, y: 0.13455588, z: 0.42811385}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1860561135
 GameObject:
   m_ObjectHideFlags: 0
@@ -787,3 +854,4 @@ SceneRoots:
   - {fileID: 1993866152}
   - {fileID: 447807164}
   - {fileID: 1427722103}
+  - {fileID: 1806859845}

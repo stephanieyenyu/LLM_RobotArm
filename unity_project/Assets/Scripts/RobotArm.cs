@@ -36,11 +36,15 @@ public class RobotArm : MonoBehaviour
 
     public TextAsset GCode;
 
-    // Transformationsmatrix, die das Roboterkoordinatensystem in das Unity-Koordinatensystem umwandelt
+    // Robot base frame → Unity local mapping
+    //   Robot +X → Unity +Z
+    //   Robot +Y → Unity -X
+    //   Robot +Z → Unity +Y
+    // 跟 SceneSyncer.QRToUnity 對齊；Unity UR3 GameObject 保持 rotation = (0,0,0)
     public static readonly Matrix4x4 Robot2Unity = new Matrix4x4(
-        new Vector4(1, 0, 0, 0),
-        new Vector4(0, 0, 1, 0),
-        new Vector4(0, 1, 0, 0),
+        new Vector4(0, 0, 1, 0),   // Robot X 單位向量 → Unity +Z
+        new Vector4(-1, 0, 0, 0),  // Robot Y 單位向量 → Unity -X
+        new Vector4(0, 1, 0, 0),   // Robot Z 單位向量 → Unity +Y
         new Vector4(0, 0, 0, 1));
 
     void Start()

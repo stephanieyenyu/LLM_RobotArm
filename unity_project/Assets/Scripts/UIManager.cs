@@ -274,8 +274,12 @@ public class UIManager : MonoBehaviour
         {
             if (cube == null) continue;
             Vector3 p = cube.transform.localPosition;
-            float qrX = p.x;
-            float qrY = p.z;                    // Unity Z → QR Y
+            // Unity → QR frame（跟 SceneSyncer.QRToUnity 對稱）
+            //   Unity  Z →  QR X
+            //   Unity -X →  QR Y
+            //   Unity  Y →  QR Z
+            float qrX = p.z;
+            float qrY = -p.x;
             float qrZ = p.y + halfHeight;       // 頂面高度
 
             string colorName = cube.name.Contains("black") ? "black" : "yellow";
