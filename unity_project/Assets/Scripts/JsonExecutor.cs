@@ -142,6 +142,11 @@ public class JsonExecutor : MonoBehaviour
     public float simYawOffsetDeg = 0f;
     public bool simFlipX = false;
     public bool simFlipY = false;
+    // 桌面座標系跟手臂方位對不上時，用這個轉正——以順時針為正（90 = 順時針轉
+    // 90 度）。只影響模擬用的座標映射（這幾個函式，見 ApplySimWorkspaceRotation），
+    // 不影響 QR1_X/QR1_Y 本身，也不影響接實機那條路徑的座標計算。方向猜錯的話
+    // 直接改成 -90 試試看，不用改程式碼邏輯。
+    public float simWorkspaceRotationDeg = 90f;
 
     [Header("模擬手臂 - 前伸姿態（度；順序 base/shoulder/elbow/wrist_1/wrist_2/wrist_3）")]
     // 到達 source/target 上方時的姿態，base 會被動態覆蓋成計算的 yaw
@@ -675,8 +680,7 @@ public class JsonExecutor : MonoBehaviour
         // 水平距離
         float urX = QR1_X + qrX;
         float urY = QR1_Y + qrY;
-        if (simFlipX) urX = -urX;
-        if (simFlipY) urY = -urY;
+        ApplySimWorkspaceRotation(ref urX, ref urY);
         float r = Mathf.Sqrt(urX * urX + urY * urY);
 
         // 垂直距離：目標 z 固定用 simFixedArmZ（不依 cube 高度變化）
@@ -736,8 +740,7 @@ public class JsonExecutor : MonoBehaviour
         // QR frame → UR base frame（保留 simFlipX/Y 相容）
         double urX = QR1_X + qrX;
         double urY = QR1_Y + qrY;
-        if (simFlipX) urX = -urX;
-        if (simFlipY) urY = -urY;
+        ApplySimWorkspaceRotation(ref urX, ref urY);
         double urZ = QR1_Z + qrZ + (hoverAbove ? simGripperHoverM : simGripperContactM);
 
         var target = new UR3eKinematics.Pose
@@ -796,8 +799,7 @@ public class JsonExecutor : MonoBehaviour
             })
             {
                 double urX = QR1_X + pos.x; double urY = QR1_Y + pos.y;
-                if (simFlipX) urX = -urX;
-                if (simFlipY) urY = -urY;
+                ApplySimWorkspaceRotation(ref urX, ref urY);
                 double urZ = QR1_Z + pos.z + (hover ? simGripperHoverM : simGripperContactM);
                 var tgt = new UR3eKinematics.Pose
                 {
@@ -955,12 +957,33 @@ public class JsonExecutor : MonoBehaviour
     {
         float urX = QR1_X + qrX;
         float urY = QR1_Y + qrY;
-        if (simFlipX) urX = -urX;
-        if (simFlipY) urY = -urY;
+        ApplySimWorkspaceRotation(ref urX, ref urY);
         float yawRad = Mathf.Atan2(urY, urX);
         float yawDeg = yawRad * Mathf.Rad2Deg;
         if (simYawInvert) yawDeg = -yawDeg;
         return yawDeg + simYawOffsetDeg;
+    }
+
+    // 桌面座標系跟手臂方位對齊用：先套 simFlipX/Y（鏡射），再套
+    // simWorkspaceRotationDeg（順時針旋轉，度）。只給模擬用的座標映射呼叫，
+    // 不影響 QR1_X/QR1_Y 本身，也不影響接實機那條路徑。
+    void ApplySimWorkspaceRotation(ref float urX, ref float urY)
+    {
+        if (simFlipX) urX = -urX;
+        if (simFlipY) urY = -urY;
+        if (simWorkspaceRotationDeg == 0f) return;
+        float rad = simWorkspaceRotationDeg * Mathf.Deg2Rad;
+        float cos = Mathf.Cos(rad), sin = Mathf.Sin(rad);
+        float rotX = urX * cos + urY * sin;
+        float rotY = -urX * sin + urY * cos;
+        urX = rotX; urY = rotY;
+    }
+
+    void ApplySimWorkspaceRotation(ref double urX, ref double urY)
+    {
+        float fx = (float)urX, fy = (float)urY;
+        ApplySimWorkspaceRotation(ref fx, ref fy);
+        urX = fx; urY = fy;
     }
 
     // 將 robotArm.Angles 從目前值平滑插值到 targetDeg
