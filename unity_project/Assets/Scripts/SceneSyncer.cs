@@ -47,11 +47,14 @@ public class SceneSyncer : MonoBehaviour
     public float workspaceWidthM = 0.622f;       // QR1 → QR2 距離
     public float workspaceDepthM = 0.281f;       // QR1 → QR3 距離
 
-    [Header("手臂 base 在 QR frame 中的位置（把 workspace 對齊到手臂）")]
-    // 預設：手臂在 QR3-QR4 邊的中點（近手臂側邊的中央）
-    // 若實際擺法不同，改這個 X/Y（QR frame 座標）
-    public float armBaseAtQrX = 0.311f;   // = workspaceWidthM / 2
-    public float armBaseAtQrY = 0.281f;   // = workspaceDepthM（QR3-QR4 邊）
+    // 手臂固定站在 QR3-QR4 邊的中點（近手臂側邊的中央）。改算成即時算出來的
+    // 屬性，不再是獨立可調的欄位——原本 armBaseAtQrX/Y 是各自手動設定的數字，
+    // 跟 workspaceWidthM/workspaceDepthM 改了之後沒有一起更新，兩邊對不上時
+    // 桌子就會偏移/歪掉（例如寬度改成 0.85 但這裡還停在舊寬度一半的 0.311）。
+    // 如果手臂實際不在這條邊的中點，之後要加需求再另外處理，不要在這裡各自
+    // 存一份容易漂移的數字。
+    public float armBaseAtQrX => workspaceWidthM / 2f;
+    public float armBaseAtQrY => workspaceDepthM;
 
     [Header("手臂錨點（拖 UR3 底座進來；沒指定才假設本物件已站在手臂位置）")]
     // 下面 armInWorkspace 的算法假設「這個 GameObject 自己的世界座標」就是手臂
