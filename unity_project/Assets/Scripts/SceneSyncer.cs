@@ -107,6 +107,12 @@ public class SceneSyncer : MonoBehaviour
         Vector3 armInWorkspace = QRToUnity(armBaseAtQrX, armBaseAtQrY, 0f);
         workspaceRoot.localPosition = -armInWorkspace;
 
+        // workspaceYawDeg 之前只宣告沒套用，桌面方向永遠沒轉到，紅色 QR1
+        // 標記才會對不上手臂方位。繞 workspaceRoot 自己的原點（就是上面設定的
+        // 手臂位置）轉，只影響視覺（plane/QR 標記/zones/cubes 都是它的子物件，
+        // 一起轉），不影響 QRToUnity 本身、也不影響 JsonExecutor 那邊的 IK 計算。
+        workspaceRoot.localRotation = Quaternion.Euler(0f, workspaceYawDeg, 0f);
+
         // 工作平面（薄薄的白色 Cube 當桌板）
         // Robot X 沿 workspaceWidthM，Y 沿 workspaceDepthM；在 Unity 是 Z 沿 width、-X 沿 depth
         GameObject plane = GameObject.CreatePrimitive(PrimitiveType.Cube);
