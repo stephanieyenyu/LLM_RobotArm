@@ -43,6 +43,8 @@ public class SyncGripper : MonoBehaviour
     private bool lastGripClosed = false;           // 用來偵測 grip 邊緣
     private GameObject heldCube;                   // 目前被夾住的 cube（未夾時為 null）
     private Transform heldCubeOriginalParent;      // 放開時要還回去的 parent
+    private bool previewOverrideActive = false;
+    private bool previewGripClosed = false;
 
     // grasp 期間持續嘗試靠近 → 抓：JsonExecutor 的 URScript 每一步是獨立 program，
     // 會中斷前一個 movej，所以 grasp 信號觸發時 TCP 常常還沒真的到 cube 位置。
@@ -67,10 +69,12 @@ public class SyncGripper : MonoBehaviour
         if (RobotArm.FreezeVisualFeedback) return;
 
         // 目標開合狀態：讀 RobotArm 的 Outputs（True = 夾住；False = 張開）
-        bool targetClosed = robotArm != null
-            && robotArm.Outputs != null
-            && digitalOutputIndex < robotArm.Outputs.Length
-            && robotArm.Outputs[digitalOutputIndex];
+        bool targetClosed = previewOverrideActive
+            ? previewGripClosed
+            : robotArm != null
+              && robotArm.Outputs != null
+              && digitalOutputIndex < robotArm.Outputs.Length
+              && robotArm.Outputs[digitalOutputIndex];
 
         // ---- 手指開合動畫 ----
         float targetOffset = targetClosed ? closedOffset : openOffset;
@@ -78,6 +82,15 @@ public class SyncGripper : MonoBehaviour
 
         leftFinger.localPosition = leftInitialPos + new Vector3(-currentOffset + openOffset, 0f, 0f);
         rightFinger.localPosition = rightInitialPos + new Vector3(currentOffset - openOffset, 0f, 0f);
+
+        // JsonExecutor owns object parenting during deterministic batch preview.
+        // Here we only mirror the real gripper fingers, otherwise this component
+        // and the preview coroutine could both attach/release the same object.
+        if (previewOverrideActive)
+        {
+            lastGripClosed = targetClosed;
+            return;
+        }
 
         // ---- 虛擬夾取狀態機 ----
         // 邊緣：False→True 進入 wantingToGrab；True→False 放開
@@ -117,6 +130,19 @@ public class SyncGripper : MonoBehaviour
                 wantingToGrab = false;
             }
         }
+    }
+
+    public void SetPreviewGrip(bool closed)
+    {
+        previewOverrideActive = true;
+        previewGripClosed = closed;
+    }
+
+    public void ClearPreviewGripOverride()
+    {
+        previewGripClosed = false;
+        previewOverrideActive = false;
+        lastGripClosed = false;
     }
 
     // Timeout 時印出最近 cube 距離，方便判斷 threshold 要不要調

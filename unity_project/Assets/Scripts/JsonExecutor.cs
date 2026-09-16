@@ -165,6 +165,12 @@ public class JsonExecutor : MonoBehaviour
     public bool freezeUnityRobotDuringRealBatch = true;
     public float placeDescendExtraZ = 0f;
 
+    [Header("預演 / 實機共用 movej 軌跡")]
+    public bool useSharedMovejTrajectory = true;
+    [Range(0.5f, 5f)] public float trajectoryCollisionSampleDeg = 2f;
+    public float sharedMovejAcceleration = 0.35f;
+    public float sharedMovejVelocity = 0.45f;
+
     [Header("實機夾取校正（只影響 source，不影響放置矩陣）")]
     public float pickOffsetX = -0.002f;
     public float pickOffsetY = 0.002f;
@@ -187,7 +193,7 @@ public class JsonExecutor : MonoBehaviour
     // private const float SKEW_SIGN = 1f;
     // Reject TCP targets too close to the base axis. Reaching into this cylinder
     // requires a tightly folded arm and can make adjacent UR3e links collide.
-    private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
+    private const float BASE_EXCLUSION_RADIUS_M = 0.14f;
     // Picking needs more clearance than placing because the source-side tool
     // orientation and attached gripper can fold the wrist/forearm toward the base.
     private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.23f;
@@ -197,7 +203,7 @@ public class JsonExecutor : MonoBehaviour
     private const float BASE_DETOUR_MAX_ANGLE_STEP_DEG = 25f;
     // Avoid poses that make the UR3e almost fully extend. Those IK solutions are
     // fragile and can trigger a protective stop before the TCP reaches the block.
-    private const float MAX_REACH_RADIUS_M = 0.42f;
+    private const float MAX_REACH_RADIUS_M = 0.45f;
     // Do not advance merely because a fixed delay elapsed.  Every motion is
     // confirmed against the UR secondary-interface feedback first.
     private const float MOTION_START_GRACE_SEC = 0.35f;
@@ -230,6 +236,18 @@ public class JsonExecutor : MonoBehaviour
     private bool lastStepReportedSuccess;
     private bool safetyRecoverySucceeded;
     private long executionEpoch;
+
+    class PlannedJointAction
+    {
+        public string function;
+        public readonly List<double[]> targets = new List<double[]>();
+        public float seconds;
+    }
+
+    private readonly Dictionary<int, List<PlannedJointAction>> sharedTrajectory =
+        new Dictionary<int, List<PlannedJointAction>>();
+    private readonly List<double[]> sharedFinalTrajectory = new List<double[]>();
+    private double[] sharedTrajectoryStartQ;
 
     void Awake()
     {
@@ -472,8 +490,29 @@ public class JsonExecutor : MonoBehaviour
     {
         Debug.Log($"[Executor] 收到 batch {batch.batch_id}: {batch.steps.Count} steps — {batch.comment}");
 
+        if (useSharedMovejTrajectory)
+        {
+            if (!useReadyPose || readyJointsRad == null || readyJointsRad.Length != 6)
+            {
+                WriteStepDone(batch.batch_id, false,
+                    "shared movej trajectory requires a calibrated 6-axis Ready pose", 0f);
+                yield break;
+            }
+            if (robotArm == null) robotArm = FindObjectOfType<RobotArm>();
+            double[] startQ = useReadyPose && readyJointsRad != null && readyJointsRad.Length == 6
+                ? System.Array.ConvertAll(readyJointsRad, value => (double)value)
+                : DegArrayToRad(simIKReferenceDeg);
+            if (!BuildSharedTrajectory(batch, startQ, out string trajectoryError))
+            {
+                string message = $"shared movej trajectory rejected before preview: {trajectoryError}";
+                Debug.LogError("[Executor-shared] " + message);
+                WriteStepDone(batch.batch_id, false, message, 0f);
+                yield break;
+            }
+        }
+
         // ★ Pre-flight kinematics 檢查：任一步不可達/奇點就 abort，不動實機
-        if (useCanonicalKinematics && verifyBatchReachability)
+        if (!useSharedMovejTrajectory && useCanonicalKinematics && verifyBatchReachability)
         {
             var failures = VerifyBatchReachability(batch);
             if (failures.Count > 0)
@@ -589,6 +628,31 @@ public class JsonExecutor : MonoBehaviour
 
         if (!simulationOnly)
         {
+            if (useSharedMovejTrajectory)
+            {
+                currentStepId = batch.batch_id;
+                long finalEpoch = ++executionEpoch;
+                for (int i = 0; i < sharedFinalTrajectory.Count; i++)
+                {
+                    yield return SendExplicitJointTarget(sharedFinalTrajectory[i],
+                        $"batch final shared {i + 1}/{sharedFinalTrajectory.Count}",
+                        finalEpoch, batch.batch_id);
+                    if (!lastMotionSucceeded)
+                    {
+                        WriteStepDone(batch.batch_id, false,
+                            lastMotionError ?? "UR final shared trajectory failed", 0f);
+                        RobotArm.FreezeVisualFeedback = false;
+                        yield return StartCoroutine(SetPerceptionMode("idle"));
+                        currentStepId = -1;
+                        yield break;
+                    }
+                }
+                currentStepId = -1;
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                yield return new WaitForSeconds(1.5f);
+            }
+            else
+            {
             currentStepId = batch.batch_id;
             long finalLiftEpoch = ++executionEpoch;
             yield return SendCurrentTcpLiftToTravelHeight(
@@ -636,6 +700,7 @@ public class JsonExecutor : MonoBehaviour
             currentStepId = -1;
             yield return StartCoroutine(SetPerceptionMode("idle"));
             yield return new WaitForSeconds(1.5f);
+            }
         }
 
         currentStepId = batch.batch_id;
@@ -779,6 +844,332 @@ public class JsonExecutor : MonoBehaviour
         var r = new double[6];
         for (int i = 0; i < System.Math.Min(6, deg.Length); i++) r[i] = deg[i] * System.Math.PI / 180.0;
         return r;
+    }
+
+    bool BuildSharedTrajectory(BatchEnvelope batch, double[] startQ, out string error)
+    {
+        sharedTrajectory.Clear();
+        sharedFinalTrajectory.Clear();
+        sharedTrajectoryStartQ = (double[])startQ.Clone();
+        double[] reference = (double[])startQ.Clone();
+        UR3eKinematics.toolOffsetZ = robotArm != null ? robotArm.toolOffsetZ : 0.0;
+
+        foreach (var env in batch.steps)
+        {
+            if (env == null || env.done) continue;
+            var planned = new List<PlannedJointAction>();
+            if (env.action_sequence == null)
+            {
+                error = $"step {env.step_id} has no action_sequence";
+                return false;
+            }
+
+            bool holding = false;
+            for (int actionIndex = 0; actionIndex < env.action_sequence.Count; actionIndex++)
+            {
+                var action = env.action_sequence[actionIndex];
+                var pa = new PlannedJointAction
+                {
+                    function = action.function,
+                    seconds = Mathf.Clamp(action.seconds > 0f ? action.seconds : 0.5f, 0.1f, 3f)
+                };
+
+                bool source = action.location == "source";
+                NamedPosition pos = source ? env.source_position : env.target_position;
+                if (pos == null && action.function != "wait" && action.function != "go_home")
+                {
+                    error = $"step {env.step_id} action {actionIndex + 1} lacks position";
+                    return false;
+                }
+
+                float x = pos == null ? 0f : QR1_X + pos.x + (source ? pickOffsetX : 0f);
+                float y = pos == null ? 0f : QR1_Y + pos.y + (source ? pickOffsetY : 0f);
+                float z = pos == null ? 0f : QR1_Z + pos.z + Z_CORRECTION;
+                float height = Mathf.Clamp(action.height_m > 0f ? action.height_m : SAFE_Z_OFFSET, 0.05f, 0.15f);
+                string orientation = pos == null ? "horizontal" : EffectiveOrientation(pos, source);
+
+                if (action.function == "move_above")
+                {
+                    var current = UR3eKinematics.FKPose(reference);
+                    if (!PlanMoveAbove(pa, ref reference, current, x, y, z + height,
+                            orientation, out error))
+                    {
+                        error = $"step {env.step_id} action {actionIndex + 1}: {error}";
+                        return false;
+                    }
+                }
+                else if (action.function == "descend")
+                {
+                    if (!source && holding) z += Mathf.Max(0f, placeDescendExtraZ);
+                    if (!PlanJointPose(pa, ref reference, x, y, z, orientation, out error))
+                    {
+                        error = $"step {env.step_id} action {actionIndex + 1}: {error}";
+                        return false;
+                    }
+                }
+                else if (action.function == "lift")
+                {
+                    if (!PlanJointPose(pa, ref reference, x, y, z + height, orientation, out error))
+                    {
+                        error = $"step {env.step_id} action {actionIndex + 1}: {error}";
+                        return false;
+                    }
+                }
+                else if (action.function == "go_home")
+                {
+                    double[] home = { -1.5708, -1.5708, 0.0, -1.5708, 0.0, 0.0 };
+                    if (!ValidateJointTransition(reference, home, out error, allowSingularEnd: true))
+                    {
+                        error = $"step {env.step_id} action {actionIndex + 1}: {error}";
+                        return false;
+                    }
+                    pa.targets.Add(home);
+                    reference = (double[])home.Clone();
+                }
+
+                if (action.function == "grasp") holding = true;
+                if (action.function == "release") holding = false;
+                planned.Add(pa);
+            }
+            sharedTrajectory[env.step_id] = planned;
+        }
+
+        // The old executor returned through Ready and Home after the batch. Plan
+        // and validate that return too so preview and hardware end with the same
+        // motions rather than appending unpreviewed commands.
+        double[] calibratedReady = System.Array.ConvertAll(readyJointsRad, value => (double)value);
+        // The fixed calibrated Ready joints may be on the opposite elbow IK
+        // branch from the final pick/place pose. A direct movej interpolation
+        // would then have to cross q3=0/PI and trip the elbow singularity gate.
+        // Preserve the calibrated Ready TCP pose, but solve it from the current
+        // branch so preview and hardware can return without changing branches.
+        var readyPose = UR3eKinematics.FKPose(calibratedReady);
+        var readySolution = UR3eKinematics.IKNearest(readyPose, reference);
+        if (!readySolution.ok)
+        {
+            error = $"final Ready IK {readySolution.error}: {readySolution.message}";
+            return false;
+        }
+        double[] ready = readySolution.q;
+        if (!ValidateJointTransition(reference, ready, out error, allowSingularEnd: false))
+        {
+            error = "final Ready transition: " + error;
+            return false;
+        }
+        sharedFinalTrajectory.Add((double[])ready.Clone());
+        reference = ready;
+        double[] homeTarget = { -1.5708, -1.5708, 0.0, -1.5708, 0.0, 0.0 };
+        if (!ValidateJointTransition(reference, homeTarget, out error, allowSingularEnd: true))
+        {
+            error = "final Home transition: " + error;
+            return false;
+        }
+        sharedFinalTrajectory.Add(homeTarget);
+
+        error = null;
+        Debug.Log($"[Executor-shared] Built and collision-checked shared movej trajectory for {sharedTrajectory.Count} steps.");
+        return true;
+    }
+
+    bool PlanMoveAbove(PlannedJointAction action, ref double[] reference,
+        UR3eKinematics.Pose current, double targetX, double targetY,
+        double endpointHoverZ, string orientation, out string error)
+    {
+        // A single global travel plane can be unreachable for a far-away block
+        // when the configured TCP includes a long gripper. Try progressively
+        // lower planes, but never go below the action's validated hover height.
+        // The first segment may lower from the current TCP to that safe plane.
+        // Every candidate still passes the normal
+        // joint-transition and approximate collision checks.
+        double configuredTravelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
+        double minimumTravelZ = endpointHoverZ;
+        double firstTravelZ = System.Math.Max(configuredTravelZ, minimumTravelZ);
+        string lastError = null;
+
+        double travelZ = firstTravelZ;
+        while (true)
+        {
+            double[] trialReference = (double[])reference.Clone();
+            var trial = new PlannedJointAction
+            {
+                function = action.function,
+                seconds = action.seconds
+            };
+
+            if (PlanJointPose(trial, ref trialReference, current.x, current.y,
+                    travelZ, orientation, out lastError) &&
+                PlanJointPose(trial, ref trialReference, targetX, targetY,
+                    travelZ, orientation, out lastError) &&
+                PlanJointPose(trial, ref trialReference, targetX, targetY,
+                    endpointHoverZ, orientation, out lastError))
+            {
+                action.targets.AddRange(trial.targets);
+                reference = trialReference;
+                if (travelZ < configuredTravelZ - 1e-6)
+                    Debug.Log($"[Executor-shared] Adapted travel Z from {configuredTravelZ:F3}m " +
+                              $"to {travelZ:F3}m for reachability; safe hover floor={minimumTravelZ:F3}m.");
+                error = null;
+                return true;
+            }
+
+            if (travelZ <= minimumTravelZ + 1e-6)
+                break;
+            travelZ = System.Math.Max(minimumTravelZ, travelZ - 0.01);
+        }
+
+        error = $"no reachable collision-free travel height in " +
+                $"{minimumTravelZ:F3}..{firstTravelZ:F3}m; last attempt: {lastError}";
+        return false;
+    }
+
+    bool PlanJointPose(PlannedJointAction action, ref double[] reference,
+        double x, double y, double z, string orientation, out string error)
+    {
+        var pose = SharedTargetPose(x, y, z, orientation);
+        var solution = UR3eKinematics.IKNearest(pose, reference);
+        if (!solution.ok)
+        {
+            error = $"IK {solution.error}: {solution.message} at {pose}";
+            return false;
+        }
+        if (!ValidateJointTransition(reference, solution.q, out error, allowSingularEnd: false))
+        {
+            string firstTransitionError = error;
+            bool foundSafeAlternative = false;
+            var alternatives = UR3eKinematics.IKAlternatives(pose, reference);
+            foreach (var alternative in alternatives)
+            {
+                if (!ValidateJointTransition(reference, alternative.q, out error,
+                        allowSingularEnd: false)) continue;
+                solution = alternative;
+                foundSafeAlternative = true;
+                Debug.Log($"[Executor-shared] Selected collision-free alternative IK at {pose}.");
+                break;
+            }
+            if (!foundSafeAlternative)
+            {
+                error = $"no safe IK transition among primary and {alternatives.Count} alternative solutions; " +
+                        $"primary rejection: {firstTransitionError}; last rejection: {error}";
+                return false;
+            }
+        }
+        action.targets.Add((double[])solution.q.Clone());
+        reference = (double[])solution.q.Clone();
+        return true;
+    }
+
+    UR3eKinematics.Pose SharedTargetPose(double x, double y, double z, string orientation)
+    {
+        float toolDeg = orientation == "horizontal" ? 0f : 90f;
+        Quaternion rotation = Quaternion.AngleAxis(180f, Vector3.up) *
+                              Quaternion.AngleAxis(toolDeg, Vector3.forward);
+        rotation.ToAngleAxis(out float angleDeg, out Vector3 axis);
+        if (angleDeg > 180f) { angleDeg = 360f - angleDeg; axis = -axis; }
+        float angleRad = angleDeg * Mathf.Deg2Rad;
+        return new UR3eKinematics.Pose
+        {
+            x = x, y = y, z = z,
+            rx = axis.x * angleRad, ry = axis.y * angleRad, rz = axis.z * angleRad
+        };
+    }
+
+    bool ValidateJointTransition(double[] from, double[] to, out string error,
+        bool allowSingularEnd)
+    {
+        double maxDelta = 0.0;
+        for (int i = 0; i < 6; i++) maxDelta = System.Math.Max(maxDelta, System.Math.Abs(to[i] - from[i]));
+        int samples = System.Math.Max(2, (int)System.Math.Ceiling(
+            maxDelta * Mathf.Rad2Deg / Mathf.Max(0.5f, trajectoryCollisionSampleDeg)));
+
+        for (int sample = 0; sample <= samples; sample++)
+        {
+            double t = (double)sample / samples;
+            var q = new double[6];
+            for (int i = 0; i < 6; i++) q[i] = from[i] + (to[i] - from[i]) * t;
+            var jointCheck = UR3eKinematics.CheckJoints(q);
+            if (jointCheck != UR3eKinematics.IKError.None &&
+                !(allowSingularEnd && sample == samples))
+            {
+                error = $"joint validation failed at {t:P0}: {jointCheck}";
+                return false;
+            }
+            if (!ValidateApproximateRobotCollision(q, out string collision))
+            {
+                error = $"collision at {t:P0}: {collision}";
+                return false;
+            }
+        }
+        error = null;
+        return true;
+    }
+
+    bool ValidateApproximateRobotCollision(double[] q, out string error)
+    {
+        double[][] p = UR3eKinematics.LinkPoints(q);
+        float[] radii = { 0.085f, 0.070f, 0.055f, 0.050f, 0.045f, 0.035f };
+        float tableZ = QR1_Z;
+
+        // The base/shoulder are mounted through the table; check all moving links
+        // after the upper arm against the tabletop with conservative radii.
+        for (int segment = 2; segment < 6; segment++)
+        {
+            float minZ = (float)System.Math.Min(p[segment][2], p[segment + 1][2]) - radii[segment];
+            if (minZ < tableZ - 0.005f)
+            {
+                error = $"link segment {segment} enters tabletop (z={minZ:F3}m)";
+                return false;
+            }
+        }
+
+        for (int a = 0; a < 6; a++)
+        {
+            for (int b = a + 2; b < 6; b++)
+            {
+                // Direct neighbours share a joint; base versus shoulder/upper-arm
+                // contact is part of the normal mechanical assembly.
+                if (a == 0 && b <= 2) continue;
+                // Segments 3 and 5 are separated by the fixed d5 wrist spacer
+                // (about 85 mm). Their conservative capsules naturally meet at
+                // that assembly, so adding the general 8 mm clearance creates a
+                // permanent false positive even in the calibrated Ready pose.
+                if (a == 3 && b == 5) continue;
+                float distance = SegmentDistance(ToVector3(p[a]), ToVector3(p[a + 1]),
+                                                 ToVector3(p[b]), ToVector3(p[b + 1]));
+                float required = radii[a] + radii[b] + 0.008f;
+                if (distance < required)
+                {
+                    error = $"self-collision link {a}↔{b}: {distance:F3}m < {required:F3}m";
+                    return false;
+                }
+            }
+        }
+        error = null;
+        return true;
+    }
+
+    static Vector3 ToVector3(double[] p) => new Vector3((float)p[0], (float)p[1], (float)p[2]);
+
+    static float SegmentDistance(Vector3 p1, Vector3 q1, Vector3 p2, Vector3 q2)
+    {
+        Vector3 d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
+        float a = Vector3.Dot(d1, d1), e = Vector3.Dot(d2, d2), f = Vector3.Dot(d2, r);
+        float s, t;
+        if (a <= 1e-8f && e <= 1e-8f) return Vector3.Distance(p1, p2);
+        if (a <= 1e-8f) { s = 0f; t = Mathf.Clamp01(f / e); }
+        else
+        {
+            float c = Vector3.Dot(d1, r);
+            if (e <= 1e-8f) { t = 0f; s = Mathf.Clamp01(-c / a); }
+            else
+            {
+                float b = Vector3.Dot(d1, d2), denom = a * e - b * b;
+                s = denom != 0f ? Mathf.Clamp01((b * f - c * e) / denom) : 0f;
+                t = (b * s + f) / e;
+                if (t < 0f) { t = 0f; s = Mathf.Clamp01(-c / a); }
+                else if (t > 1f) { t = 1f; s = Mathf.Clamp01((b - c) / a); }
+            }
+        }
+        return Vector3.Distance(p1 + d1 * s, p2 + d2 * t);
     }
 
     // Pre-flight：掃全 batch，任一步 source/target 不可達或奇點就回報
@@ -1158,13 +1549,27 @@ public class JsonExecutor : MonoBehaviour
         // 記錄 preview 過程中新生成的 cube（結束時要刪掉，不留垃圾）
         int cubesBeforePreview = cubes.Count;
 
-        // 對每個 step 跑 AnimateOneStep
+        // The real batch moves to Ready before consuming the shared trajectory.
+        // Show the same starting joint pose before previewing its waypoints.
+        if (useSharedMovejTrajectory && sharedTrajectoryStartQ != null && robotArm != null)
+            yield return AnimateJointsTo(RadToDeg(sharedTrajectoryStartQ), 1.0f);
+
+        // 對每個 step 跑動畫
         foreach (StepEnvelope env in batch.steps)
         {
             if (env == null || env.done ||
                 env.source_position == null || env.target_position == null)
                 continue;
-            yield return AnimateOneStep(env, "preview");
+            if (useSharedMovejTrajectory)
+                yield return AnimateSharedTrajectoryStep(env, "preview");
+            else
+                yield return AnimateOneStep(env, "preview");
+        }
+
+        if (useSharedMovejTrajectory)
+        {
+            foreach (double[] target in sharedFinalTrajectory)
+                yield return AnimateJointsTo(RadToDeg(target), 1.5f);
         }
 
         // 復原：手臂角度
@@ -1197,6 +1602,76 @@ public class JsonExecutor : MonoBehaviour
         }
 
         Debug.Log($"[Executor-preview] 動畫預覽結束，已復原場景。實機開始執行");
+    }
+
+    IEnumerator AnimateSharedTrajectoryStep(StepEnvelope env, string tag)
+    {
+        if (!sharedTrajectory.TryGetValue(env.step_id, out var actions)) yield break;
+        GameObject cube = sceneSyncer.FindNearestCube(
+            env.source_position.x, env.source_position.y, env.source_position.z);
+        if (cube == null)
+        {
+            Color color = env.source_position.name != null && env.source_position.name.Contains("yellow")
+                ? new Color(1f, 0.85f, 0.1f) : new Color(0.4f, 0.4f, 0.4f);
+            cube = sceneSyncer.SpawnCube($"{tag}_cube_{env.step_id}",
+                env.source_position.x, env.source_position.y, env.source_position.z, color);
+        }
+        Transform originalParent = cube.transform.parent;
+        Transform gripper = robotArm != null ? robotArm.TCP : null;
+        SyncGripper previewGripper = FindObjectOfType<SyncGripper>();
+
+        for (int i = 0; i < actions.Count; i++)
+        {
+            PlannedJointAction action = actions[i];
+            foreach (double[] target in action.targets)
+            {
+                float maxDeltaRad = 0f;
+                if (robotArm != null && robotArm.Angles != null)
+                    for (int j = 0; j < Mathf.Min(6, robotArm.Angles.Length); j++)
+                        maxDeltaRad = Mathf.Max(maxDeltaRad,
+                            Mathf.Abs(RadToDeg(target)[j] - robotArm.Angles[j]) * Mathf.Deg2Rad);
+                float duration = Mathf.Max(0.15f, maxDeltaRad / Mathf.Max(0.05f, sharedMovejVelocity));
+                yield return AnimateJointsTo(RadToDeg(target), duration);
+            }
+
+            if (action.function == "grasp")
+            {
+                if (previewGripper != null) previewGripper.SetPreviewGrip(true);
+                Transform gripParent = previewGripper != null
+                    ? previewGripper.transform
+                    : gripper;
+                if (gripParent != null) cube.transform.SetParent(gripParent, true);
+                yield return new WaitForSeconds(1.5f);
+            }
+            else if (action.function == "release")
+            {
+                if (previewGripper != null) previewGripper.SetPreviewGrip(false);
+                cube.transform.SetParent(originalParent, true);
+                Vector3 targetLocal = SceneSyncer.QRToUnity(
+                    env.target_position.x, env.target_position.y, env.target_position.z);
+                targetLocal.y -= sceneSyncer.cubeSizeM / 2f;
+                cube.transform.localPosition = targetLocal;
+                cube.transform.localScale = SimScaleFor(env.target_position);
+                // Target scale already encodes horizontal/vertical domino
+                // direction. Keeping the tool's world rotation here applied the
+                // orientation twice and made the preview disagree with reality.
+                cube.transform.localRotation = Quaternion.identity;
+                yield return new WaitForSeconds(1.5f);
+                if (previewGripper != null) previewGripper.ClearPreviewGripOverride();
+            }
+            else if (action.function == "wait")
+            {
+                yield return new WaitForSeconds(action.seconds);
+            }
+        }
+        cube.name = $"{tag}_step{env.step_id}";
+    }
+
+    static float[] RadToDeg(double[] radians)
+    {
+        var degrees = new float[6];
+        for (int i = 0; i < 6; i++) degrees[i] = (float)(radians[i] * 180.0 / System.Math.PI);
+        return degrees;
     }
 
     Vector3 SimScaleFor(NamedPosition pos)
@@ -1353,7 +1828,14 @@ public class JsonExecutor : MonoBehaviour
             float skew = source ? srcSkew : tgtSkew;
             float height = Mathf.Clamp(action.height_m > 0f ? action.height_m : SAFE_Z_OFFSET, 0.05f, 0.15f);
 
-            switch (action.function)
+            bool sharedMotion = useSharedMovejTrajectory &&
+                (action.function == "move_above" || action.function == "descend" ||
+                 action.function == "lift" || action.function == "go_home");
+            if (sharedMotion)
+            {
+                yield return ExecuteSharedJointAction(env.step_id, i, tag, stepEpoch);
+            }
+            else switch (action.function)
             {
                 case "move_above":
                     yield return SendCurrentTcpLiftToTravelHeight(travelZ,
@@ -1435,6 +1917,82 @@ public class JsonExecutor : MonoBehaviour
         float duration = Time.realtimeSinceStartup - t0;
         WriteStepDone(env.step_id, true, null, duration);
         Debug.Log($"═══ Step {env.step_id} 完成 ({duration:F1}s) ═══");
+    }
+
+    IEnumerator ExecuteSharedJointAction(int stepId, int actionIndex, string tag, long stepEpoch)
+    {
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+        if (!sharedTrajectory.TryGetValue(stepId, out var actions) ||
+            actionIndex < 0 || actionIndex >= actions.Count)
+        {
+            lastMotionError = $"missing shared trajectory for step {stepId} action {actionIndex + 1}";
+            yield break;
+        }
+
+        var action = actions[actionIndex];
+        if (action.targets.Count == 0)
+        {
+            lastMotionError = $"shared trajectory action {tag} has no joint targets";
+            yield break;
+        }
+        for (int i = 0; i < action.targets.Count; i++)
+        {
+            yield return SendExplicitJointTarget(action.targets[i],
+                $"{tag} shared {i + 1}/{action.targets.Count}", stepEpoch, stepId);
+            if (!lastMotionSucceeded) yield break;
+        }
+    }
+
+    IEnumerator SendExplicitJointTarget(double[] target, string tag, long stepEpoch, int stepId)
+    {
+        if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+        string command = $"movej([{target[0]:F6},{target[1]:F6},{target[2]:F6}," +
+                         $"{target[3]:F6},{target[4]:F6},{target[5]:F6}], " +
+                         $"a={sharedMovejAcceleration:F3}, v={sharedMovejVelocity:F3})";
+        Debug.Log($"  [{tag}] SEND EXACT: {command}");
+        urListener.SendCommand(command);
+        yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
+
+        float startedAt = Time.realtimeSinceStartup;
+        while (Time.realtimeSinceStartup - startedAt < MOTION_TIMEOUT_SEC)
+        {
+            if (!IsExecutionCurrent(stepEpoch, stepId))
+            {
+                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                yield break;
+            }
+            if (!urListener.Connected)
+            {
+                lastMotionError = $"UR disconnected during {tag}";
+                yield break;
+            }
+            if (IsEmergencyStop() || IsRecoverableSafetyStop())
+            {
+                lastMotionError = $"UR safety stop during {tag}; shared trajectory aborted";
+                yield break;
+            }
+
+            var joints = urListener.JointData.AsArray;
+            float maxError = 0f;
+            for (int i = 0; i < 6; i++)
+            {
+                float actual = (float)joints[i].q_actual;
+                maxError = Mathf.Max(maxError, Mathf.Abs(Mathf.DeltaAngle(
+                    actual * Mathf.Rad2Deg, (float)target[i] * Mathf.Rad2Deg)) * Mathf.Deg2Rad);
+            }
+            if (maxError <= HOME_JOINT_TOLERANCE_RAD &&
+                !urListener.RobotModeData.isProgramRunning)
+            {
+                lastMotionSucceeded = true;
+                Debug.Log($"  [{tag}] REACHED EXACT: max joint error {maxError * Mathf.Rad2Deg:F2} deg");
+                yield break;
+            }
+            yield return new WaitForSeconds(0.05f);
+        }
+        lastMotionError = $"UR motion timeout during shared trajectory {tag}";
     }
 
     IEnumerator SendMove(

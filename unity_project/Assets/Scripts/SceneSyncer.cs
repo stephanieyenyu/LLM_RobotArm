@@ -69,7 +69,7 @@ public class SceneSyncer : MonoBehaviour
     [System.NonSerialized] public float supplyZoneXMax = 0.35f;
     [System.NonSerialized] public float targetZoneOriginX = 0.49f;
     [System.NonSerialized] public float targetZoneOriginY = 0.04f;
-    [System.NonSerialized] public float cellSize = 0.04f;
+    [System.NonSerialized] public float cellSize = 0.054f;
     [System.NonSerialized] public int gridRows = 5;
     [System.NonSerialized] public int gridCols = 5;
 

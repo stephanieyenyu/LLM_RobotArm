@@ -222,6 +222,8 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
     Console.WriteLine($"[Layer 2] 展開成 {realize.Targets.Count} 個 target cells "
                       + $"({realize.Targets.Count(t => t.ExpectedShape == "domino")} domino + "
                       + $"{realize.Targets.Count(t => t.ExpectedShape == "cube")} cube)");
+    Console.WriteLine($"[Layer 2] Placement shift: X={realize.PlacementShiftX:+0.000;-0.000;0.000} m, " +
+                      $"Y={realize.PlacementShiftY:+0.000;-0.000;0.000} m (CellSize={workspace.CellSize:F3} m)");
 
     var virtualScene = CloneScene(initialSnap);
     var remainingTargets = new List<TargetCell>(realize.Targets);
@@ -263,7 +265,7 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
         remainingTargets.RemoveAll(t => t.Row == assignment.Target!.Row && t.Col == assignment.Target.Col);
     }
 
-    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps);
+    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps, initialSnap, realize.Targets);
 }
 
 async Task RunSingleObjectTaskBatchAsync(RoutedCommand routed, List<SceneObject> initialScene)
@@ -534,6 +536,8 @@ async Task RunPatternTaskAsync(string userCommand)
     Console.WriteLine($"[Layer 2] 展開成 {realize.Targets.Count} 個 target cells "
                       + $"({realize.Targets.Count(t => t.ExpectedShape == "domino")} domino + "
                       + $"{realize.Targets.Count(t => t.ExpectedShape == "cube")} cube)");
+    Console.WriteLine($"[Layer 2] Placement shift: X={realize.PlacementShiftX:+0.000;-0.000;0.000} m, " +
+                      $"Y={realize.PlacementShiftY:+0.000;-0.000;0.000} m (CellSize={workspace.CellSize:F3} m)");
 
     var remainingTargets = new List<TargetCell>(realize.Targets);
     var placedTargets = new List<TargetCell>();
@@ -1309,7 +1313,8 @@ async Task<StepEnvelope?> BuildStepEnvelopeAsync(
     };
 }
 
-async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps)
+async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps,
+    List<SceneObject>? placementScene = null, List<TargetCell>? placementTargets = null)
 {
     if (steps.Count == 0)
     {
@@ -1318,13 +1323,52 @@ async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps)
         return;
     }
 
+    var offsets = new List<(double X, double Y)> { (0, 0) };
+    if (placementScene != null && placementTargets != null)
+        foreach (double distance in new[] { 0.01, 0.02 })
+            foreach (var direction in new[] { (1, 0), (-1, 0), (0, 1), (0, -1),
+                         (1, 1), (1, -1), (-1, 1), (-1, -1) })
+                offsets.Add((direction.Item1 * distance, direction.Item2 * distance));
+
+    foreach (var offset in offsets)
+    {
+    var candidateSteps = JsonSerializer.Deserialize<List<StepEnvelope>>(
+        JsonSerializer.Serialize(steps, jsonOptions), jsonOptions)!;
+    if (offset.X != 0 || offset.Y != 0)
+    {
+        var candidateScene = CloneScene(placementScene!);
+        bool valid = true;
+        foreach (var step in candidateSteps)
+        {
+            var target = step.TargetPosition!;
+            target.X += offset.X;
+            target.Y += offset.Y;
+            double radius = Math.Sqrt(Math.Pow(-0.38824 + target.X, 2) + Math.Pow(-0.35473 + target.Y, 2));
+            if (target.X < workspace.TargetZoneXMin || target.X > 0.72 ||
+                target.Y < 0 || target.Y > 0.45 || radius < 0.14 || radius > 0.45)
+            { valid = false; break; }
+            var assignment = new Assignment
+            {
+                Source = step.SourcePosition,
+                Target = new TargetCell { WorldX = target.X, WorldY = target.Y, WorldZ = target.Z,
+                    ExpectedShape = target.Shape, ExpectedOrientation = target.Orientation },
+            };
+            if (!MotionPlanValidator.TryValidate(new MotionPlan { ActionSequence = step.ActionSequence },
+                    assignment, candidateScene, out _))
+            { valid = false; break; }
+            UpdateVirtualSceneAfterPlannedStep(candidateScene, assignment);
+        }
+        if (!valid) continue;
+        Console.WriteLine($"[Batch placement retry] 整體平移 X={offset.X:F3}, Y={offset.Y:F3} m；重新驗證整批軌跡。");
+    }
+    foreach (var step in candidateSteps) step.StepId = ++globalStepId;
     int batchId = ++globalStepId;
     var batch = new BatchEnvelope
     {
         BatchId = batchId,
         Done = false,
         Comment = comment,
-        Steps = steps,
+        Steps = candidateSteps,
     };
     WriteBatchFile(batch);
 
@@ -1334,10 +1378,21 @@ async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps)
     if (execResult == null || !execResult.Completed)
     {
         Console.WriteLine($"[Batch] Unity batch timeout 或失敗：{execResult?.Error}");
+        // Retry only an explicit rejection before preview: no hardware command
+        // has been sent. Never retry a timeout or a partially executed batch.
+        if (placementScene != null && execResult?.Error?.StartsWith(
+                "shared movej trajectory rejected before preview:", StringComparison.Ordinal) == true)
+            continue;
         return;
     }
 
     Console.WriteLine($"[Batch] Unity 回報 batch {batchId} 全部完成。");
+    if (placementTargets != null)
+        foreach (var target in placementTargets)
+        { target.WorldX += offset.X; target.WorldY += offset.Y; }
+    return;
+    }
+    Console.WriteLine("[Batch] 所有整體平移候選都無法通過驗證；未執行實機動作。");
 }
 
 List<SceneObject> CloneScene(IEnumerable<SceneObject> scene) =>

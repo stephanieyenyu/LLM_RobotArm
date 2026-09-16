@@ -187,22 +187,34 @@ public class RobotArm : MonoBehaviour
     // In der OnGUI Methode sind alle UI Elemente uund deren Funktionalitäten vorhanden.
     private void OnGUI()
     {
+        // OnGUI can run before Start or during a script reload, when the
+        // connection listener has not been initialized yet. Return before
+        // beginning any GUILayout scope so a null reference cannot unbalance it.
+        if (urListener == null) return;
         GUILayout.BeginArea(new Rect(10, 10, 200, 400));
-        if (!urListener.Connected)
+        try
         {
-            // Solange kein Roboter verbunden ist, wird eine Eingabefeld für die IP-Adresse angezeigt
-            GUILayout.BeginHorizontal();
-            ipInput = GUILayout.TextField(ipInput);
-            if (GUILayout.Button("Connect"))
+            if (!urListener.Connected)
             {
-                urListener.Connect(ipInput, false);
+                GUILayout.BeginHorizontal();
+                try
+                {
+                    ipInput = GUILayout.TextField(ipInput);
+                    if (GUILayout.Button("Connect"))
+                        urListener.Connect(ipInput, false);
+                }
+                finally
+                {
+                    GUILayout.EndHorizontal();
+                }
             }
-
-            GUILayout.EndHorizontal();
+        }
+        finally
+        {
+            GUILayout.EndArea();
         }
         // 連線後不再顯示 Disconnect / Home 按鈕
         // 這些功能移到 UIManager 的三個按鈕（Open / Grip / Home）
-        GUILayout.EndArea();
     }
 
     static Vector3 axisTovector3(Axis axis)

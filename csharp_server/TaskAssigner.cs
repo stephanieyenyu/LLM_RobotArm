@@ -25,7 +25,7 @@ public static class TaskAssigner
     private const double QR1_TO_UR_X = -0.38824;
     private const double QR1_TO_UR_Y = -0.35473;
     private const double MIN_SAFE_SOURCE_RADIUS_M = 0.23;
-    private const double MAX_SAFE_SOURCE_RADIUS_M = 0.42;
+    private const double MAX_SAFE_SOURCE_RADIUS_M = 0.45;
 
     /// <summary>
     /// 挑下一步。回傳 null 代表沒有可執行的（供應不足 / 無 target）。

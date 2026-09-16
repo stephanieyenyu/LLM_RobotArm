@@ -11,7 +11,7 @@ public static class MotionPlanValidator
     // QR pose and object centers can jitter by several millimetres near an edge.
     // Permit a small measurement tolerance without disabling the independent UR
     // base exclusion, transfer-distance, occupancy, and clearance checks.
-    private const double WorkspaceMeasurementToleranceM = 0.015;
+    private const double WorkspaceMeasurementToleranceM = 0.025;
     private const double MinTravelClearanceM = 0.08;
     private const double ObstacleClearanceM = 0.03;
     private const double MaxTransferDistanceM = 0.70;

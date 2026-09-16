@@ -334,7 +334,7 @@ Transform:
   m_GameObject: {fileID: 575843500}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0.179}
+  m_LocalPosition: {x: 0, y: 0, z: 0.123}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -698,7 +698,7 @@ MonoBehaviour:
   pollIntervalSec: 0.3
   perceptionModeUrl: http://localhost:5000/scene/mode
   uiManager: {fileID: 0}
-  simulationOnly: 1
+  simulationOnly: 0
   sceneSyncer: {fileID: 447807163}
   robotArm: {fileID: 1799080993}
   simMoveSecPerStep: 1.2
@@ -751,8 +751,12 @@ MonoBehaviour:
   simHomeWrist2: 0
   simHomeWrist3: 0
   previewBatchInUnityBeforeRobot: 1
-  freezeUnityRobotDuringRealBatch: 1
+  freezeUnityRobotDuringRealBatch: 0
   placeDescendExtraZ: 0
+  useSharedMovejTrajectory: 1
+  trajectoryCollisionSampleDeg: 2
+  sharedMovejAcceleration: 0.35
+  sharedMovejVelocity: 0.45
   pickOffsetX: 0.002
   pickOffsetY: 0.002
   useReadyPose: 1
@@ -1213,7 +1217,7 @@ MonoBehaviour:
   - -90
   - 0
   - 0
-  toolOffsetZ: 0.18
+  toolOffsetZ: 0.123
   restRotations:
   - {x: 0, y: 0, z: 0, w: 1}
   - {x: 0.7071068, y: 0, z: 0, w: 0.7071068}
@@ -1221,7 +1225,7 @@ MonoBehaviour:
   - {x: 0, y: 0, z: 0, w: 1}
   - {x: 0.7071068, y: 0, z: 0, w: 0.7071068}
   - {x: -0.7071068, y: -0.000000061817246, z: 0, w: 0.7071068}
-  autoConnectIP: 
+  autoConnectIP: 192.168.50.204
   followRealRobotFeedback: 1
   TCPPosition: {x: 0, y: 0, z: 0}
   TCPRotation: {x: 0, y: 0, z: 0, w: 0}

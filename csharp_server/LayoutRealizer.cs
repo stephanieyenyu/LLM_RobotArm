@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -16,6 +17,8 @@ public static class LayoutRealizer
     {
         public List<TargetCell>? Targets { get; set; }
         public string? Error { get; set; }
+        public double PlacementShiftX { get; set; }
+        public double PlacementShiftY { get; set; }
     }
 
     /// <summary>
@@ -115,7 +118,92 @@ if (dominosNeeded > dominoBudget)
     };
 }
 
-return new RealizeResult { Targets = targets };
+        if (!TryFitTargetsToSafeReach(targets, ws, out double shiftX, out double shiftY))
+        {
+            return new RealizeResult
+            {
+                Error = $"CellSize={ws.CellSize:F3} m 的本次圖案無法在 placement area 內平移到 " +
+                        "UR 半徑篩選 0.14..0.45 m；未停用 IK 與碰撞限制。",
+            };
+        }
+
+        foreach (var target in targets)
+        {
+            target.WorldX += shiftX;
+            target.WorldY += shiftY;
+        }
+
+        return new RealizeResult
+        {
+            Targets = targets,
+            PlacementShiftX = shiftX,
+            PlacementShiftY = shiftY,
+        };
+    }
+
+    private static bool TryFitTargetsToSafeReach(
+        IReadOnlyList<TargetCell> targets,
+        WorkspaceBounds ws,
+        out double bestShiftX,
+        out double bestShiftY)
+    {
+        const double qrToRobotX = -0.38824;
+        const double qrToRobotY = -0.35473;
+        const double minReach = 0.14;
+        const double maxReach = 0.45;
+        const double placementMaxX = 0.72;
+        const double placementMinY = 0.00;
+        const double placementMaxY = 0.45;
+        const double searchStep = 0.001;
+
+        double minX = targets.Min(t => t.WorldX);
+        double maxX = targets.Max(t => t.WorldX);
+        double minY = targets.Min(t => t.WorldY);
+        double maxY = targets.Max(t => t.WorldY);
+        double minShiftX = ws.TargetZoneXMin - minX;
+        double maxShiftX = placementMaxX - maxX;
+        double minShiftY = placementMinY - minY;
+        double maxShiftY = placementMaxY - maxY;
+
+        bestShiftX = 0.0;
+        bestShiftY = 0.0;
+        double bestCost = double.PositiveInfinity;
+        double bestMargin = double.NegativeInfinity;
+
+        for (double dx = minShiftX; dx <= maxShiftX + 1e-9; dx += searchStep)
+        {
+            for (double dy = minShiftY; dy <= maxShiftY + 1e-9; dy += searchStep)
+            {
+                bool safe = true;
+                double minimumMargin = double.PositiveInfinity;
+                foreach (var target in targets)
+                {
+                    double robotX = qrToRobotX + target.WorldX + dx;
+                    double robotY = qrToRobotY + target.WorldY + dy;
+                    double radius = Math.Sqrt(robotX * robotX + robotY * robotY);
+                    if (radius < minReach || radius > maxReach)
+                    {
+                        safe = false;
+                        break;
+                    }
+                    minimumMargin = Math.Min(minimumMargin,
+                        Math.Min(radius - minReach, maxReach - radius));
+                }
+                if (!safe) continue;
+
+                double cost = dx * dx + dy * dy;
+                if (cost < bestCost - 1e-12 ||
+                    (Math.Abs(cost - bestCost) <= 1e-12 && minimumMargin > bestMargin))
+                {
+                    bestCost = cost;
+                    bestMargin = minimumMargin;
+                    bestShiftX = dx;
+                    bestShiftY = dy;
+                }
+            }
+        }
+
+        return !double.IsPositiveInfinity(bestCost);
     }
 
     private static TargetCell BuildCube(int r, int c, int rows, WorkspaceBounds ws, string color)

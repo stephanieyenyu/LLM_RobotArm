@@ -92,6 +92,24 @@ public static class UR3eKinematics
         return MatrixToPose(FK(q));
     }
 
+    // Joint/link origins in robot-base coordinates. The final point is the
+    // configured TCP. Used by the shared trajectory pre-flight collision check.
+    public static double[][] LinkPoints(double[] q)
+    {
+        double[] aArr = { 0,   a2,  a3,  0,   0,    0    };
+        double[] al   = { PI2, 0,   0,   PI2, -PI2, 0    };
+        double[] dArr = { d1,  0,   0,   d4,  d5,   D6Effective };
+        var points = new double[7][];
+        var t = Identity();
+        points[0] = new[] { 0.0, 0.0, 0.0 };
+        for (int i = 0; i < 6; i++)
+        {
+            t = Mul(t, DH(aArr[i], al[i], dArr[i], q[i]));
+            points[i + 1] = new[] { t[0, 3], t[1, 3], t[2, 3] };
+        }
+        return points;
+    }
+
     // ============ IK ============
     // 從 reference q 出發用 Damped Least Squares 收斂到 target。
     // 適合 pre-flight：連續動作維持同一分支解。
@@ -138,6 +156,31 @@ public static class UR3eKinematics
         var e = PoseError(T_target, FK(q));
         return Math.Sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]) < IK_TOL_POS * 10
             && Math.Sqrt(e[3] * e[3] + e[4] * e[4] + e[5] * e[5]) < IK_TOL_ROT * 10;
+    }
+
+    // Alternative endpoint solutions for callers that must also validate the
+    // complete joint-space transition, not just endpoint reachability.
+    public static System.Collections.Generic.List<IKSolution> IKAlternatives(
+        Pose target, double[] reference)
+    {
+        var matrix = PoseToMatrix(target);
+        var solutions = new System.Collections.Generic.List<IKSolution>();
+        foreach (var seed in StructuredSeeds(matrix, reference))
+        {
+            var solution = IKFromSeed(matrix, seed);
+            if (!solution.ok) continue;
+            solution = Unwrapped(solution, reference);
+            bool duplicate = false;
+            foreach (var existing in solutions)
+                if (JointDist(existing.q, solution.q) < 1e-6)
+                {
+                    duplicate = true;
+                    break;
+                }
+            if (!duplicate) solutions.Add(solution);
+        }
+        solutions.Sort((a, b) => JointDist(a.q, reference).CompareTo(JointDist(b.q, reference)));
+        return solutions;
     }
 
     // 各 joint 取與 reference 最近的等價角度（差 2π 是同一姿態），避免動畫繞遠路；超出 joint limit 就保留原值
