@@ -555,6 +555,11 @@ public class JsonExecutor : MonoBehaviour
             }
             currentStepId = -1;
         }
+        else
+        {
+            // 純模擬模式也要對齊：實機 batch 開頭一定先 movej 到 ready pose
+            yield return SimGoToReadyPose("sim initial ready");
+        }
 
         for (int i = 0; i < batch.steps.Count; i++)
         {
@@ -747,10 +752,16 @@ public class JsonExecutor : MonoBehaviour
                                  out float[] jointsDeg, out string error)
     {
         // canonical 模式的座標映射是精確的；simFlipX/Y 只屬於舊 2D IK，套在這裡會把目標鏡射
-        double urX = QR1_X + qrX;
-        double urY = QR1_Y + qrY;
-        double urZ = QR1_Z + qrZ + extraZAboveCube;
+        return TryBuildPoseUR(QR1_X + qrX, QR1_Y + qrY, QR1_Z + qrZ + extraZAboveCube,
+                              out jointsDeg, out error);
+    }
 
+    // UR base frame 版：直接給 TCP 在 base 座標的 (x, y, z)，gripper 朝下。
+    // 模擬的 action_sequence 直譯器走這個，因為 ExecuteStep 也是全程在 UR base frame
+    // 算座標；兩邊共用同一個入口，模擬與實機才不會各算各的。
+    bool TryBuildPoseUR(double urX, double urY, double urZ,
+                        out float[] jointsDeg, out string error)
+    {
         var target = new UR3eKinematics.Pose
         {
             x = urX, y = urY, z = urZ,
@@ -810,16 +821,27 @@ public class JsonExecutor : MonoBehaviour
                 failures.Add($"step {env.step_id} target @ UR({tx:F3},{ty:F3}) 半徑 {Mathf.Sqrt(tx * tx + ty * ty):F3} m " +
                              $"超出實機安全範圍 {BASE_EXCLUSION_RADIUS_M:F2}..{MAX_REACH_RADIUS_M:F2} m");
 
-            foreach (var (label, pos, hover) in new[]
+            // 驗手臂實際會經過的三個高度，順序跟 action_sequence 一致：
+            //   contact = descend 的終點（QR1_Z + z + Z_CORRECTION，跟實機相同）
+            //   above   = move_above / lift 的終點，用 height_m 的上限 0.15 驗最壞情況
+            //   travel  = move_above 平移時所在的平面
+            // 舊版驗的是 simGripperHoverM(0.08)，那個高度現在沒有任何動作會停在上面。
+            float travelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
+            foreach (var (label, pos, zAbs) in new[]
             {
-                ($"step {env.step_id} source hover",  env.source_position, true),
-                ($"step {env.step_id} source contact",env.source_position, false),
-                ($"step {env.step_id} target hover",  env.target_position, true),
-                ($"step {env.step_id} target contact",env.target_position, false),
+                ($"step {env.step_id} source contact", env.source_position, 0f),
+                ($"step {env.step_id} source above",   env.source_position, 0.15f),
+                ($"step {env.step_id} source travel",  env.source_position, travelZ),
+                ($"step {env.step_id} target contact", env.target_position, 0f),
+                ($"step {env.step_id} target above",   env.target_position, 0.15f),
+                ($"step {env.step_id} target travel",  env.target_position, travelZ),
             })
             {
                 double urX = QR1_X + pos.x; double urY = QR1_Y + pos.y;
-                double urZ = QR1_Z + pos.z + (hover ? simGripperHoverM : ContactExtraZ);
+                // zAbs >= travelZ → 絕對高度；否則是「相對 contact 再往上」
+                double urZ = zAbs >= travelZ
+                    ? travelZ
+                    : QR1_Z + pos.z + Z_CORRECTION + zAbs;
                 var tgt = new UR3eKinematics.Pose
                 {
                     x = urX, y = urY, z = urZ,
@@ -879,23 +901,17 @@ public class JsonExecutor : MonoBehaviour
         cube.transform.localScale = SimScaleFor(env.source_position);
 
         // QR frame → Unity local（統一走 SceneSyncer.QRToUnity）
-        // 加上 Inspector 放置微調（simPlaceOffsetX/Y/Z 也視為 QR frame 的偏移）
+        // simPlaceOffsetX/Y/Z 只是方塊落點的視覺微調，不套用在手臂目標上。
+        // 要讓預覽真的代表實機，這三個值必須維持 0。
         float halfHeight = sceneSyncer.cubeSizeM / 2f;
-        Vector3 sourceLocal = cube.transform.localPosition;
         Vector3 targetLocal = SceneSyncer.QRToUnity(
             env.target_position.x + simPlaceOffsetX,
             env.target_position.y + simPlaceOffsetY,
             env.target_position.z + simPlaceOffsetZ);
         targetLocal.y -= halfHeight;
-        float hoverY = Mathf.Max(sourceLocal.y, targetLocal.y) + 0.08f;
-        Vector3 sourceHover = new Vector3(sourceLocal.x, hoverY, sourceLocal.z);
-        Vector3 targetHover = new Vector3(targetLocal.x, hoverY, targetLocal.z);
 
-        Debug.Log($"[Executor-{tag}] step {env.step_id}: source local={sourceLocal} → target local={targetLocal}");
-
-        // 手臂夾爪 transform：優先用 RobotArm.TCP（場景裡的 RealTCP，標記夾爪
-        // 指尖實際位置）；沒指定才退回用最後一個 joint（wrist_3 的旋轉樞紐，
-        // 不是指尖，退回用這個只是保底，不是正確位置）。null 就無手臂動畫。
+        // 手臂夾爪 transform：優先用 RobotArm.TCP（tcp_tip，夾爪實際夾持點）；
+        // 沒指定才退回最後一個 joint（wrist_3 樞紐，不是指尖，只是保底）。
         Transform gripper = null;
         bool armEnabled = simAnimateArm && robotArm != null &&
                           robotArm.Transforms != null && robotArm.Transforms.Length > 0;
@@ -905,100 +921,158 @@ public class JsonExecutor : MonoBehaviour
                 ? robotArm.TCP
                 : robotArm.Transforms[robotArm.Transforms.Length - 1];
         }
-
-        // 保留 cube 原始 parent (CubeContainer)，之後 restore 用
         Transform cubeOriginalParent = cube.transform.parent;
 
-        // 7-phase 動畫：hover 掃 → 下降到 cube 頂 → 抬 → hover 掃 → 下降 → 抬 → home
-        // 每個 phase 的 Z 都用該 step 自己的 qrZ 算，所以 source / target 高度不同也自動處理。
-        //   hover   用 hoverOverride = -1（canonical → qrZ + simGripperHoverM）
-        //   contact 用 ContactExtraZ（canonical：跟實機相同的 Z_CORRECTION）
-        // canonical 模式下 IK 目標是 TCP（RobotArm.toolOffsetZ = Teach Pendant 的 TCP），
-        // 所以這裡不需要任何「夾爪多長」的補償。
-        float[] poseSourceHover = BuildReachPoseForQR(
-            env.source_position.x + simPickGripperOffsetX,
-            env.source_position.y + simPickGripperOffsetY,
-            env.source_position.z, hoverOverride: -1f);
-        float[] poseSourceContact = BuildReachPoseForQR(
-            env.source_position.x + simPickGripperOffsetX,
-            env.source_position.y + simPickGripperOffsetY,
-            env.source_position.z, hoverOverride: ContactExtraZ);
-        float[] poseTargetHover = BuildReachPoseForQR(
-            env.target_position.x + simPlaceGripperOffsetX,
-            env.target_position.y + simPlaceGripperOffsetY,
-            env.target_position.z, hoverOverride: -1f);
-        float[] poseTargetContact = BuildReachPoseForQR(
-            env.target_position.x + simPlaceGripperOffsetX,
-            env.target_position.y + simPlaceGripperOffsetY,
-            env.target_position.z, hoverOverride: ContactExtraZ);
+        // ---- 座標換算：跟 ExecuteStep 逐行對齊 ----
+        // 這幾行只要跟 ExecuteStep 差一個字，模擬就不再是實機的模擬，
+        // 所以這裡刻意寫死 Z_CORRECTION，不走 ContactExtraZ 那個 sim-only 開關。
+        float ox = QR1_X + env.source_position.x + pickOffsetX;
+        float oy = QR1_Y + env.source_position.y + pickOffsetY;
+        float oz = QR1_Z + env.source_position.z + Z_CORRECTION;
+        float tx = QR1_X + env.target_position.x;
+        float ty = QR1_Y + env.target_position.y;
+        float tz = QR1_Z + env.target_position.z + Z_CORRECTION;
+        float travelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
 
-        // 時間分配（總長 simMoveSecPerStep）：分給 7 個 phase
-        float total = simMoveSecPerStep;
-        float tA  = total * 0.20f;  // swing to source hover
-        float tA2 = total * 0.15f;  // descend to source cube
-        float tB  = total * 0.10f;  // lift from source
-        float tC  = total * 0.20f;  // swing to target hover
-        float tC2 = total * 0.15f;  // descend to target
-        float tD  = total * 0.10f;  // lift from target
-        float tF  = total * 0.10f;  // home
-
-        // ---- A. Arm swing 到 source XY（hover Z） ----
-        if (armEnabled) yield return AnimateJointsTo(poseSourceHover, tA);
-        else            yield return new WaitForSeconds(tA * 0.1f);
-        yield return new WaitForSeconds(simHoldSec);
-
-        // ---- A2. Arm 垂直下降到 source cube 頂（Cartesian 直線，每 frame 重算 IK） ----
-        float srcX = env.source_position.x + simPickGripperOffsetX;
-        float srcY = env.source_position.y + simPickGripperOffsetY;
-        float srcZ = env.source_position.z;
-        float tgtX = env.target_position.x + simPlaceGripperOffsetX;
-        float tgtY = env.target_position.y + simPlaceGripperOffsetY;
-        float tgtZ = env.target_position.z;
-        float srcContactZ = srcZ + ContactExtraZ;
-        // 實機放置時（手上有方塊）descend 會再加 placeDescendExtraZ，這裡照做
-        float tgtContactZ = tgtZ + ContactExtraZ + (useCanonicalKinematics ? Mathf.Max(0f, placeDescendExtraZ) : 0f);
-        if (armEnabled) yield return AnimateArmVertical(srcX, srcY, srcZ, HoverArmZFor(srcZ), srcContactZ, tA2);
-        else            yield return AnimateLocalTo(cube.transform, sourceLocal, tA2);
-        // 夾爪碰到方塊後 attach
-        if (armEnabled && gripper != null)
+        if (!useCanonicalKinematics)
         {
-            cube.transform.SetParent(gripper, worldPositionStays: true);
+            Debug.LogWarning("[Executor-sim] useCanonicalKinematics 是關的。動作直譯器一律用 " +
+                             "canonical UR3e IK，舊的 2D heuristic 走不出 Cartesian 直線；" +
+                             "要讓預覽代表實機，請把它打開。");
         }
-        yield return new WaitForSeconds(simHoldSec);
 
-        // ---- B. Arm 垂直抬回 hover（cube 隨 gripper 上來） ----
-        if (armEnabled) yield return AnimateArmVertical(srcX, srcY, srcZ, srcContactZ, HoverArmZFor(srcZ), tB);
-        else            yield return AnimateLocalTo(cube.transform, sourceHover, tB);
-        yield return new WaitForSeconds(simHoldSec);
-
-        // ---- C. Arm swing 到 target XY（hover Z，cube 隨 gripper 飛） ----
-        if (armEnabled) yield return AnimateJointsTo(poseTargetHover, tC);
-        else            yield return AnimateLocalTo(cube.transform, targetHover, tC);
-        yield return new WaitForSeconds(simHoldSec);
-
-        // ---- C2. Arm 垂直下降到 target 位置（Cartesian 直線） ----
-        if (armEnabled) yield return AnimateArmVertical(tgtX, tgtY, tgtZ, HoverArmZFor(tgtZ), tgtContactZ, tC2);
-        else            yield return AnimateLocalTo(cube.transform, targetLocal, tC2);
-        yield return new WaitForSeconds(simHoldSec);
-
-        // ---- release：unparent，snap 到精確 target local，改成 target scale ----
-        if (armEnabled && gripper != null)
+        // ---- 動作序列：直接執行 LLM 要給實機的那一份 ----
+        // 改版前這裡跑的是寫死的 7 個 phase，完全沒讀 action_sequence，
+        // 所以預覽演的跟實機做的是兩回事：hover 高度、travel 平面、繞底座、
+        // 每步結尾回不回 startpoint 全都不同。
+        var actions = env.action_sequence;
+        if (actions == null || actions.Count == 0)
         {
-            if (cubeOriginalParent != null)
-                cube.transform.SetParent(cubeOriginalParent, worldPositionStays: true);
-            else
-                cube.transform.SetParent(null, worldPositionStays: true);
+            actions = BuildDefaultActionSequence();
+            Debug.LogWarning($"[Executor-{tag}] step {env.step_id} 沒有 action_sequence，" +
+                             "改用預設 pick-place 序列模擬（實機遇到這種 step 會直接判 missing action_sequence）");
         }
-        cube.transform.localScale = SimScaleFor(env.target_position);
-        cube.transform.localPosition = targetLocal;
 
-        // ---- D. Arm 垂直抬回 target hover（cube 已放，不跟） ----
-        if (armEnabled) yield return AnimateArmVertical(tgtX, tgtY, tgtZ, tgtContactZ, HoverArmZFor(tgtZ), tD);
-        yield return new WaitForSeconds(simHoldSec);
+        Debug.Log($"[Executor-{tag}] step {env.step_id}: source UR=({ox:F4},{oy:F4},{oz:F4}) " +
+                  $"target UR=({tx:F4},{ty:F4},{tz:F4}) travelZ={travelZ:F4}，共 {actions.Count} 個動作");
 
-        // ---- F. Arm 回 home ----
-        if (armEnabled) yield return AnimateJointsTo(BuildHomePose(), tF);
-        yield return new WaitForSeconds(0.15f);
+        if (!armEnabled)
+        {
+            // 沒有手臂可動畫時只把方塊搬到定位，至少讓場景狀態正確
+            cube.transform.localScale = SimScaleFor(env.target_position);
+            cube.transform.localPosition = targetLocal;
+            cube.name = $"{tag}_step{env.step_id}";
+            yield break;
+        }
+
+        // 模擬的「目前 TCP」，等同實機讀 urListener.CartesianInfo
+        Vector3 tcp = CurrentSimTcpUR();
+        bool holdingObject = false;
+
+        for (int i = 0; i < actions.Count; i++)
+        {
+            RobotFunctionCall action = actions[i];
+            string label = $"{tag} {i + 1}/{actions.Count} {action.function}";
+            bool source = action.location == "source";
+            float x = source ? ox : tx;
+            float y = source ? oy : ty;
+            float z = source ? oz : tz;
+            // 高度夾限跟 ExecuteStep 相同：LLM 沒給就用 SAFE_Z_OFFSET，再夾到 0.05~0.15
+            float height = Mathf.Clamp(
+                action.height_m > 0f ? action.height_m : SAFE_Z_OFFSET, 0.05f, 0.15f);
+
+            switch (action.function)
+            {
+                case "move_above":
+                {
+                    // 跟實機一樣三段：升到 travel 平面 → 平面移動（必要時繞開底座）→ 降到 z+height
+                    if (tcp.z < travelZ - TCP_POSITION_TOLERANCE_M)
+                    {
+                        Vector3 lifted = new Vector3(tcp.x, tcp.y, travelZ);
+                        yield return AnimateTcpLinearUR(tcp, lifted,
+                            simMoveSecPerStep * SIM_T_PRELIFT, label + " prelift");
+                        tcp = lifted;
+                    }
+
+                    var waypoints = BuildBaseDetourWaypoints(tcp.x, tcp.y, x, y);
+                    if (waypoints.Count > 1)
+                    {
+                        Debug.Log($"  [{label}] 直線會掃過底座，改繞 R={BASE_DETOUR_RADIUS_M:F3}m " +
+                                  $"（{waypoints.Count} 段）");
+                    }
+                    float perLeg = simMoveSecPerStep * SIM_T_TRAVEL / waypoints.Count;
+                    foreach (var wp in waypoints)
+                    {
+                        Vector3 next = new Vector3(wp.x, wp.y, travelZ);
+                        yield return AnimateTcpLinearUR(tcp, next, perLeg, label + " travel");
+                        tcp = next;
+                    }
+
+                    Vector3 above = new Vector3(x, y, z + height);
+                    yield return AnimateTcpLinearUR(tcp, above,
+                        simMoveSecPerStep * SIM_T_DESCEND, label + " above");
+                    tcp = above;
+                    break;
+                }
+                case "descend":
+                {
+                    // 放置時手上有方塊要再多留一點，跟 ExecuteStep 相同
+                    float zd = z;
+                    if (!source && holdingObject) zd += Mathf.Max(0f, placeDescendExtraZ);
+                    Vector3 down = new Vector3(x, y, zd);
+                    yield return AnimateTcpLinearUR(tcp, down,
+                        simMoveSecPerStep * SIM_T_DESCEND, label);
+                    tcp = down;
+                    break;
+                }
+                case "lift":
+                {
+                    // lift 必須是 Cartesian 直線；movej 會換 IK 分支，把手臂整個甩開
+                    Vector3 up = new Vector3(x, y, z + height);
+                    yield return AnimateTcpLinearUR(tcp, up,
+                        simMoveSecPerStep * SIM_T_LIFT, label);
+                    tcp = up;
+                    break;
+                }
+                case "grasp":
+                    cube.transform.SetParent(gripper, worldPositionStays: true);
+                    holdingObject = true;
+                    Debug.Log($"  [{label}] 夾住 {cube.name}");
+                    yield return new WaitForSeconds(simHoldSec);
+                    break;
+                case "release":
+                    cube.transform.SetParent(cubeOriginalParent, worldPositionStays: true);
+                    cube.transform.localScale = SimScaleFor(env.target_position);
+                    cube.transform.localPosition = targetLocal;
+                    holdingObject = false;
+                    Debug.Log($"  [{label}] 放開 {cube.name}");
+                    yield return new WaitForSeconds(simHoldSec);
+                    break;
+                case "wait":
+                    yield return new WaitForSeconds(
+                        Mathf.Clamp(action.seconds > 0f ? action.seconds : 0.5f, 0.1f, 3f));
+                    break;
+                case "go_home":
+                    yield return AnimateJointsTo(BuildHomePose(),
+                        simMoveSecPerStep * SIM_T_HOME);
+                    tcp = CurrentSimTcpUR();
+                    break;
+                default:
+                    Debug.LogError($"[Executor-{tag}] 不認得的 robot function：{action.function}" +
+                                   "（實機遇到會直接 abort 這一步）");
+                    break;
+            }
+        }
+
+        // 序列跑完方塊還在夾爪上 = LLM 少給了 release，實機會把方塊一路帶著走
+        if (holdingObject)
+        {
+            Debug.LogError($"[Executor-{tag}] step {env.step_id} 結束時方塊仍被夾著" +
+                           "（action_sequence 裡沒有 release）");
+            cube.transform.SetParent(cubeOriginalParent, worldPositionStays: true);
+            cube.transform.localScale = SimScaleFor(env.target_position);
+            cube.transform.localPosition = targetLocal;
+        }
 
         cube.name = $"{tag}_step{env.step_id}";
     }
@@ -1016,16 +1090,52 @@ public class JsonExecutor : MonoBehaviour
         return yawDeg + simYawOffsetDeg;
     }
 
-    // hover 時 TCP 的目標高度，語意跟 BuildReachPoseForQR 的 hoverOverride 一致。
-    // 垂直升降的起訖點必須用這個，才會跟 swing 階段停的高度接得上（否則手臂會先跳一下）。
-    float HoverArmZFor(float qrZ)
-        => useCanonicalKinematics ? (qrZ + simGripperHoverM) : simFixedArmZ;
+    // 各類動作各佔 simMoveSecPerStep 的比例。沿用改版前 7-phase 的權重，
+    // 動畫節奏跟以前一致；但動作數量現在由 action_sequence 決定，單步總長不再固定。
+    private const float SIM_T_PRELIFT = 0.10f;
+    private const float SIM_T_TRAVEL  = 0.20f;
+    private const float SIM_T_DESCEND = 0.15f;
+    private const float SIM_T_LIFT    = 0.10f;
+    private const float SIM_T_HOME    = 0.10f;
 
-    // 垂直下降/上升：TCP 沿 Cartesian Z 走直線，每 frame 重算 IK
-    //   qrX/qrY 保持固定，qrZ 也固定（是 cube 頂），只有 arm 目標 Z 從 startArmZ 線性到 endArmZ
-    //   內部用 hoverOverride = armZ - qrZ 灌進 BuildReachPoseForQR 讓 IK 每次算對應姿態
-    IEnumerator AnimateArmVertical(float qrX, float qrY, float qrZ,
-                                    float startArmZ, float endArmZ, float seconds)
+    // action_sequence 缺漏時的後備序列，內容跟 LLM Motion Planner 正常產出的一致。
+    // 實機遇到空序列會直接判 missing action_sequence，這裡只是讓預覽仍演得出東西。
+    List<RobotFunctionCall> BuildDefaultActionSequence()
+    {
+        return new List<RobotFunctionCall>
+        {
+            new RobotFunctionCall { function = "move_above", location = "source", height_m = SAFE_Z_OFFSET },
+            new RobotFunctionCall { function = "descend",    location = "source" },
+            new RobotFunctionCall { function = "grasp" },
+            new RobotFunctionCall { function = "wait",       seconds = 0.2f },
+            new RobotFunctionCall { function = "lift",       location = "source", height_m = SAFE_Z_OFFSET },
+            new RobotFunctionCall { function = "move_above", location = "target", height_m = SAFE_Z_OFFSET },
+            new RobotFunctionCall { function = "descend",    location = "target" },
+            new RobotFunctionCall { function = "release" },
+            new RobotFunctionCall { function = "wait",       seconds = 0.2f },
+            new RobotFunctionCall { function = "lift",       location = "target", height_m = SAFE_Z_OFFSET },
+        };
+    }
+
+    // 模擬手臂目前的 TCP 位置（UR base frame），等同實機讀 urListener.CartesianInfo。
+    // 直譯器每個動作都要知道「現在在哪」，才能決定要不要 prelift、以及走哪條 travel 路徑。
+    Vector3 CurrentSimTcpUR()
+    {
+        double[] q = new double[6];
+        bool haveAngles = robotArm != null && robotArm.Angles != null && robotArm.Angles.Length >= 6;
+        for (int i = 0; i < 6; i++)
+        {
+            if (haveAngles) q[i] = robotArm.Angles[i] * Mathf.Deg2Rad;
+            else if (_lastIKJointsRad != null) q[i] = _lastIKJointsRad[i];
+        }
+        var p = UR3eKinematics.FKPose(q);
+        return new Vector3((float)p.x, (float)p.y, (float)p.z);
+    }
+
+    // Cartesian 直線：TCP 在 UR base frame 由 fromUR 走到 toUR，每 frame 重算 IK。
+    // 對應實機的 movel。不能改用關節內插（那是 movej，TCP 會走成弧線，
+    // 直上直下的夾取放置就會歪掉，而且可能中途換 IK 分支把手臂甩開）。
+    IEnumerator AnimateTcpLinearUR(Vector3 fromUR, Vector3 toUR, float seconds, string tag)
     {
         if (robotArm == null || robotArm.Angles == null || robotArm.Angles.Length == 0)
         {
@@ -1035,28 +1145,41 @@ public class JsonExecutor : MonoBehaviour
         int n = robotArm.Angles.Length;
         seconds = Mathf.Max(0.01f, seconds);
 
-        Debug.Log($"[Executor-sim] AnimateArmVertical: qr=({qrX:F3},{qrY:F3},{qrZ:F3}), armZ {startArmZ:F3}→{endArmZ:F3} in {seconds:F2}s");
+        Debug.Log($"[Executor-sim] {tag}: UR ({fromUR.x:F4},{fromUR.y:F4},{fromUR.z:F4}) → " +
+                  $"({toUR.x:F4},{toUR.y:F4},{toUR.z:F4}) in {seconds:F2}s");
 
-        int frameCount = 0;
+        int ikFailures = 0;
         float elapsed = 0f;
         while (elapsed < seconds)
         {
             elapsed += Time.deltaTime;
             float k = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / seconds));
-            float armZ = Mathf.Lerp(startArmZ, endArmZ, k);
-            float hOvr = armZ - qrZ;   // BuildReachPoseForQR 內部：zTarget = qrZ + hOvr = armZ
-            var pose = BuildReachPoseForQR(qrX, qrY, qrZ, hoverOverride: hOvr);
-            int m = Mathf.Min(n, pose.Length);
-            for (int i = 0; i < m; i++) robotArm.Angles[i] = pose[i];
-            frameCount++;
+            Vector3 p = Vector3.Lerp(fromUR, toUR, k);
+            if (TryBuildPoseUR(p.x, p.y, p.z, out float[] pose, out _))
+            {
+                int m = Mathf.Min(n, pose.Length);
+                for (int i = 0; i < m; i++) robotArm.Angles[i] = pose[i];
+            }
+            else ikFailures++;
             yield return null;
         }
-        // 收尾：確保停在 endArmZ
-        var final = BuildReachPoseForQR(qrX, qrY, qrZ, hoverOverride: endArmZ - qrZ);
-        int mf = Mathf.Min(n, final.Length);
-        for (int i = 0; i < mf; i++) robotArm.Angles[i] = final[i];
 
-        Debug.Log($"[Executor-sim] AnimateArmVertical done: {frameCount} frames, final Angles=[{string.Join(",", System.Array.ConvertAll(final, a => a.ToString("F1")))}]°");
+        // 收尾：確保精確停在終點
+        if (TryBuildPoseUR(toUR.x, toUR.y, toUR.z, out float[] final, out string finalErr))
+        {
+            int mf = Mathf.Min(n, final.Length);
+            for (int i = 0; i < mf; i++) robotArm.Angles[i] = final[i];
+        }
+        else
+        {
+            Debug.LogError($"[Executor-sim] {tag}: 終點 IK 無解 — {finalErr}（實機在這裡會停下來）");
+        }
+
+        if (ikFailures > 0)
+        {
+            Debug.LogWarning($"[Executor-sim] {tag}: 路徑上有 {ikFailures} 個取樣點 IK 無解，" +
+                             "這段直線實機走不完整");
+        }
     }
 
     // 將 robotArm.Angles 從目前值平滑插值到 targetDeg
@@ -1157,6 +1280,9 @@ public class JsonExecutor : MonoBehaviour
 
         // 記錄 preview 過程中新生成的 cube（結束時要刪掉，不留垃圾）
         int cubesBeforePreview = cubes.Count;
+
+        // 實機的 ExecuteBatch 在第一步之前會先 SendReady，預覽要從同一個姿態起步
+        yield return SimGoToReadyPose("preview initial ready");
 
         // 對每個 step 跑 AnimateOneStep
         foreach (StepEnvelope env in batch.steps)
@@ -1610,6 +1736,33 @@ public class JsonExecutor : MonoBehaviour
         lastMotionError = $"UR motion timeout during {tag}: home was not reached";
     }
 
+    // 模擬版的 SendReady：實機每個 batch 開始前都會先 movej 到 readyJointsRad，
+    // 預覽也必須從同一個姿態起步。少了這一步，第一個 move_above 會從 startpoint
+    // （手臂打直、夾爪朝側面）直接拉一條斜線到 travel 平面，中途要求夾爪朝下的
+    // 姿態根本不可達 —— 實機不會這樣走，預覽卻會演出來。
+    IEnumerator SimGoToReadyPose(string tag)
+    {
+        if (!useReadyPose)
+        {
+            Debug.Log($"  [{tag}] SKIP: Use Ready Pose is off");
+            yield break;
+        }
+        if (readyJointsRad == null || readyJointsRad.Length != 6)
+        {
+            Debug.LogError($"  [{tag}] Ready pose requires exactly 6 joint values");
+            yield break;
+        }
+
+        float[] deg = new float[6];
+        for (int i = 0; i < 6; i++) deg[i] = readyJointsRad[i] * Mathf.Rad2Deg;
+        Debug.Log($"  [{tag}] ready pose = [{string.Join(", ", System.Array.ConvertAll(deg, a => a.ToString("F1")))}]°");
+        yield return AnimateJointsTo(deg, simMoveSecPerStep * SIM_T_HOME);
+
+        // IK 連續性的參考 q 也要跟著換，否則下一段 Cartesian 直線會從舊分支起算
+        _lastIKJointsRad = new double[6];
+        for (int i = 0; i < 6; i++) _lastIKJointsRad[i] = readyJointsRad[i];
+    }
+
     IEnumerator SendReady(string tag, long stepEpoch, int stepId)
     {
         if (!IsExecutionCurrent(stepEpoch, stepId)) yield break;
@@ -1891,13 +2044,9 @@ public class JsonExecutor : MonoBehaviour
         }
 
         var tcp = urListener.CartesianInfo;
-        float startX = (float)tcp.X;
-        float startY = (float)tcp.Y;
-        float startAngle = Mathf.Atan2(startY, startX) * Mathf.Rad2Deg;
-        float targetAngle = Mathf.Atan2(targetY, targetX) * Mathf.Rad2Deg;
-        float angleDelta = Mathf.DeltaAngle(startAngle, targetAngle);
-        int arcSteps = Mathf.Max(1,
-            Mathf.CeilToInt(Mathf.Abs(angleDelta) / BASE_DETOUR_MAX_ANGLE_STEP_DEG));
+        var waypoints = BuildBaseDetourWaypoints(
+            (float)tcp.X, (float)tcp.Y, targetX, targetY);
+        int arcSteps = waypoints.Count - 2;   // 扣掉 entry 與最後的目的地
 
         Debug.Log($"  [{tag}] Direct path crosses base exclusion; routing " +
                   $"around R={BASE_DETOUR_RADIUS_M:F3}m in {arcSteps} arc segment(s).");
@@ -1905,27 +2054,15 @@ public class JsonExecutor : MonoBehaviour
         // Move radially to the routing circle, trace a short polygonal arc, then
         // move radially to the destination. Every segment remains outside the
         // exclusion cylinder and is independently checked by SendMove.
-        float startRad = startAngle * Mathf.Deg2Rad;
-        yield return SendMove(
-            BASE_DETOUR_RADIUS_M * Mathf.Cos(startRad),
-            BASE_DETOUR_RADIUS_M * Mathf.Sin(startRad),
-            targetZ, orientation, skewDeg, tag + " detour-entry", true,
-            stepEpoch, stepId);
-        if (!lastMotionSucceeded) yield break;
-
-        for (int i = 1; i <= arcSteps; i++)
+        for (int i = 0; i < waypoints.Count; i++)
         {
-            float angle = (startAngle + angleDelta * i / arcSteps) * Mathf.Deg2Rad;
-            yield return SendMove(
-                BASE_DETOUR_RADIUS_M * Mathf.Cos(angle),
-                BASE_DETOUR_RADIUS_M * Mathf.Sin(angle),
-                targetZ, orientation, skewDeg, $"{tag} detour-arc {i}/{arcSteps}",
-                true, stepEpoch, stepId);
+            string label = i == 0 ? " detour-entry"
+                         : i == waypoints.Count - 1 ? " detour-exit"
+                         : $" detour-arc {i}/{arcSteps}";
+            yield return SendMove(waypoints[i].x, waypoints[i].y, targetZ,
+                orientation, skewDeg, tag + label, true, stepEpoch, stepId);
             if (!lastMotionSucceeded) yield break;
         }
-
-        yield return SendMove(targetX, targetY, targetZ, orientation, skewDeg,
-            tag + " detour-exit", true, stepEpoch, stepId);
     }
 
     bool InsideSourceBaseExclusion(float x, float y)
@@ -1934,11 +2071,50 @@ public class JsonExecutor : MonoBehaviour
                SOURCE_BASE_EXCLUSION_RADIUS_M * SOURCE_BASE_EXCLUSION_RADIUS_M;
     }
 
+    // 水平移動要經過的 (x, y) 路徑點（UR base frame），最後一點一定是目的地。
+    // 直線不會掃到底座就只回目的地；會掃到就回「徑向進入 → 沿 R=BASE_DETOUR_RADIUS_M
+    // 的折線弧 → 徑向離開」。實機的 SendTravelMoveWithBaseDetour 跟模擬的直譯器
+    // 都呼叫這個，兩邊才會走完全相同的路徑。
+    List<Vector2> BuildBaseDetourWaypoints(float startX, float startY,
+                                           float targetX, float targetY)
+    {
+        var points = new List<Vector2>();
+        if (IsLinearPathClearOfBase(startX, startY, targetX, targetY, out _))
+        {
+            points.Add(new Vector2(targetX, targetY));
+            return points;
+        }
+
+        float startAngle = Mathf.Atan2(startY, startX) * Mathf.Rad2Deg;
+        float targetAngle = Mathf.Atan2(targetY, targetX) * Mathf.Rad2Deg;
+        float angleDelta = Mathf.DeltaAngle(startAngle, targetAngle);
+        int arcSteps = Mathf.Max(1,
+            Mathf.CeilToInt(Mathf.Abs(angleDelta) / BASE_DETOUR_MAX_ANGLE_STEP_DEG));
+
+        float startRad = startAngle * Mathf.Deg2Rad;
+        points.Add(new Vector2(BASE_DETOUR_RADIUS_M * Mathf.Cos(startRad),
+                               BASE_DETOUR_RADIUS_M * Mathf.Sin(startRad)));
+        for (int i = 1; i <= arcSteps; i++)
+        {
+            float angle = (startAngle + angleDelta * i / arcSteps) * Mathf.Deg2Rad;
+            points.Add(new Vector2(BASE_DETOUR_RADIUS_M * Mathf.Cos(angle),
+                                   BASE_DETOUR_RADIUS_M * Mathf.Sin(angle)));
+        }
+        points.Add(new Vector2(targetX, targetY));
+        return points;
+    }
+
     bool IsLinearTcpPathClearOfBase(float targetX, float targetY, out float minimumRadius)
     {
         var tcp = urListener.CartesianInfo;
-        float startX = (float)tcp.X;
-        float startY = (float)tcp.Y;
+        return IsLinearPathClearOfBase((float)tcp.X, (float)tcp.Y,
+                                       targetX, targetY, out minimumRadius);
+    }
+
+    // 純幾何版：起點也當參數傳進來，模擬沒有實機 TCP 可讀，必須用這個。
+    bool IsLinearPathClearOfBase(float startX, float startY,
+                                 float targetX, float targetY, out float minimumRadius)
+    {
         float dx = targetX - startX;
         float dy = targetY - startY;
         float lengthSquared = dx * dx + dy * dy;
