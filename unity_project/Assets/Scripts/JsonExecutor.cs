@@ -193,7 +193,7 @@ public class JsonExecutor : MonoBehaviour
     // private const float SKEW_SIGN = 1f;
     // Reject TCP targets too close to the base axis. Reaching into this cylinder
     // requires a tightly folded arm and can make adjacent UR3e links collide.
-    private const float BASE_EXCLUSION_RADIUS_M = 0.14f;
+    private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
     // Picking needs more clearance than placing because the source-side tool
     // orientation and attached gripper can fold the wrist/forearm toward the base.
     private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.23f;
@@ -203,7 +203,7 @@ public class JsonExecutor : MonoBehaviour
     private const float BASE_DETOUR_MAX_ANGLE_STEP_DEG = 25f;
     // Avoid poses that make the UR3e almost fully extend. Those IK solutions are
     // fragile and can trigger a protective stop before the TCP reaches the block.
-    private const float MAX_REACH_RADIUS_M = 0.45f;
+    private const float MAX_REACH_RADIUS_M = 0.42f;
     // Do not advance merely because a fixed delay elapsed.  Every motion is
     // confirmed against the UR secondary-interface feedback first.
     private const float MOTION_START_GRACE_SEC = 0.35f;

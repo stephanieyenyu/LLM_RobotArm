@@ -40,10 +40,10 @@ public class WorkspaceBounds
     // 2D bitmap placement origin and cell spacing.
     // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
     // 整片 5x5 必須落在實機安全半徑 0.16..0.42 m 之間（JsonExecutor 的 BASE_EXCLUSION / MAX_REACH）。
-    // 5.4 cm 格距增加相鄰積木與夾爪之間的操作空間。
+    // 5.2 cm 格距增加相鄰積木與夾爪之間的操作空間。
     public double TargetOriginX { get; set; } = 0.49;
     public double TargetOriginY { get; set; } = 0.04;
-    public double CellSize { get; set; } = 0.054;
+    public double CellSize { get; set; } = 0.052;
     public double DefaultBlockZ { get; set; } = 0.025;
     public int MaxRows { get; set; } = 5;
     public int MaxCols { get; set; } = 5;

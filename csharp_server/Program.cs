@@ -188,6 +188,29 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
         return;
     }
 
+    var realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
+    for (int compactAttempt = 1; realize.Error != null && compactAttempt <= 2; compactAttempt++)
+    {
+        int span = compactAttempt == 1 ? 4 : 3;
+        string feedback = $"Physical placement failed: {realize.Error}. Keep the original target identity and " +
+            $"the same {workspace.MaxRows}x{workspace.MaxCols} canvas. Do not enlarge the canvas or change cell spacing " +
+            $"({workspace.CellSize:F3} m). Redraw a compact recognizable candidate whose occupied bounding box " +
+            $"is at most {span} rows by {span} columns; leave remaining cells empty. " +
+            "If exact recognizable identity cannot fit these constraints, report infeasible instead of forcing it.";
+        Console.WriteLine($"[Layer 2 compact retry] {compactAttempt}/2: 維持畫布與格距，佔用範圍最多 {span}x{span}；重新生成與評審。");
+        try
+        {
+            pattern = await patternDesigner.DesignAsync(userCommand, blockColor, cubeBudget, dominoBudget,
+                feedback, span);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Layer 1 compact] 無可接受候選：{ex.Message}");
+            continue;
+        }
+        realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
+    }
+
     int br = pattern.Bitmap!.GetLength(0), bc = pattern.Bitmap.GetLength(1);
     var rows = new List<string>();
     Console.WriteLine($"[Layer 1] pattern={pattern.PatternId}, bitmap={br}x{bc}");
@@ -211,7 +234,6 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
             timestamp = DateTime.Now.ToString("s"),
         }, jsonOptions));
 
-    var realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
     if (realize.Error != null || realize.Targets == null)
     {
         Console.WriteLine($"[Layer 2] {realize.Error}");
@@ -1345,7 +1367,7 @@ async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps,
             target.Y += offset.Y;
             double radius = Math.Sqrt(Math.Pow(-0.38824 + target.X, 2) + Math.Pow(-0.35473 + target.Y, 2));
             if (target.X < workspace.TargetZoneXMin || target.X > 0.72 ||
-                target.Y < 0 || target.Y > 0.45 || radius < 0.14 || radius > 0.45)
+                target.Y < 0 || target.Y > 0.45 || radius < 0.16 || radius > 0.42)
             { valid = false; break; }
             var assignment = new Assignment
             {

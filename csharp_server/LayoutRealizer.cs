@@ -123,7 +123,7 @@ if (dominosNeeded > dominoBudget)
             return new RealizeResult
             {
                 Error = $"CellSize={ws.CellSize:F3} m 的本次圖案無法在 placement area 內平移到 " +
-                        "UR 半徑篩選 0.14..0.45 m；未停用 IK 與碰撞限制。",
+                        "UR 半徑篩選 0.16..0.42 m；未停用 IK 與碰撞限制。",
             };
         }
 
@@ -149,8 +149,8 @@ if (dominosNeeded > dominoBudget)
     {
         const double qrToRobotX = -0.38824;
         const double qrToRobotY = -0.35473;
-        const double minReach = 0.14;
-        const double maxReach = 0.45;
+        const double minReach = 0.16;
+        const double maxReach = 0.42;
         const double placementMaxX = 0.72;
         const double placementMinY = 0.00;
         const double placementMaxY = 0.45;

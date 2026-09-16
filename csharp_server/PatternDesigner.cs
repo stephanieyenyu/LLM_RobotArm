@@ -52,7 +52,8 @@ public sealed class PatternDesigner
         this.maxCols = maxCols;
     }
 
-    public async Task<CanonicalPattern> DesignAsync(string command, string color = "yellow", int cubes = 0, int dominoes = 0)
+    public async Task<CanonicalPattern> DesignAsync(string command, string color = "yellow", int cubes = 0, int dominoes = 0,
+        string layoutFeedback = "", int maxOccupiedSpan = 0)
     {
         if (string.IsNullOrWhiteSpace(command)) throw new ArgumentException("User command is empty.");
         int capacity = cubes + dominoes * 2;
@@ -60,10 +61,10 @@ public sealed class PatternDesigner
         if (SkipReview)
         {
             Console.WriteLine("[Layer 1] SKIP_PATTERN_REVIEW=1：只生成一次 bitmap，不做交叉審查/投票。");
-            var single = await GenerateOpenAi(command, color, cubes, dominoes, "");
+            var single = await GenerateOpenAi(command, color, cubes, dominoes, layoutFeedback);
             PrintCandidate("OpenAI", single);
             var localCheck = Validate(single, capacity);
-            if (!localCheck.Valid)
+            if (!localCheck.Valid || !FitsOccupiedSpan(single, maxOccupiedSpan))
                 throw new InvalidOperationException($"單次生成的 bitmap 未通過格式/庫存檢查：{localCheck.Error}");
             return new CanonicalPattern
             {
@@ -73,7 +74,7 @@ public sealed class PatternDesigner
             };
         }
 
-        string openFeedback = "", geminiFeedback = "";
+        string openFeedback = layoutFeedback, geminiFeedback = layoutFeedback;
 
         for (int round = 1; round <= MaxRounds; round++)
         {
@@ -106,6 +107,7 @@ public sealed class PatternDesigner
             AddRevisionIfValid(finalists, openReview, "Gemini revision by OpenAI", command, capacity);
             AddRevisionIfValid(finalists, gemReview, "OpenAI revision by Gemini", command, capacity);
             finalists = finalists
+                .Where(c => FitsOccupiedSpan(c, maxOccupiedSpan))
                 .GroupBy(c => string.Join("/", c.Bitmap ?? new List<string>()))
                 .Select(g => g.First())
                 .ToList();
@@ -133,10 +135,25 @@ public sealed class PatternDesigner
                     BlockColor = color,
                 };
             }
-            openFeedback = Feedback(openLocal.Error, openReview);
-            geminiFeedback = Feedback(gemLocal.Error, gemReview);
+            openFeedback = layoutFeedback + "\n" + Feedback(openLocal.Error, openReview);
+            geminiFeedback = layoutFeedback + "\n" + Feedback(gemLocal.Error, gemReview);
         }
         throw new InvalidOperationException($"雙模型交叉評審在 {MaxRounds} 輪後仍未接受任何 bitmap。");
+    }
+
+    static bool FitsOccupiedSpan(Candidate candidate, int maximum)
+    {
+        if (maximum <= 0) return true;
+        int minRow = int.MaxValue, minCol = int.MaxValue, maxRow = -1, maxCol = -1;
+        var bitmap = candidate.Bitmap ?? new List<string>();
+        for (int r = 0; r < bitmap.Count; r++)
+            for (int c = 0; c < bitmap[r].Length; c++)
+                if (bitmap[r][c] == '1')
+                {
+                    minRow = Math.Min(minRow, r); maxRow = Math.Max(maxRow, r);
+                    minCol = Math.Min(minCol, c); maxCol = Math.Max(maxCol, c);
+                }
+        return maxRow >= 0 && maxRow - minRow + 1 <= maximum && maxCol - minCol + 1 <= maximum;
     }
 
     async Task<Candidate> GenerateOpenAi(string command, string color, int cubes, int dominoes, string feedback)
