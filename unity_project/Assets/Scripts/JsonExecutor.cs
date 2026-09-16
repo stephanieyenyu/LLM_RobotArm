@@ -105,7 +105,10 @@ public class JsonExecutor : MonoBehaviour
     // TCP hover 高度（cube 頂端上方 m）
     public float simGripperHoverM = 0.08f;
     // TCP 接觸高度（cube 頂端加這個）— pick/place 下降時用
-    public float simGripperContactM = 0.005f;
+    // 舊 2D IK 專用；canonical 模式改用跟實機相同的 Z_CORRECTION（見 ContactExtraZ）
+    public float simContactClearanceM = 0.005f;
+    // 下降接觸時 TCP 高於方塊頂的距離；canonical 模式跟實機 ExecuteStep 用同一個常數，模擬才等於實機
+    float ContactExtraZ => useCanonicalKinematics ? Z_CORRECTION : simContactClearanceM;
     // Gripper 朝下的 TCP rotation vector（URScript axis-angle）
     // 預設 (π,0,0) = TCP z 軸朝下（工具指向地面）
     public Vector3 simGripperDownRotVec = new Vector3(Mathf.PI, 0f, 0f);
@@ -171,9 +174,10 @@ public class JsonExecutor : MonoBehaviour
     public float[] readyJointsRad = new float[6] { -1.5708f, -1.5708f, 1.5708f, -1.5708f, 0f, 0f };
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
-    private const float QR1_X = -0.38824f;
-    private const float QR1_Y = -0.35973f+0.005f;
-    private const float QR1_Z = 0.030f;
+    // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
+    public const float QR1_X = -0.38824f;
+    public const float QR1_Y = -0.35973f+0.005f;
+    public const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;
     private const float Z_CORRECTION = 0.02f;
@@ -661,8 +665,9 @@ public class JsonExecutor : MonoBehaviour
         // Canonical UR3e kinematics 分支（★ 建議走這條）
         if (useCanonicalKinematics)
         {
-            bool hoverAbove = hoverOverride < 0f;
-            if (TryBuildKinematicsPose(qrX, qrY, qrZ, hoverAbove, out float[] kinJoints, out string kinErr))
+            // hoverOverride < 0 → 用 simGripperHoverM；>= 0 → 直接當「TCP 高於 cube 頂多少 m」
+            float extraZ = hoverOverride < 0f ? simGripperHoverM : hoverOverride;
+            if (TryBuildKinematicsPose(qrX, qrY, qrZ, extraZ, out float[] kinJoints, out string kinErr))
                 return kinJoints;
             Debug.LogError($"[Executor-sim] Canonical IK failed for QR ({qrX:F3},{qrY:F3},{qrZ:F3}): {kinErr}");
             // fallback: 退回舊 heuristic，讓動畫至少能動；但 batch 檢查會在上游擋住
@@ -733,12 +738,18 @@ public class JsonExecutor : MonoBehaviour
     bool TryBuildKinematicsPose(float qrX, float qrY, float qrZ, bool hoverAbove,
                                  out float[] jointsDeg, out string error)
     {
-        // QR frame → UR base frame（保留 simFlipX/Y 相容）
+        float extraZ = hoverAbove ? simGripperHoverM : ContactExtraZ;
+        return TryBuildKinematicsPose(qrX, qrY, qrZ, extraZ, out jointsDeg, out error);
+    }
+
+    // 連續版：extraZAboveCube 是 TCP 相對 cube 頂的高度差（公尺，任意值）
+    bool TryBuildKinematicsPose(float qrX, float qrY, float qrZ, float extraZAboveCube,
+                                 out float[] jointsDeg, out string error)
+    {
+        // canonical 模式的座標映射是精確的；simFlipX/Y 只屬於舊 2D IK，套在這裡會把目標鏡射
         double urX = QR1_X + qrX;
         double urY = QR1_Y + qrY;
-        if (simFlipX) urX = -urX;
-        if (simFlipY) urY = -urY;
-        double urZ = QR1_Z + qrZ + (hoverAbove ? simGripperHoverM : simGripperContactM);
+        double urZ = QR1_Z + qrZ + extraZAboveCube;
 
         var target = new UR3eKinematics.Pose
         {
@@ -787,6 +798,18 @@ public class JsonExecutor : MonoBehaviour
             if (env == null || env.done) continue;
             if (env.source_position == null || env.target_position == null) continue;
 
+            // 跟實機 ExecuteStep 用同一組安全範圍，否則會「模擬通過、實機拒絕」
+            float ox = QR1_X + env.source_position.x + pickOffsetX;
+            float oy = QR1_Y + env.source_position.y + pickOffsetY;
+            float tx = QR1_X + env.target_position.x;
+            float ty = QR1_Y + env.target_position.y;
+            if (InsideSourceBaseExclusion(ox, oy) || OutsideReachEnvelope(ox, oy))
+                failures.Add($"step {env.step_id} source @ UR({ox:F3},{oy:F3}) 半徑 {Mathf.Sqrt(ox * ox + oy * oy):F3} m " +
+                             $"超出實機安全範圍 {SOURCE_BASE_EXCLUSION_RADIUS_M:F2}..{MAX_REACH_RADIUS_M:F2} m");
+            if (InsideBaseExclusion(tx, ty) || OutsideReachEnvelope(tx, ty))
+                failures.Add($"step {env.step_id} target @ UR({tx:F3},{ty:F3}) 半徑 {Mathf.Sqrt(tx * tx + ty * ty):F3} m " +
+                             $"超出實機安全範圍 {BASE_EXCLUSION_RADIUS_M:F2}..{MAX_REACH_RADIUS_M:F2} m");
+
             foreach (var (label, pos, hover) in new[]
             {
                 ($"step {env.step_id} source hover",  env.source_position, true),
@@ -796,9 +819,7 @@ public class JsonExecutor : MonoBehaviour
             })
             {
                 double urX = QR1_X + pos.x; double urY = QR1_Y + pos.y;
-                if (simFlipX) urX = -urX;
-                if (simFlipY) urY = -urY;
-                double urZ = QR1_Z + pos.z + (hover ? simGripperHoverM : simGripperContactM);
+                double urZ = QR1_Z + pos.z + (hover ? simGripperHoverM : ContactExtraZ);
                 var tgt = new UR3eKinematics.Pose
                 {
                     x = urX, y = urY, z = urZ,
@@ -888,44 +909,79 @@ public class JsonExecutor : MonoBehaviour
         // 保留 cube 原始 parent (CubeContainer)，之後 restore 用
         Transform cubeOriginalParent = cube.transform.parent;
 
-        // 計算 source/target 姿態，Z 統一用 hover 高度（不下降），XY 可用 Inspector 偏移對位
-        float[] poseAtSource = BuildReachPoseForQR(
+        // 7-phase 動畫：hover 掃 → 下降到 cube 頂 → 抬 → hover 掃 → 下降 → 抬 → home
+        // 每個 phase 的 Z 都用該 step 自己的 qrZ 算，所以 source / target 高度不同也自動處理。
+        //   hover   用 hoverOverride = -1（canonical → qrZ + simGripperHoverM）
+        //   contact 用 ContactExtraZ（canonical：跟實機相同的 Z_CORRECTION）
+        // canonical 模式下 IK 目標是 TCP（RobotArm.toolOffsetZ = Teach Pendant 的 TCP），
+        // 所以這裡不需要任何「夾爪多長」的補償。
+        float[] poseSourceHover = BuildReachPoseForQR(
             env.source_position.x + simPickGripperOffsetX,
             env.source_position.y + simPickGripperOffsetY,
-            env.source_position.z);
-        float[] poseAtTarget = BuildReachPoseForQR(
+            env.source_position.z, hoverOverride: -1f);
+        float[] poseSourceContact = BuildReachPoseForQR(
+            env.source_position.x + simPickGripperOffsetX,
+            env.source_position.y + simPickGripperOffsetY,
+            env.source_position.z, hoverOverride: ContactExtraZ);
+        float[] poseTargetHover = BuildReachPoseForQR(
             env.target_position.x + simPlaceGripperOffsetX,
             env.target_position.y + simPlaceGripperOffsetY,
-            env.target_position.z);
+            env.target_position.z, hoverOverride: -1f);
+        float[] poseTargetContact = BuildReachPoseForQR(
+            env.target_position.x + simPlaceGripperOffsetX,
+            env.target_position.y + simPlaceGripperOffsetY,
+            env.target_position.z, hoverOverride: ContactExtraZ);
 
-        // 時間分配（總長 simMoveSecPerStep）：Z 固定 hover 高度，不做上下升降
+        // 時間分配（總長 simMoveSecPerStep）：分給 7 個 phase
         float total = simMoveSecPerStep;
-        float t_toSource = total * 0.30f;
-        float t_pickUp   = total * 0.15f;
-        float t_swing    = total * 0.30f;
-        float t_release  = total * 0.05f;
-        float t_home     = total * 0.10f;
+        float tA  = total * 0.20f;  // swing to source hover
+        float tA2 = total * 0.15f;  // descend to source cube
+        float tB  = total * 0.10f;  // lift from source
+        float tC  = total * 0.20f;  // swing to target hover
+        float tC2 = total * 0.15f;  // descend to target
+        float tD  = total * 0.10f;  // lift from target
+        float tF  = total * 0.10f;  // home
 
-        // A. arm 旋到 source 上方（Z 固定 hover）
-        if (armEnabled) yield return AnimateJointsTo(poseAtSource, t_toSource);
-        else            yield return new WaitForSeconds(t_toSource * 0.1f);
+        // ---- A. Arm swing 到 source XY（hover Z） ----
+        if (armEnabled) yield return AnimateJointsTo(poseSourceHover, tA);
+        else            yield return new WaitForSeconds(tA * 0.1f);
         yield return new WaitForSeconds(simHoldSec);
 
-        // B. cube 抬到 hover 位置
-        yield return AnimateLocalTo(cube.transform, sourceHover, t_pickUp);
+        // ---- A2. Arm 垂直下降到 source cube 頂（Cartesian 直線，每 frame 重算 IK） ----
+        float srcX = env.source_position.x + simPickGripperOffsetX;
+        float srcY = env.source_position.y + simPickGripperOffsetY;
+        float srcZ = env.source_position.z;
+        float tgtX = env.target_position.x + simPlaceGripperOffsetX;
+        float tgtY = env.target_position.y + simPlaceGripperOffsetY;
+        float tgtZ = env.target_position.z;
+        float srcContactZ = srcZ + ContactExtraZ;
+        // 實機放置時（手上有方塊）descend 會再加 placeDescendExtraZ，這裡照做
+        float tgtContactZ = tgtZ + ContactExtraZ + (useCanonicalKinematics ? Mathf.Max(0f, placeDescendExtraZ) : 0f);
+        if (armEnabled) yield return AnimateArmVertical(srcX, srcY, srcZ, HoverArmZFor(srcZ), srcContactZ, tA2);
+        else            yield return AnimateLocalTo(cube.transform, sourceLocal, tA2);
+        // 夾爪碰到方塊後 attach
         if (armEnabled && gripper != null)
         {
-            cube.transform.position = gripper.position;
             cube.transform.SetParent(gripper, worldPositionStays: true);
         }
         yield return new WaitForSeconds(simHoldSec);
 
-        // C. arm 旋到 target 上方（cube 跟著飛，全程 hover 高度）
-        if (armEnabled) yield return AnimateJointsTo(poseAtTarget, t_swing);
-        else            yield return AnimateLocalTo(cube.transform, targetHover, t_swing);
+        // ---- B. Arm 垂直抬回 hover（cube 隨 gripper 上來） ----
+        if (armEnabled) yield return AnimateArmVertical(srcX, srcY, srcZ, srcContactZ, HoverArmZFor(srcZ), tB);
+        else            yield return AnimateLocalTo(cube.transform, sourceHover, tB);
         yield return new WaitForSeconds(simHoldSec);
 
-        // D. 解 parent + 平滑過渡到 targetHover
+        // ---- C. Arm swing 到 target XY（hover Z，cube 隨 gripper 飛） ----
+        if (armEnabled) yield return AnimateJointsTo(poseTargetHover, tC);
+        else            yield return AnimateLocalTo(cube.transform, targetHover, tC);
+        yield return new WaitForSeconds(simHoldSec);
+
+        // ---- C2. Arm 垂直下降到 target 位置（Cartesian 直線） ----
+        if (armEnabled) yield return AnimateArmVertical(tgtX, tgtY, tgtZ, HoverArmZFor(tgtZ), tgtContactZ, tC2);
+        else            yield return AnimateLocalTo(cube.transform, targetLocal, tC2);
+        yield return new WaitForSeconds(simHoldSec);
+
+        // ---- release：unparent，snap 到精確 target local，改成 target scale ----
         if (armEnabled && gripper != null)
         {
             if (cubeOriginalParent != null)
@@ -934,17 +990,14 @@ public class JsonExecutor : MonoBehaviour
                 cube.transform.SetParent(null, worldPositionStays: true);
         }
         cube.transform.localScale = SimScaleFor(env.target_position);
-        if (simSnapTransitionSec > 0f)
-            yield return AnimateLocalTo(cube.transform, targetHover, simSnapTransitionSec);
-        else
-            cube.transform.localPosition = targetHover;
+        cube.transform.localPosition = targetLocal;
 
-        // E. cube 垂直下降到 targetLocal（精確位置）
-        yield return AnimateLocalTo(cube.transform, targetLocal, t_release);
+        // ---- D. Arm 垂直抬回 target hover（cube 已放，不跟） ----
+        if (armEnabled) yield return AnimateArmVertical(tgtX, tgtY, tgtZ, tgtContactZ, HoverArmZFor(tgtZ), tD);
         yield return new WaitForSeconds(simHoldSec);
 
-        // F. arm 回 home
-        if (armEnabled) yield return AnimateJointsTo(BuildHomePose(), t_home);
+        // ---- F. Arm 回 home ----
+        if (armEnabled) yield return AnimateJointsTo(BuildHomePose(), tF);
         yield return new WaitForSeconds(0.15f);
 
         cube.name = $"{tag}_step{env.step_id}";
@@ -961,6 +1014,49 @@ public class JsonExecutor : MonoBehaviour
         float yawDeg = yawRad * Mathf.Rad2Deg;
         if (simYawInvert) yawDeg = -yawDeg;
         return yawDeg + simYawOffsetDeg;
+    }
+
+    // hover 時 TCP 的目標高度，語意跟 BuildReachPoseForQR 的 hoverOverride 一致。
+    // 垂直升降的起訖點必須用這個，才會跟 swing 階段停的高度接得上（否則手臂會先跳一下）。
+    float HoverArmZFor(float qrZ)
+        => useCanonicalKinematics ? (qrZ + simGripperHoverM) : simFixedArmZ;
+
+    // 垂直下降/上升：TCP 沿 Cartesian Z 走直線，每 frame 重算 IK
+    //   qrX/qrY 保持固定，qrZ 也固定（是 cube 頂），只有 arm 目標 Z 從 startArmZ 線性到 endArmZ
+    //   內部用 hoverOverride = armZ - qrZ 灌進 BuildReachPoseForQR 讓 IK 每次算對應姿態
+    IEnumerator AnimateArmVertical(float qrX, float qrY, float qrZ,
+                                    float startArmZ, float endArmZ, float seconds)
+    {
+        if (robotArm == null || robotArm.Angles == null || robotArm.Angles.Length == 0)
+        {
+            yield return new WaitForSeconds(seconds * 0.1f);
+            yield break;
+        }
+        int n = robotArm.Angles.Length;
+        seconds = Mathf.Max(0.01f, seconds);
+
+        Debug.Log($"[Executor-sim] AnimateArmVertical: qr=({qrX:F3},{qrY:F3},{qrZ:F3}), armZ {startArmZ:F3}→{endArmZ:F3} in {seconds:F2}s");
+
+        int frameCount = 0;
+        float elapsed = 0f;
+        while (elapsed < seconds)
+        {
+            elapsed += Time.deltaTime;
+            float k = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / seconds));
+            float armZ = Mathf.Lerp(startArmZ, endArmZ, k);
+            float hOvr = armZ - qrZ;   // BuildReachPoseForQR 內部：zTarget = qrZ + hOvr = armZ
+            var pose = BuildReachPoseForQR(qrX, qrY, qrZ, hoverOverride: hOvr);
+            int m = Mathf.Min(n, pose.Length);
+            for (int i = 0; i < m; i++) robotArm.Angles[i] = pose[i];
+            frameCount++;
+            yield return null;
+        }
+        // 收尾：確保停在 endArmZ
+        var final = BuildReachPoseForQR(qrX, qrY, qrZ, hoverOverride: endArmZ - qrZ);
+        int mf = Mathf.Min(n, final.Length);
+        for (int i = 0; i < mf; i++) robotArm.Angles[i] = final[i];
+
+        Debug.Log($"[Executor-sim] AnimateArmVertical done: {frameCount} frames, final Angles=[{string.Join(",", System.Array.ConvertAll(final, a => a.ToString("F1")))}]°");
     }
 
     // 將 robotArm.Angles 從目前值平滑插值到 targetDeg

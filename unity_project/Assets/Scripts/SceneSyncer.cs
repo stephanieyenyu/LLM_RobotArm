@@ -24,7 +24,8 @@ using UnityEngine.Networking;
 public class SceneSyncer : MonoBehaviour
 {
     // ★ Robot/QR → Unity local 座標轉換（single source of truth）
-    // 呼叫端拿到 Vector3 後可再加 halfHeight 之類的 offset
+    // 對應 RobotArm.Robot2Unity：Robot X → Unity +Z、Robot Y → Unity -X、Robot Z → Unity +Y
+    // 這是保持左右手性的轉換；換成別的對應（例如 X→X、Y→-Z）場景會變成現實的鏡像
     public static Vector3 QRToUnity(float qrX, float qrY, float qrZ)
     {
         return new Vector3(-qrY, qrZ, qrX);
@@ -44,36 +45,38 @@ public class SceneSyncer : MonoBehaviour
     public float pollIntervalSec = 0.3f;         // mode 端點的輪詢頻率
 
     [Header("工作平面尺寸（公尺，對應真實工作台）")]
+    // 真實值取自 perception_server /scene 的 workspace_info.width_m / depth_m（相機實測 QR 中心間距）
     public float workspaceWidthM = 0.622f;       // QR1 → QR2 距離
     public float workspaceDepthM = 0.281f;       // QR1 → QR3 距離
 
     [Header("手臂 base 在 QR frame 中的位置（把 workspace 對齊到手臂）")]
-    // 預設：手臂在 QR3-QR4 邊的中點（近手臂側邊的中央）
-    // 若實際擺法不同，改這個 X/Y（QR frame 座標）
-    public float armBaseAtQrX = 0.311f;   // = workspaceWidthM / 2
-    public float armBaseAtQrY = 0.281f;   // = workspaceDepthM（QR3-QR4 邊）
+    // 預設值 = -JsonExecutor.QR1_X / -QR1_Y（Teach Pendant 實測值）
+    // 手臂 base 在 robot (0,0,0)，QR1 在 robot (QR1_X, QR1_Y)，所以在 QR frame 裡
+    // 手臂座標 = (-QR1_X, -QR1_Y) = (0.38824, 0.35473)
+    // Inspector 也可以手動蓋掉這個值
+    public float armBaseAtQrX = -JsonExecutor.QR1_X;   // 0.38824
+    public float armBaseAtQrY = -JsonExecutor.QR1_Y;   // 0.35473
+    // 桌面（QR 平面）比手臂安裝面高 QR1_Z，所以手臂 base 在 QR frame 的 Z 是 -QR1_Z
+    public float armBaseAtQrZ = -JsonExecutor.QR1_Z;   // -0.030
 
-    [Header("Workspace 視覺旋轉")]
-    // 繞 Unity Y 軸轉整個 workspace（含 cubes / QR 標記 / zones）
-    // 90 = 順時針 90°；只影響視覺不影響 QR→Unity 的 IK 計算
-    public float workspaceYawDeg = 90f;
+    [Header("白色底板往外延伸（公尺）")]
+    // 底板往 4 個 QR 邊界外多延伸這個距離（純視覺，QR marker 位置不變）
+    // 例：0.15 = 每一邊多 15cm，讓底板比 QR 圍住的範圍大
+    public float planeMarginM = 0.15f;
 
     [Header("補貨區 / 擺放區邊界（跟 PlacementPlanner 常數對齊）")]
-    public float supplyZoneXMax = 0.35f;
-    public float targetZoneOriginX = 0.49f;
-    public float targetZoneOriginY = 0.04f;
-    public float cellSize = 0.04f;               // 2.5cm 立方體 + 1.5cm 間隙
-    public int gridRows = 5;
-    public int gridCols = 5;
+    // 必須與 csharp_server/LayeredTypes.cs 的 WorkspaceBounds 相同（LLM 規劃目標格用的值），不開放 Inspector 覆寫
+    [System.NonSerialized] public float supplyZoneXMax = 0.35f;
+    [System.NonSerialized] public float targetZoneOriginX = 0.49f;
+    [System.NonSerialized] public float targetZoneOriginY = 0.04f;
+    [System.NonSerialized] public float cellSize = 0.04f;
+    [System.NonSerialized] public int gridRows = 5;
+    [System.NonSerialized] public int gridCols = 5;
 
     [Header("積木顯示")]
     public float cubeSizeM = 0.025f;             // 2.5 cm 立方體
     public bool autoCreateWorkspace = true;      // 啟動時自動建工作平面 + QR 標記
 
-    [Header("桌面顯示放大")]
-    // 只放大視覺，不改任何座標邏輯（cube localPosition 仍是真實公尺）
-    // 1.0 = 原本大小；> 1 放大；< 1 縮小
-    public float visualScale = 1.0f;
 
     // ---- 內部狀態 ----
     private Transform workspaceRoot;
@@ -102,21 +105,23 @@ public class SceneSyncer : MonoBehaviour
         workspaceRoot = new GameObject("Workspace").transform;
         workspaceRoot.SetParent(transform, false);
 
-        // 把整組 workspace 位移，讓 QR(armBaseAtQrX, armBaseAtQrY, 0) 對到 Unity (0,0,0)
-        // 這樣手臂（在 world 原點）視覺上就落在 QR frame 指定的位置
-        Vector3 armInWorkspace = QRToUnity(armBaseAtQrX, armBaseAtQrY, 0f);
-        workspaceRoot.localPosition = -armInWorkspace;
+        // 整組 workspace 平移，讓「手臂 base 在 QR frame 的位置」對到 Unity 原點（手臂所在處）。
+        // 含 Z：桌面落在 robot Z = QR1_Z，跟 IK 目標高度一致（否則方塊畫面上會比 IK 目標低 QR1_Z）。
+        workspaceRoot.localRotation = Quaternion.identity;
+        workspaceRoot.localPosition = -QRToUnity(armBaseAtQrX, armBaseAtQrY, armBaseAtQrZ);
 
         // 工作平面（薄薄的白色 Cube 當桌板）
-        // Robot X 沿 workspaceWidthM，Y 沿 workspaceDepthM；在 Unity 是 Z 沿 width、-X 沿 depth
+        // Robot X 沿 workspaceWidthM → Unity +Z；Robot Y 沿 workspaceDepthM → Unity -X
+        // planeMarginM 讓底板往 4 邊外延伸；QR marker 位置不變（仍在原 QR 座標）
         GameObject plane = GameObject.CreatePrimitive(PrimitiveType.Cube);
         plane.name = "WorkspacePlane";
         plane.transform.SetParent(workspaceRoot, false);
         Vector3 planeCenter = QRToUnity(workspaceWidthM / 2f, workspaceDepthM / 2f, 0f);
         planeCenter.y = -0.005f;
         plane.transform.localPosition = planeCenter;
-        // Unity local scale: X 是 depth（robot Y 方向）、Z 是 width（robot X 方向）
-        plane.transform.localScale = new Vector3(workspaceDepthM, 0.01f, workspaceWidthM);
+        float extendedWidth = workspaceWidthM + 2f * planeMarginM;   // robot X 方向 → Unity Z 長度
+        float extendedDepth = workspaceDepthM + 2f * planeMarginM;   // robot Y 方向 → Unity X 長度
+        plane.transform.localScale = new Vector3(extendedDepth, 0.01f, extendedWidth);
         SetColor(plane, new Color(0.92f, 0.92f, 0.92f));
 
         // 4 個 QR 角落標記（QR frame 座標）
@@ -136,8 +141,8 @@ public class SceneSyncer : MonoBehaviour
         SetColor(supply, new Color(0.4f, 0.7f, 1f, 0.5f));
 
         // 擺放區（黃色半透明，grid 實體邊界）
-        float targetW = gridCols * cellSize;  // robot X 方向
-        float targetD = gridRows * cellSize;  // robot Y 方向
+        float targetW = gridCols * cellSize;  // robot X 方向 → Unity Z
+        float targetD = gridRows * cellSize;  // robot Y 方向 → Unity X
         GameObject target = GameObject.CreatePrimitive(PrimitiveType.Cube);
         target.name = "TargetZone";
         target.transform.SetParent(workspaceRoot, false);
@@ -154,11 +159,6 @@ public class SceneSyncer : MonoBehaviour
         cubeContainer = new GameObject("CubeContainer").transform;
         cubeContainer.SetParent(workspaceRoot, false);
 
-        // 應用視覺放大（只影響顯示大小，不影響 cube 內部座標）
-        if (visualScale > 0f && Mathf.Abs(visualScale - 1f) > 0.001f)
-        {
-            workspaceRoot.localScale = Vector3.one * visualScale;
-        }
     }
 
     // 讓外部（JsonExecutor 模擬模式）依 QR frame 座標找最近的 cube
@@ -364,7 +364,7 @@ public class SceneSyncer : MonoBehaviour
             // Scale：cube 是正方；domino 沿長軸 5cm、短軸 2.5cm
             //   robot X 方向 → Unity +Z；robot Y 方向 → Unity -X
             //   horizontal → 長軸沿 robot X（= Unity Z）
-            //   vertical   → 長軸沿 robot Y（= Unity X 反向；scale 只需要絕對值）
+            //   vertical   → 長軸沿 robot Y（= Unity X，scale 取絕對值）
             Vector3 scale;
             if (obj.shape == "domino")
             {
