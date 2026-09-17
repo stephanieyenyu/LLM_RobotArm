@@ -44,7 +44,7 @@ public class WorkspaceBounds
     public double TargetBottomY { get; set; } = 0.02;
     public double TargetOriginX { get; set; } = 0.49; // 3D placement uses its own origin.
     public double TargetOriginY { get; set; } = 0.04;
-    public double CellSize { get; set; } = 0.053;
+    public double CellSize { get; set; } = 0.052;
     public double SpatialCellSize { get; set; } = 0.052;
     public double DefaultBlockZ { get; set; } = 0.025;
     public int MaxRows { get; set; } = 5;

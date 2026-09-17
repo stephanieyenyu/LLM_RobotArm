@@ -123,8 +123,7 @@ public class UIManager : MonoBehaviour
         root.Add(controlPanel);
 
         // ---------------------------------------------------------
-        // 左上角模擬工具：手動新增黃色方塊 / 清空
-        // 讓沒接相機的情況下也能測試 pick-and-place
+        // 左上角 pattern 審查開關
         // ---------------------------------------------------------
         var simPanel = new VisualElement();
         simPanel.style.position = UnityEngine.UIElements.Position.Absolute;
@@ -136,31 +135,6 @@ public class UIManager : MonoBehaviour
         simPanel.style.paddingBottom = 6;
         simPanel.style.paddingLeft = 6;
         simPanel.style.paddingRight = 6;
-
-        var simLabel = new Label("模擬工具");
-        simLabel.style.color = Color.white;
-        simLabel.style.marginBottom = 4;
-        simPanel.Add(simLabel);
-
-        var addYellowBtn = new Button(() => OnAddManualCube("yellow"));
-        addYellowBtn.text = "＋ 黃色方塊";
-        addYellowBtn.style.height = 36;
-        addYellowBtn.style.width = 130;
-        addYellowBtn.style.marginBottom = 4;
-        simPanel.Add(addYellowBtn);
-
-        var addBlackBtn = new Button(() => OnAddManualCube("black"));
-        addBlackBtn.text = "＋ 黑色方塊";
-        addBlackBtn.style.height = 36;
-        addBlackBtn.style.width = 130;
-        addBlackBtn.style.marginBottom = 4;
-        simPanel.Add(addBlackBtn);
-
-        var clearBtn = new Button(() => OnClearManualCubes());
-        clearBtn.text = "清空所有方塊";
-        clearBtn.style.height = 36;
-        clearBtn.style.width = 130;
-        simPanel.Add(clearBtn);
 
         // 跳過 pattern 審查：寫進跟 csharp_server 共用的檔案，C# server 每次
         // 排 pattern 前都會重讀這個檔案，所以這裡勾選/取消隨時生效，不用重開
