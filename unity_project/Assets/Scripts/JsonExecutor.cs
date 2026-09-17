@@ -285,6 +285,7 @@ public class JsonExecutor : MonoBehaviour
     private bool lastMotionSucceeded;
     private string lastMotionError;
     private bool lastStepReportedSuccess;
+    private string lastStepReportedError;
     private bool safetyRecoverySucceeded;
     private long executionEpoch;
 
@@ -305,6 +306,11 @@ public class JsonExecutor : MonoBehaviour
     // 只控制「模擬結束比對 bitmap」這一關。動作規劃檢查、軌跡奇點 / 碰撞檢查、
     // 硬體安全範圍一律開著，不受這個開關影響。
     private bool verificationEnabled = true;
+
+    // 軌跡錯誤訊息的格式。左上角方塊 180° 備案靠這兩個判斷「是不是該方塊的自身碰撞」，
+    // 改訊息文字時要一起改，不然備案永遠不會觸發。
+    static string TrajectoryStepPrefix(int stepId) => $"第 {stepId} 步第 ";
+    const string SelfCollisionText = "自身碰撞";
 
     // ---- 模擬結束比對 bitmap ----
     // 模擬過程中每顆方塊的狀態。落點由夾爪 TCP（正向運動學）決定，不直接瞬移到指令目標，
@@ -393,7 +399,7 @@ public class JsonExecutor : MonoBehaviour
 
         Debug.LogWarning($"[Executor] 啟動時發現上一次留下的 {currentStepFile}（id {staleId}），已刪除、不會執行");
         if (!staleDone && staleId > 0)
-            WriteStepDone(staleId, false, "Unity restarted; stale command discarded without execution", 0f);
+            WriteStepDone(staleId, false, "Unity 重新啟動，上一次留下的指令已丟棄、沒有執行", 0f);
     }
 
     void OnDestroy()
@@ -453,7 +459,7 @@ public class JsonExecutor : MonoBehaviour
             StopCoroutine(currentStepCoroutine);
             currentStepCoroutine = null;
             currentStepId = -1;
-            WriteStepDone(abortedStepId, false, "aborted by user (GoHome)", 0f);
+            WriteStepDone(abortedStepId, false, "使用者中止（回 Home）", 0f);
             Debug.LogWarning($"[Executor] 已中止 step {abortedStepId}，改為返回 Home");
 
             // 將 perception 切回 idle，讓 SceneSyncer 恢復更新。
@@ -575,7 +581,7 @@ public class JsonExecutor : MonoBehaviour
         if (previewOnlySharedTrajectory && !useSharedMovejTrajectory)
         {
             WriteStepDone(batch.batch_id, false,
-                "preview-only requires the shared joint trajectory", 0f);
+                "只預覽模式需要開啟共用關節軌跡", 0f);
             yield break;
         }
 
@@ -590,7 +596,7 @@ public class JsonExecutor : MonoBehaviour
             if (!useReadyPose || readyJointsRad == null || readyJointsRad.Length != 6)
             {
                 WriteStepDone(batch.batch_id, false,
-                    "shared movej trajectory requires a calibrated 6-axis Ready pose", 0f);
+                    "共用關節軌跡需要已校正的 6 軸預備姿勢（Ready pose）", 0f);
                 yield break;
             }
             if (robotArm == null) robotArm = FindObjectOfType<RobotArm>();
@@ -605,8 +611,8 @@ public class JsonExecutor : MonoBehaviour
                     step.target_position.shape == "cube" &&
                     step.target_position.name == "target_cube_r0_c0");
                 if (topLeftCube != null &&
-                    trajectoryError.StartsWith($"step {topLeftCube.step_id} action ", StringComparison.Ordinal) &&
-                    trajectoryError.Contains("self-collision"))
+                    trajectoryError.StartsWith(TrajectoryStepPrefix(topLeftCube.step_id), StringComparison.Ordinal) &&
+                    trajectoryError.Contains(SelfCollisionText))
                 {
                     // A 180-degree yaw preserves the parallel-jaw footprint at this cube.
                     string originalError = trajectoryError;
@@ -617,12 +623,12 @@ public class JsonExecutor : MonoBehaviour
                         Debug.Log($"[Executor-shared] step {topLeftCube.step_id} top-left cube uses 180-degree tool yaw; all other target orientations unchanged.");
                     }
                     else
-                        trajectoryError = originalError + "; top-left cube 180-degree yaw also rejected: " + trajectoryError;
+                        trajectoryError = originalError + "；左上角方塊改成夾爪轉 180° 也不行：" + trajectoryError;
                 }
             }
             if (!trajectoryReady)
             {
-                string message = $"shared movej trajectory rejected before preview: {trajectoryError}";
+                string message = $"手臂路徑檢查未通過（預覽前退回）：{trajectoryError}";
                 Debug.LogError("[Executor-shared] " + message);
                 WriteStepDone(batch.batch_id, false, message, 0f);
                 yield break;
@@ -679,7 +685,7 @@ public class JsonExecutor : MonoBehaviour
             RobotArm.FreezeVisualFeedback = false;
             yield return StartCoroutine(SetPerceptionMode("idle"));
             WriteStepDone(batch.batch_id, false,
-                "preview-only: shared trajectory shown; no UR motion sent", 0f);
+                "只預覽模式：已播放共用軌跡，沒有送出實體手臂動作", 0f);
             Debug.Log("[Executor-preview] Preview-only finished; UR motion was not sent.");
             yield break;
         }
@@ -689,7 +695,7 @@ public class JsonExecutor : MonoBehaviour
             RobotArm.FreezeVisualFeedback = false;
             yield return StartCoroutine(SetPerceptionMode("idle"));
             WriteStepDone(batch.batch_id, false,
-                "top-left cube 180-degree yaw previewed; hardware motion requires explicit Inspector approval", 0f);
+                "已預覽左上角方塊轉 180° 的備案；要讓實體手臂執行，需在 Inspector 勾選允許", 0f);
             Debug.LogWarning("[Executor-preview] Top-left cube yaw fallback previewed only; no UR motion sent.");
             yield break;
         }
@@ -717,11 +723,11 @@ public class JsonExecutor : MonoBehaviour
             currentStepId = batch.batch_id;
             long recoveryEpoch = ++executionEpoch;
             yield return WaitForManualSafetyRecovery(
-                "before executing the batch", recoveryEpoch, batch.batch_id);
+                "批次開始前", recoveryEpoch, batch.batch_id);
             currentStepId = -1;
             if (!safetyRecoverySucceeded)
             {
-                string error = lastMotionError ?? "UR safety recovery failed";
+                string error = lastMotionError ?? "UR 安全停止後的復原失敗";
                 WriteStepDone(batch.batch_id, false, error, 0f);
                 RobotArm.FreezeVisualFeedback = false;
                 yield return StartCoroutine(SetPerceptionMode("idle"));
@@ -731,11 +737,11 @@ public class JsonExecutor : MonoBehaviour
 
         currentStepId = batch.batch_id;
         long readyEpoch = ++executionEpoch;
-        yield return SendReady("batch initial ready", readyEpoch, batch.batch_id);
+        yield return SendReady("批次開始 回 Ready", readyEpoch, batch.batch_id);
         if (!lastMotionSucceeded)
         {
             string error = string.IsNullOrEmpty(lastMotionError)
-                ? "UR initial Ready failed"
+                ? "UR 開始前回到 Ready 姿勢失敗"
                 : lastMotionError;
             WriteStepDone(batch.batch_id, false, error, 0f);
             RobotArm.FreezeVisualFeedback = false;
@@ -753,7 +759,7 @@ public class JsonExecutor : MonoBehaviour
             if (env.source_position == null || env.target_position == null)
             {
                 Debug.LogWarning($"[Executor] batch step {env?.step_id} 缺少 source/target");
-                WriteStepDone(env != null ? env.step_id : batch.batch_id, false, "batch step missing source/target", 0f);
+                WriteStepDone(env != null ? env.step_id : batch.batch_id, false, "批次中有步驟缺少來源或目標", 0f);
                 RobotArm.FreezeVisualFeedback = false;
                 yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
@@ -771,6 +777,10 @@ public class JsonExecutor : MonoBehaviour
             if (stepEpoch != executionEpoch || !lastStepReportedSuccess)
             {
                 Debug.LogWarning($"[Executor] batch {batch.batch_id} stopped after step {env.step_id}");
+                // 單步失敗只回報了那一步的編號，但 csharp_server 等的是整批的編號；
+                // 不補這一筆，server 收不到錯誤原因，要空等到逾時（每步 600 秒）。
+                string reason = string.IsNullOrEmpty(lastStepReportedError) ? "沒有回報原因" : lastStepReportedError;
+                WriteStepDone(batch.batch_id, false, $"第 {i + 1}/{batch.steps.Count} 步（編號 {env.step_id}）失敗，整批停止：{reason}", 0f);
                 RobotArm.FreezeVisualFeedback = false;
                 yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
@@ -784,12 +794,12 @@ public class JsonExecutor : MonoBehaviour
             for (int i = 0; i < sharedFinalTrajectory.Count; i++)
             {
                 yield return SendExplicitJointTarget(sharedFinalTrajectory[i],
-                    $"batch final shared {i + 1}/{sharedFinalTrajectory.Count}",
+                    $"批次收尾 共用軌跡 {i + 1}/{sharedFinalTrajectory.Count}",
                     finalEpoch, batch.batch_id);
                 if (!lastMotionSucceeded)
                 {
                     WriteStepDone(batch.batch_id, false,
-                        lastMotionError ?? "UR final shared trajectory failed", 0f);
+                        lastMotionError ?? "UR 收尾的共用軌跡執行失敗", 0f);
                     RobotArm.FreezeVisualFeedback = false;
                     yield return StartCoroutine(SetPerceptionMode("idle"));
                     currentStepId = -1;
@@ -806,11 +816,11 @@ public class JsonExecutor : MonoBehaviour
         long finalLiftEpoch = ++executionEpoch;
         yield return SendCurrentTcpLiftToTravelHeight(
             QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE,
-            "batch final safe lift", finalLiftEpoch, batch.batch_id);
+            "批次收尾 安全抬升", finalLiftEpoch, batch.batch_id);
         if (!lastMotionSucceeded)
         {
             string error = string.IsNullOrEmpty(lastMotionError)
-                ? "UR final safe lift failed"
+                ? "UR 收尾安全抬升失敗"
                 : lastMotionError;
             WriteStepDone(batch.batch_id, false, error, 0f);
             RobotArm.FreezeVisualFeedback = false;
@@ -820,11 +830,11 @@ public class JsonExecutor : MonoBehaviour
         }
 
         long finalReadyEpoch = ++executionEpoch;
-        yield return SendReady("batch final ready", finalReadyEpoch, batch.batch_id);
+        yield return SendReady("批次收尾 回 Ready", finalReadyEpoch, batch.batch_id);
         if (!lastMotionSucceeded)
         {
             string error = string.IsNullOrEmpty(lastMotionError)
-                ? "UR final Ready failed"
+                ? "UR 收尾回到 Ready 姿勢失敗"
                 : lastMotionError;
             WriteStepDone(batch.batch_id, false, error, 0f);
             RobotArm.FreezeVisualFeedback = false;
@@ -834,11 +844,11 @@ public class JsonExecutor : MonoBehaviour
         }
 
         long homeEpoch = ++executionEpoch;
-        yield return SendHome("batch final go_home", homeEpoch, batch.batch_id);
+        yield return SendHome("批次收尾 回 Home", homeEpoch, batch.batch_id);
         if (!lastMotionSucceeded)
         {
             string error = string.IsNullOrEmpty(lastMotionError)
-                ? "UR final Home failed"
+                ? "UR 收尾回到 Home 失敗"
                 : lastMotionError;
             WriteStepDone(batch.batch_id, false, error, 0f);
             RobotArm.FreezeVisualFeedback = false;
@@ -1008,7 +1018,7 @@ public class JsonExecutor : MonoBehaviour
             var planned = new List<PlannedJointAction>();
             if (env.action_sequence == null)
             {
-                error = $"step {env.step_id} has no action_sequence";
+                error = $"第 {env.step_id} 步沒有 action_sequence";
                 return false;
             }
 
@@ -1026,7 +1036,7 @@ public class JsonExecutor : MonoBehaviour
                 NamedPosition pos = source ? env.source_position : env.target_position;
                 if (pos == null && action.function != "wait" && action.function != "go_home")
                 {
-                    error = $"step {env.step_id} action {actionIndex + 1} lacks position";
+                    error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作缺少位置";
                     return false;
                 }
 
@@ -1046,7 +1056,7 @@ public class JsonExecutor : MonoBehaviour
                     if (!PlanMoveAbove(pa, ref reference, current, x, y, z + height,
                             orientation, out error))
                     {
-                        error = $"step {env.step_id} action {actionIndex + 1}: {error}";
+                        error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作：{error}";
                         return false;
                     }
                 }
@@ -1055,7 +1065,7 @@ public class JsonExecutor : MonoBehaviour
                     if (!source && holding) z += Mathf.Max(0f, placeDescendExtraZ);
                     if (!PlanJointPose(pa, ref reference, x, y, z, orientation, out error))
                     {
-                        error = $"step {env.step_id} action {actionIndex + 1}: {error}";
+                        error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作：{error}";
                         return false;
                     }
                 }
@@ -1063,7 +1073,7 @@ public class JsonExecutor : MonoBehaviour
                 {
                     if (!PlanJointPose(pa, ref reference, x, y, z + height, orientation, out error))
                     {
-                        error = $"step {env.step_id} action {actionIndex + 1}: {error}";
+                        error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作：{error}";
                         return false;
                     }
                 }
@@ -1072,7 +1082,7 @@ public class JsonExecutor : MonoBehaviour
                     double[] home = { -1.5708, -1.5708, 0.0, -1.5708, 0.0, 0.0 };
                     if (!ValidateJointTransition(reference, home, out error, allowSingularEnd: true))
                     {
-                        error = $"step {env.step_id} action {actionIndex + 1}: {error}";
+                        error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作：{error}";
                         return false;
                     }
                     pa.targets.Add(home);
@@ -1099,13 +1109,13 @@ public class JsonExecutor : MonoBehaviour
         var readySolution = UR3eKinematics.IKNearest(readyPose, reference);
         if (!readySolution.ok)
         {
-            error = $"final Ready IK {readySolution.error}: {readySolution.message}";
+            error = $"收尾回到 Ready 姿勢無解（{UR3eKinematics.Describe(readySolution.error)}）：{readySolution.message}";
             return false;
         }
         double[] ready = readySolution.q;
         if (!ValidateJointTransition(reference, ready, out error, allowSingularEnd: false))
         {
-            error = "final Ready transition: " + error;
+            error = "收尾回到 Ready 的路徑：" + error;
             return false;
         }
         sharedFinalTrajectory.Add((double[])ready.Clone());
@@ -1113,7 +1123,7 @@ public class JsonExecutor : MonoBehaviour
         double[] homeTarget = { -1.5708, -1.5708, 0.0, -1.5708, 0.0, 0.0 };
         if (!ValidateJointTransition(reference, homeTarget, out error, allowSingularEnd: true))
         {
-            error = "final Home transition: " + error;
+            error = "收尾回到 Home 的路徑：" + error;
             return false;
         }
         sharedFinalTrajectory.Add(homeTarget);
@@ -1486,7 +1496,7 @@ public class JsonExecutor : MonoBehaviour
                              $"{bitmapCheckErrors.Count} 項，對照組照樣繼續");
             return true;
         }
-        string summary = $"simulation bitmap check failed ({bitmapCheckErrors.Count}): " +
+        string summary = $"模擬結束比對不通過（{bitmapCheckErrors.Count} 項）：" +
                          string.Join(" | ", bitmapCheckErrors);
         Debug.LogError("[BitmapCheck] " + summary);
         WriteStepDone(batch.batch_id, false, summary, 0f);
@@ -1539,8 +1549,8 @@ public class JsonExecutor : MonoBehaviour
             travelZ = System.Math.Max(minimumTravelZ, travelZ - 0.01);
         }
 
-        error = $"no reachable collision-free travel height in " +
-                $"{minimumTravelZ:F3}..{firstTravelZ:F3}m; last attempt: {lastError}";
+        error = $"找不到到得了又不會碰撞的移動高度（範圍 " +
+                $"{minimumTravelZ:F3}～{firstTravelZ:F3}m）；最後一次失敗原因：{lastError}";
         return false;
     }
 
@@ -1564,7 +1574,7 @@ public class JsonExecutor : MonoBehaviour
             if (startRadius < BASE_EXCLUSION_RADIUS_M ||
                 targetRadius < BASE_EXCLUSION_RADIUS_M)
             {
-                error = "shared travel starts or ends inside the base exclusion radius";
+                error = "移動路徑的起點或終點在底座排除半徑內";
                 return false;
             }
             double startAngle = System.Math.Atan2(startY, startX);
@@ -1601,7 +1611,7 @@ public class JsonExecutor : MonoBehaviour
         var solution = UR3eKinematics.IKNearest(pose, reference);
         if (!solution.ok)
         {
-            error = $"IK {solution.error}: {solution.message} at {pose}";
+            error = $"IK 無解（{UR3eKinematics.Describe(solution.error)}）：{solution.message}，目標 {pose}";
             return false;
         }
         if (!ValidateBaseFacing(solution.q, x, y, out error) ||
@@ -1622,8 +1632,8 @@ public class JsonExecutor : MonoBehaviour
             }
             if (!foundSafeAlternative)
             {
-                error = $"no safe IK transition among primary and {alternatives.Count} alternative solutions; " +
-                        $"primary rejection: {firstTransitionError}; last rejection: {error}";
+                error = $"主要解和 {alternatives.Count} 組替代解都沒有安全的關節轉換；" +
+                        $"主要解退回原因：{firstTransitionError}；最後一組退回原因：{error}";
                 return false;
             }
         }
@@ -1639,8 +1649,8 @@ public class JsonExecutor : MonoBehaviour
             System.Math.Cos(joints[0] - bearing));
         if (System.Math.Abs(delta) > System.Math.PI / 2.0)
         {
-            error = $"base faces away from target by {System.Math.Abs(delta) * Mathf.Rad2Deg:F1} deg " +
-                    $"(base={joints[0] * Mathf.Rad2Deg:F1} deg, bearing={bearing * Mathf.Rad2Deg:F1} deg)";
+            error = $"底座背對目標 {System.Math.Abs(delta) * Mathf.Rad2Deg:F1} 度" +
+                    $"（底座角度={joints[0] * Mathf.Rad2Deg:F1} 度，目標方位={bearing * Mathf.Rad2Deg:F1} 度）";
             return false;
         }
         error = null;
@@ -1680,12 +1690,12 @@ public class JsonExecutor : MonoBehaviour
             if (jointCheck != UR3eKinematics.IKError.None &&
                 !(allowSingularEnd && sample == samples))
             {
-                error = $"joint validation failed at {t:P0}: {jointCheck}";
+                error = $"路徑 {t:P0} 處關節檢查不通過：{UR3eKinematics.Describe(jointCheck)}";
                 return false;
             }
             if (!ValidateApproximateRobotCollision(q, out string collision))
             {
-                error = $"collision at {t:P0}: {collision}";
+                error = $"路徑 {t:P0} 處發生碰撞：{collision}";
                 return false;
             }
         }
@@ -1706,7 +1716,7 @@ public class JsonExecutor : MonoBehaviour
             float minZ = (float)System.Math.Min(p[segment][2], p[segment + 1][2]) - radii[segment];
             if (minZ < tableZ - 0.005f)
             {
-                error = $"link segment {segment} enters tabletop (z={minZ:F3}m)";
+                error = $"第 {segment} 段連桿撞到桌面（z={minZ:F3}m）";
                 return false;
             }
         }
@@ -1725,7 +1735,7 @@ public class JsonExecutor : MonoBehaviour
                 float required = radii[a] + radii[b] + 0.008f;
                 if (distance < required)
                 {
-                    error = $"self-collision link {a}↔{b}: {distance:F3}m < {required:F3}m";
+                    error = $"{SelfCollisionText}：連桿 {a}↔{b} 距離 {distance:F3}m，小於需要的 {required:F3}m";
                     return false;
                 }
             }
@@ -2250,10 +2260,10 @@ public class JsonExecutor : MonoBehaviour
         if (IsRecoverableSafetyStop())
         {
             yield return WaitForManualSafetyRecovery(
-                "before executing the step", stepEpoch, env.step_id);
+                "步驟開始前", stepEpoch, env.step_id);
             if (!safetyRecoverySucceeded)
             {
-                string error = lastMotionError ?? "UR safety recovery failed";
+                string error = lastMotionError ?? "UR 安全停止後的復原失敗";
                 WriteStepDone(env.step_id, false, error, 0f);
                 if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
@@ -2281,10 +2291,10 @@ public class JsonExecutor : MonoBehaviour
             OutsideReachEnvelope(ox, oy, MAX_SOURCE_REACH_RADIUS_M) ||
             OutsideReachEnvelope(tx, ty, MAX_TARGET_REACH_RADIUS_M))
         {
-            string error = $"unsafe target reach: source radius={Mathf.Sqrt(ox * ox + oy * oy):F3}m, " +
-                           $"target radius={Mathf.Sqrt(tx * tx + ty * ty):F3}m, " +
-                           $"source allowed={SOURCE_BASE_EXCLUSION_RADIUS_M:F3}..{MAX_SOURCE_REACH_RADIUS_M:F3}m, " +
-                           $"target allowed={BASE_EXCLUSION_RADIUS_M:F3}..{MAX_TARGET_REACH_RADIUS_M:F3}m";
+            string error = $"目標超出安全範圍：來源半徑={Mathf.Sqrt(ox * ox + oy * oy):F3}m，" +
+                           $"目標半徑={Mathf.Sqrt(tx * tx + ty * ty):F3}m，" +
+                           $"來源允許={SOURCE_BASE_EXCLUSION_RADIUS_M:F3}～{MAX_SOURCE_REACH_RADIUS_M:F3}m，" +
+                           $"目標允許={BASE_EXCLUSION_RADIUS_M:F3}～{MAX_TARGET_REACH_RADIUS_M:F3}m";
             Debug.LogError("[Executor] " + error);
             WriteStepDone(env.step_id, false, error, 0f);
             if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
@@ -2303,7 +2313,7 @@ public class JsonExecutor : MonoBehaviour
 
         if (env.action_sequence == null || env.action_sequence.Count == 0)
         {
-            WriteStepDone(env.step_id, false, "missing action_sequence", 0f);
+            WriteStepDone(env.step_id, false, "缺少 action_sequence", 0f);
             if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
             yield break;
         }
@@ -2321,8 +2331,8 @@ public class JsonExecutor : MonoBehaviour
             if (IsEmergencyStop() || IsRecoverableSafetyStop())
             {
                 string error = IsEmergencyStop()
-                    ? $"UR emergency stop before action {i + 1}; batch stopped"
-                    : $"UR safety stop before action {i + 1}; batch stopped";
+                    ? $"第 {i + 1} 個動作前 UR 緊急停止，整批停止"
+                    : $"第 {i + 1} 個動作前 UR 安全停止，整批停止";
                 WriteStepDone(env.step_id, false, error, Time.realtimeSinceStartup - t0);
                 if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
@@ -2349,16 +2359,16 @@ public class JsonExecutor : MonoBehaviour
             {
                 case "move_above":
                     yield return SendCurrentTcpLiftToTravelHeight(travelZ,
-                        tag + " prelift", stepEpoch, env.step_id);
+                        tag + " 先抬升到移動高度", stepEpoch, env.step_id);
                     if (!lastMotionSucceeded) break;
 
                     // Travel only after the current TCP is already on the high
                     // plane, so the arm does not sweep across the blocks.
                     yield return SendTravelMoveWithBaseDetour(x, y, travelZ,
-                        orientation, skew, tag + " travel", stepEpoch, env.step_id);
+                        orientation, skew, tag + " 平移", stepEpoch, env.step_id);
                     if (!lastMotionSucceeded) break;
                     yield return SendMove(x, y, z + height, orientation, skew,
-                        tag + " above", true, stepEpoch, env.step_id);
+                        tag + " 下降到上方", true, stepEpoch, env.step_id);
                     break;
                 case "descend":
                     if (!source && holdingObject)
@@ -2387,7 +2397,7 @@ public class JsonExecutor : MonoBehaviour
                     yield return SendHome(tag, stepEpoch, env.step_id);
                     break;
                 default:
-                    WriteStepDone(env.step_id, false, "unknown robot function: " + action.function, 0f);
+                    WriteStepDone(env.step_id, false, "不認得的手臂動作：" + action.function, 0f);
                     if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
                     yield break;
             }
@@ -2399,7 +2409,7 @@ public class JsonExecutor : MonoBehaviour
             {
                 float failedDuration = Time.realtimeSinceStartup - t0;
                 string error = string.IsNullOrEmpty(lastMotionError)
-                    ? $"UR motion failed at {tag}"
+                    ? $"UR 動作失敗：{tag}"
                     : lastMotionError;
                 Debug.LogError($"[Executor] Step {env.step_id} stopped: {error}");
                 WriteStepDone(env.step_id, false, error, failedDuration);
@@ -2436,20 +2446,20 @@ public class JsonExecutor : MonoBehaviour
         if (!sharedTrajectory.TryGetValue(stepId, out var actions) ||
             actionIndex < 0 || actionIndex >= actions.Count)
         {
-            lastMotionError = $"missing shared trajectory for step {stepId} action {actionIndex + 1}";
+            lastMotionError = $"第 {stepId} 步第 {actionIndex + 1} 個動作沒有共用軌跡";
             yield break;
         }
 
         var action = actions[actionIndex];
         if (action.targets.Count == 0)
         {
-            lastMotionError = $"shared trajectory action {tag} has no joint targets";
+            lastMotionError = $"共用軌跡的動作 {tag} 沒有關節目標";
             yield break;
         }
         for (int i = 0; i < action.targets.Count; i++)
         {
             yield return SendExplicitJointTarget(action.targets[i],
-                $"{tag} shared {i + 1}/{action.targets.Count}", stepEpoch, stepId);
+                $"{tag} 共用軌跡 {i + 1}/{action.targets.Count}", stepEpoch, stepId);
             if (!lastMotionSucceeded) yield break;
         }
     }
@@ -2471,17 +2481,17 @@ public class JsonExecutor : MonoBehaviour
         {
             if (!IsExecutionCurrent(stepEpoch, stepId))
             {
-                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
                 yield break;
             }
             if (!urListener.Connected)
             {
-                lastMotionError = $"UR disconnected during {tag}";
+                lastMotionError = $"UR 在「{tag}」途中斷線";
                 yield break;
             }
             if (IsEmergencyStop() || IsRecoverableSafetyStop())
             {
-                lastMotionError = $"UR safety stop during {tag}; shared trajectory aborted";
+                lastMotionError = $"UR 在「{tag}」途中安全停止，共用軌跡中止";
                 yield break;
             }
 
@@ -2502,7 +2512,7 @@ public class JsonExecutor : MonoBehaviour
             }
             yield return new WaitForSeconds(0.05f);
         }
-        lastMotionError = $"UR motion timeout during shared trajectory {tag}";
+        lastMotionError = $"UR 執行共用軌跡「{tag}」逾時";
     }
 
     IEnumerator SendMove(
@@ -2514,8 +2524,8 @@ public class JsonExecutor : MonoBehaviour
             !IsLinearTcpPathClearOfBase(x, y, out float minimumPathRadius))
         {
             lastMotionSucceeded = false;
-            lastMotionError = $"unsafe linear TCP path during {tag}: minimum base radius " +
-                              $"{minimumPathRadius:F3}m is below {BASE_EXCLUSION_RADIUS_M:F3}m";
+            lastMotionError = $"「{tag}」的直線路徑太靠近底座：最小半徑 " +
+                              $"{minimumPathRadius:F3}m 小於 {BASE_EXCLUSION_RADIUS_M:F3}m";
             Debug.LogError("[Executor] " + lastMotionError);
             yield break;
         }
@@ -2527,7 +2537,7 @@ public class JsonExecutor : MonoBehaviour
 
         if (!IsExecutionCurrent(stepEpoch, stepId))
         {
-            lastMotionError = $"stale step {stepId} cancelled during {tag}";
+            lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
             yield break;
         }
         Debug.Log($"  [{tag}] SEND: {cmd}");
@@ -2542,17 +2552,17 @@ public class JsonExecutor : MonoBehaviour
         {
             if (!IsExecutionCurrent(stepEpoch, stepId))
             {
-                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
                 yield break;
             }
             if (!urListener.Connected)
             {
-                lastMotionError = $"UR disconnected during {tag}";
+                lastMotionError = $"UR 在「{tag}」途中斷線";
                 yield break;
             }
             if (IsEmergencyStop())
             {
-                lastMotionError = $"UR emergency stop during {tag}; automatic resume is disabled";
+                lastMotionError = $"UR 在「{tag}」途中緊急停止，不會自動恢復";
                 yield break;
             }
             if (IsRecoverableSafetyStop())
@@ -2585,7 +2595,7 @@ public class JsonExecutor : MonoBehaviour
             Debug.LogWarning(
                 $"[Executor] Protective Stop recovery at {tag}: interrupted motion will NOT be retried; batch is stopped in place.");
             lastMotionSucceeded = false;
-            lastMotionError = $"UR protective stop during {tag}; stopped in place without retrying the interrupted motion";
+            lastMotionError = $"UR 在「{tag}」途中保護性停止，已原地停下，不會重試被中斷的動作";
             yield break;
         }
 
@@ -2594,7 +2604,7 @@ public class JsonExecutor : MonoBehaviour
         float finalDy = (float)finalTcp.Y - y;
         float finalDz = (float)finalTcp.Z - z;
         float finalDistance = Mathf.Sqrt(finalDx * finalDx + finalDy * finalDy + finalDz * finalDz);
-        lastMotionError = $"UR motion timeout during {tag}: TCP remained {finalDistance * 1000f:F1} mm from target";
+        lastMotionError = $"UR 執行「{tag}」逾時：夾爪距離目標還有 {finalDistance * 1000f:F1} mm";
     }
 
     IEnumerator SendHome(string tag, long stepEpoch, int stepId)
@@ -2610,7 +2620,7 @@ public class JsonExecutor : MonoBehaviour
         {
             if (!IsExecutionCurrent(stepEpoch, stepId))
             {
-                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
                 yield break;
             }
             string retryLabel = safetyAttempt == 0 ? "" : " (manual safety retry)";
@@ -2624,17 +2634,17 @@ public class JsonExecutor : MonoBehaviour
             {
                 if (!IsExecutionCurrent(stepEpoch, stepId))
                 {
-                    lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                    lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
                     yield break;
                 }
                 if (!urListener.Connected)
                 {
-                    lastMotionError = $"UR disconnected during {tag}";
+                    lastMotionError = $"UR 在「{tag}」途中斷線";
                     yield break;
                 }
                 if (IsEmergencyStop())
                 {
-                    lastMotionError = $"UR emergency stop during {tag}; automatic resume is disabled";
+                    lastMotionError = $"UR 在「{tag}」途中緊急停止，不會自動恢復";
                     yield break;
                 }
                 if (IsRecoverableSafetyStop())
@@ -2666,7 +2676,7 @@ public class JsonExecutor : MonoBehaviour
                 break;
             if (safetyAttempt >= MAX_MANUAL_HOME_RETRIES)
             {
-                lastMotionError = $"UR protective stop repeated during {tag}; retry limit reached";
+                lastMotionError = $"UR 在「{tag}」途中重複保護性停止，已達重試上限";
                 yield break;
             }
 
@@ -2675,7 +2685,7 @@ public class JsonExecutor : MonoBehaviour
                 yield break;
         }
 
-        lastMotionError = $"UR motion timeout during {tag}: home was not reached";
+        lastMotionError = $"UR 執行「{tag}」逾時：沒有回到 Home";
     }
 
     IEnumerator SendReady(string tag, long stepEpoch, int stepId)
@@ -2693,7 +2703,7 @@ public class JsonExecutor : MonoBehaviour
 
         if (readyJointsRad == null || readyJointsRad.Length != 6)
         {
-            lastMotionError = "Ready pose requires exactly 6 joint values";
+            lastMotionError = "Ready 姿勢必須剛好 6 個關節角度";
             Debug.LogError("[Executor] " + lastMotionError);
             yield break;
         }
@@ -2710,22 +2720,22 @@ public class JsonExecutor : MonoBehaviour
         {
             if (!IsExecutionCurrent(stepEpoch, stepId))
             {
-                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
                 yield break;
             }
             if (!urListener.Connected)
             {
-                lastMotionError = $"UR disconnected during {tag}";
+                lastMotionError = $"UR 在「{tag}」途中斷線";
                 yield break;
             }
             if (IsEmergencyStop())
             {
-                lastMotionError = $"UR emergency stop during {tag}; automatic resume is disabled";
+                lastMotionError = $"UR 在「{tag}」途中緊急停止，不會自動恢復";
                 yield break;
             }
             if (IsRecoverableSafetyStop())
             {
-                lastMotionError = $"UR safety stop during {tag}";
+                lastMotionError = $"UR 在「{tag}」途中安全停止";
                 yield break;
             }
             if (urListener.RobotModeData.isProgramRunning)
@@ -2749,14 +2759,14 @@ public class JsonExecutor : MonoBehaviour
             }
             if (!sawProgramRunning && Time.realtimeSinceStartup - startedAt > 1.0f)
             {
-                lastMotionError = $"UR did not start {tag}: {RobotStatusText()}";
+                lastMotionError = $"UR 沒有開始執行「{tag}」：{RobotStatusText()}";
                 Debug.LogError("[Executor] " + lastMotionError);
                 yield break;
             }
             yield return new WaitForSeconds(0.05f);
         }
 
-        lastMotionError = $"UR motion timeout during {tag}: ready pose was not reached";
+        lastMotionError = $"UR 執行「{tag}」逾時：沒有到達 Ready 姿勢";
     }
 
     string BuildJointMovejLine(float[] joints)
@@ -2796,17 +2806,17 @@ public class JsonExecutor : MonoBehaviour
         {
             if (!IsExecutionCurrent(stepEpoch, stepId))
             {
-                lastMotionError = $"stale step {stepId} cancelled during {tag}";
+                lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
                 yield break;
             }
             if (!urListener.Connected)
             {
-                lastMotionError = $"UR disconnected during {tag}";
+                lastMotionError = $"UR 在「{tag}」途中斷線";
                 yield break;
             }
             if (IsEmergencyStop())
             {
-                lastMotionError = $"UR emergency stop during {tag}; automatic resume is disabled";
+                lastMotionError = $"UR 在「{tag}」途中緊急停止，不會自動恢復";
                 yield break;
             }
             if (IsRecoverableSafetyStop())
@@ -2835,7 +2845,7 @@ public class JsonExecutor : MonoBehaviour
             yield return WaitForManualSafetyRecovery(tag, stepEpoch, stepId);
             if (!safetyRecoverySucceeded)
                 yield break;
-            lastMotionError = $"UR protective stop during {tag}; batch was not started";
+            lastMotionError = $"UR 在「{tag}」途中保護性停止，批次沒有開始";
             yield break;
         }
 
@@ -2844,7 +2854,7 @@ public class JsonExecutor : MonoBehaviour
         float finalDy = (float)finalTcp.Y - y;
         float finalDz = (float)finalTcp.Z - targetZ;
         float finalDistance = Mathf.Sqrt(finalDx * finalDx + finalDy * finalDy + finalDz * finalDz);
-        lastMotionError = $"UR motion timeout during {tag}: TCP remained {finalDistance * 1000f:F1} mm from lifted target";
+        lastMotionError = $"UR 執行「{tag}」逾時：夾爪距離抬升目標還有 {finalDistance * 1000f:F1} mm";
     }
 
     IEnumerator WaitForManualSafetyRecovery(
@@ -2862,17 +2872,17 @@ public class JsonExecutor : MonoBehaviour
         {
             if (!IsExecutionCurrent(stepEpoch, stepId))
             {
-                lastMotionError = $"stale step {stepId} cancelled while waiting at {context}";
+                lastMotionError = $"第 {stepId} 步已過期，在等待（{context}）時取消";
                 yield break;
             }
             if (!urListener.Connected)
             {
-                lastMotionError = $"UR disconnected while waiting for manual safety recovery at {context}";
+                lastMotionError = $"等待人工排除安全停止（{context}）時 UR 斷線";
                 yield break;
             }
             if (IsEmergencyStop())
             {
-                lastMotionError = $"UR emergency stop at {context}; automatic resume is disabled";
+                lastMotionError = $"UR 緊急停止（{context}），不會自動恢復";
                 yield break;
             }
 
@@ -2899,7 +2909,7 @@ public class JsonExecutor : MonoBehaviour
             yield return new WaitForSeconds(0.1f);
         }
 
-        lastMotionError = $"Timed out waiting for manual safety recovery at {context}";
+        lastMotionError = $"等待人工排除安全停止逾時（{context}）";
     }
 
     bool IsExecutionCurrent(long stepEpoch, int stepId)
@@ -2930,14 +2940,14 @@ public class JsonExecutor : MonoBehaviour
     string RobotStatusText()
     {
         if (urListener == null)
-            return "UR listener is not started";
+            return "UR 連線尚未啟動";
 
-        return $"connected={urListener.Connected}, " +
-               $"robotMode={urListener.RobotModeData.robotMode}, " +
-               $"safetyMode={urListener.MasterboardData.safetyMode}, " +
-               $"programRunning={urListener.RobotModeData.isProgramRunning}, " +
-               $"protectiveStopped={urListener.RobotModeData.isProtectiveStopped}, " +
-               $"emergencyStopped={urListener.RobotModeData.isEmergencyStopped}";
+        return $"已連線={urListener.Connected}，" +
+               $"手臂模式={urListener.RobotModeData.robotMode}，" +
+               $"安全模式={urListener.MasterboardData.safetyMode}，" +
+               $"程式執行中={urListener.RobotModeData.isProgramRunning}，" +
+               $"保護性停止={urListener.RobotModeData.isProtectiveStopped}，" +
+               $"緊急停止={urListener.RobotModeData.isEmergencyStopped}";
     }
 
     bool InsideBaseExclusion(float x, float y)
@@ -2977,7 +2987,7 @@ public class JsonExecutor : MonoBehaviour
         yield return SendMove(
             BASE_DETOUR_RADIUS_M * Mathf.Cos(startRad),
             BASE_DETOUR_RADIUS_M * Mathf.Sin(startRad),
-            targetZ, orientation, skewDeg, tag + " detour-entry", true,
+            targetZ, orientation, skewDeg, tag + " 繞底座-進入", true,
             stepEpoch, stepId);
         if (!lastMotionSucceeded) yield break;
 
@@ -2987,13 +2997,13 @@ public class JsonExecutor : MonoBehaviour
             yield return SendMove(
                 BASE_DETOUR_RADIUS_M * Mathf.Cos(angle),
                 BASE_DETOUR_RADIUS_M * Mathf.Sin(angle),
-                targetZ, orientation, skewDeg, $"{tag} detour-arc {i}/{arcSteps}",
+                targetZ, orientation, skewDeg, $"{tag} 繞底座-弧段 {i}/{arcSteps}",
                 true, stepEpoch, stepId);
             if (!lastMotionSucceeded) yield break;
         }
 
         yield return SendMove(targetX, targetY, targetZ, orientation, skewDeg,
-            tag + " detour-exit", true, stepEpoch, stepId);
+            tag + " 繞底座-離開", true, stepEpoch, stepId);
     }
 
     bool InsideSourceBaseExclusion(float x, float y)
@@ -3127,6 +3137,7 @@ public class JsonExecutor : MonoBehaviour
     void WriteStepDone(int stepId, bool completed, string error, float duration)
     {
         lastStepReportedSuccess = completed;
+        lastStepReportedError = error;
         var report = new StepDoneReport
         {
             step_id = stepId,
