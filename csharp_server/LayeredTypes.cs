@@ -39,12 +39,12 @@ public class WorkspaceBounds
     // 2D bitmap 的右下格中心固定在 QR frame；小圖形向左、向上展開。
     // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
     // LayoutRealizer 會拒絕超出目標擺放半徑 0.16..0.47 m 的目標。
-    // 5.3 cm 格距增加相鄰積木與夾爪之間的操作空間。
+    // 5.2 cm 格距：相鄰積木之間留 2.7 cm 給夾爪手指。
     public double TargetRightX { get; set; } = 0.708;
     public double TargetBottomY { get; set; } = 0.02;
     public double TargetOriginX { get; set; } = 0.49; // 3D placement uses its own origin.
     public double TargetOriginY { get; set; } = 0.04;
-    public double CellSize { get; set; } = 0.053;
+    public double CellSize { get; set; } = 0.052;
     public double SpatialCellSize { get; set; } = 0.052;
     public double DefaultBlockZ { get; set; } = 0.025;
     public int MaxRows { get; set; } = 5;
