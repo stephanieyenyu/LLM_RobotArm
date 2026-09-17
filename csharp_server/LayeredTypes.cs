@@ -158,6 +158,11 @@ public class BatchEnvelope
 
     [JsonPropertyName("steps")]
     public List<StepEnvelope> Steps { get; set; } = new();
+
+    // 這一批是否關閉驗證（對照組）。欄位名刻意用 disabled：Unity 讀不到這個欄位時
+    // 預設 false，等於驗證開啟，版本不同步時不會默默變成對照組。
+    [JsonPropertyName("verification_disabled")]
+    public bool VerificationDisabled { get; set; }
 }
 
 /// <summary>
