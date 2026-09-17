@@ -36,10 +36,9 @@ public class RobotArm : MonoBehaviour
     private Quaternion[] startRotations;
 
     private URPackageListener urListener;
-    private string ipInput = "192.168.56.101";
 
     // 自動連線 UR3e（跟 JsonExecutor 的 Ur IP 設一樣即可，例如 "192.168.50.204"）
-    // 留空的話就等使用者在 OnGUI 面板手動輸入 IP + 按 Connect
+    // 這是 Unity 手臂跟隨實機姿態的唯一連線方式；留空就不連，Unity 手臂只顯示模擬
     [Header("Auto-connect")]
     public string autoConnectIP = "";
 
@@ -136,7 +135,7 @@ public class RobotArm : MonoBehaviour
             return;
 
         // 只有 followRealRobotFeedback=true 才從實機讀 Angles；
-        // sim 模式關掉這個，讓外部（JsonExecutor）自己寫 Angles
+        // 模擬預覽期間 JsonExecutor 會關掉這個，自己寫 Angles
         if (followRealRobotFeedback && urListener != null && urListener.Connected)
             for (int i = 0; i < Transforms.Length; i++)
                 Angles[i] = (float)urListener.JointData.AsArray[i].q_actual * 180f / MathF.PI;
@@ -182,39 +181,6 @@ public class RobotArm : MonoBehaviour
                 Outputs[i] = bits != 0;
             }
         }
-    }
-
-    // In der OnGUI Methode sind alle UI Elemente uund deren Funktionalitäten vorhanden.
-    private void OnGUI()
-    {
-        // OnGUI can run before Start or during a script reload, when the
-        // connection listener has not been initialized yet. Return before
-        // beginning any GUILayout scope so a null reference cannot unbalance it.
-        if (urListener == null) return;
-        GUILayout.BeginArea(new Rect(10, 10, 200, 400));
-        try
-        {
-            if (!urListener.Connected)
-            {
-                GUILayout.BeginHorizontal();
-                try
-                {
-                    ipInput = GUILayout.TextField(ipInput);
-                    if (GUILayout.Button("Connect"))
-                        urListener.Connect(ipInput, false);
-                }
-                finally
-                {
-                    GUILayout.EndHorizontal();
-                }
-            }
-        }
-        finally
-        {
-            GUILayout.EndArea();
-        }
-        // 連線後不再顯示 Disconnect / Home 按鈕
-        // 這些功能移到 UIManager 的三個按鈕（Open / Grip / Home）
     }
 
     static Vector3 axisTovector3(Axis axis)

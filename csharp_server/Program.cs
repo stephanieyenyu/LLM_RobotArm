@@ -296,7 +296,7 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
         remainingTargets.RemoveAll(t => t.Row == assignment.Target!.Row && t.Col == assignment.Target.Col);
     }
 
-    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps);
+    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps, realize.Targets, rows);
 }
 
 async Task RunSingleObjectTaskBatchAsync(RoutedCommand routed, List<SceneObject> initialScene)
@@ -1356,7 +1356,8 @@ async Task<StepEnvelope?> BuildStepEnvelopeAsync(
     };
 }
 
-async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps)
+async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps,
+    List<TargetCell>? expectedTargets = null, List<string>? bitmapRows = null)
 {
     if (steps.Count == 0)
     {
@@ -1376,6 +1377,20 @@ async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps)
         Comment = comment,
         Steps = candidateSteps,
         VerificationDisabled = !verificationEnabled,
+        Bitmap = expectedTargets != null ? bitmapRows : null,
+        CellSizeM = workspace.CellSize,
+        ExpectedCells = expectedTargets?.Select(t => new ExpectedCell
+        {
+            Row = t.Row,
+            Col = t.Col,
+            SecondRow = t.SecondRow ?? -1,
+            SecondCol = t.SecondCol ?? -1,
+            X = t.WorldX,
+            Y = t.WorldY,
+            Z = t.WorldZ,
+            Shape = t.ExpectedShape,
+            Orientation = t.ExpectedOrientation,
+        }).ToList(),
     };
     WriteBatchFile(batch);
 
