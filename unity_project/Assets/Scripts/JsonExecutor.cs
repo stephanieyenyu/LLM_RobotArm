@@ -52,6 +52,10 @@ public class BatchEnvelope
     public bool done;
     public string comment;
     public List<StepEnvelope> steps;
+    // csharp_server 收到指令時讀一次 Unity 的驗證開關，把結果蓋在整批上。
+    // 刻意用 disabled 當欄位名：舊版 server 沒送這個欄位時 JsonUtility 讀成 false，
+    // 等於驗證開啟，不會因為兩邊版本不同就默默變成對照組。
+    public bool verification_disabled;
 }
 
 [System.Serializable]
@@ -251,6 +255,18 @@ public class JsonExecutor : MonoBehaviour
         new Dictionary<int, List<PlannedJointAction>>();
     private readonly List<double[]> sharedFinalTrajectory = new List<double[]>();
     private double[] sharedTrajectoryStartQ;
+
+    // ---- 一鍵驗證開關（實驗組 / 對照組）----
+    // 由每一批的 BatchEnvelope.verification_disabled 決定，整批用同一個值。
+    // 關閉時略過：軌跡的奇點 / 碰撞檢查、可達性預檢。硬體安全範圍（底座排除半徑、
+    // 最大伸展、保護性停止處理）不受這個開關影響，永遠生效。
+    private bool verificationEnabled = true;
+    // 對照組時被略過、但驗證開著就會擋下的項目。只記錄不影響行為，供實驗比對。
+    private readonly List<string> bypassedVerificationFindings = new List<string>();
+    // 對照組時 IK 無解、產生不出關節角的位置。軌跡只做到這裡，實機執行到這一步會停。
+    private string sharedTrajectoryFailure;
+    // 目前正在規劃哪個動作，讓略過的檢查項目記得出處
+    private string planningContext = "";
 
     void Awake()
     {
@@ -492,6 +508,12 @@ public class JsonExecutor : MonoBehaviour
     IEnumerator ExecuteBatch(BatchEnvelope batch)
     {
         Debug.Log($"[Executor] 收到 batch {batch.batch_id}: {batch.steps.Count} steps — {batch.comment}");
+        verificationEnabled = !batch.verification_disabled;
+        bypassedVerificationFindings.Clear();
+        sharedTrajectoryFailure = null;
+        Debug.Log(verificationEnabled
+            ? $"[Verification] batch {batch.batch_id}：驗證開啟（實驗組）"
+            : $"[Verification] batch {batch.batch_id}：驗證關閉（對照組）；硬體安全範圍仍然生效");
         bool usingTopLeftFallback = false;
 
         if (previewOnlySharedTrajectory && !useSharedMovejTrajectory && !simulationOnly)
@@ -545,11 +567,13 @@ public class JsonExecutor : MonoBehaviour
             }
         }
 
+        LogBypassedVerification(batch.batch_id);
+
         // ★ Pre-flight kinematics 檢查：任一步不可達/奇點就 abort，不動實機
         if (!useSharedMovejTrajectory && useCanonicalKinematics && verifyBatchReachability)
         {
             var failures = VerifyBatchReachability(batch);
-            if (failures.Count > 0)
+            if (failures.Count > 0 && verificationEnabled)
             {
                 string summary = $"batch {batch.batch_id} 有 {failures.Count} 個不可達或奇點位置，abort：\n  - "
                                  + string.Join("\n  - ", failures);
@@ -557,7 +581,15 @@ public class JsonExecutor : MonoBehaviour
                 WriteStepDone(batch.batch_id, false, summary, 0f);
                 yield break;
             }
-            Debug.Log($"[Executor-precheck] ✓ batch {batch.batch_id} 全部 {batch.steps.Count} steps 通過 UR3e kinematics 檢查");
+            if (failures.Count > 0)
+            {
+                bypassedVerificationFindings.AddRange(failures);
+                LogBypassedVerification(batch.batch_id);
+            }
+            else
+            {
+                Debug.Log($"[Executor-precheck] ✓ batch {batch.batch_id} 全部 {batch.steps.Count} steps 通過 UR3e kinematics 檢查");
+            }
         }
 
         if (!simulationOnly)
@@ -700,6 +732,15 @@ public class JsonExecutor : MonoBehaviour
                         currentStepId = -1;
                         yield break;
                     }
+                }
+                if (sharedTrajectoryFailure != null)
+                {
+                    WriteStepDone(batch.batch_id, false,
+                        "verification off, final return truncated: " + sharedTrajectoryFailure, 0f);
+                    RobotArm.FreezeVisualFeedback = false;
+                    yield return StartCoroutine(SetPerceptionMode("idle"));
+                    currentStepId = -1;
+                    yield break;
                 }
                 currentStepId = -1;
                 yield return StartCoroutine(SetPerceptionMode("idle"));
@@ -916,13 +957,14 @@ public class JsonExecutor : MonoBehaviour
             if (env.action_sequence == null)
             {
                 error = $"step {env.step_id} has no action_sequence";
-                return false;
+                return TruncateOrReject(env.step_id, planned, ref error);
             }
 
             bool holding = false;
             for (int actionIndex = 0; actionIndex < env.action_sequence.Count; actionIndex++)
             {
                 var action = env.action_sequence[actionIndex];
+                planningContext = $"step {env.step_id} action {actionIndex + 1} {action.function}";
                 var pa = new PlannedJointAction
                 {
                     function = action.function,
@@ -934,7 +976,7 @@ public class JsonExecutor : MonoBehaviour
                 if (pos == null && action.function != "wait" && action.function != "go_home")
                 {
                     error = $"step {env.step_id} action {actionIndex + 1} lacks position";
-                    return false;
+                    return TruncateOrReject(env.step_id, planned, ref error);
                 }
 
                 float x = pos == null ? 0f : QR1_X + pos.x + (source ? pickOffsetX : 0f);
@@ -954,7 +996,7 @@ public class JsonExecutor : MonoBehaviour
                             orientation, out error))
                     {
                         error = $"step {env.step_id} action {actionIndex + 1}: {error}";
-                        return false;
+                        return TruncateOrReject(env.step_id, planned, ref error);
                     }
                 }
                 else if (action.function == "descend")
@@ -963,7 +1005,7 @@ public class JsonExecutor : MonoBehaviour
                     if (!PlanJointPose(pa, ref reference, x, y, z, orientation, out error))
                     {
                         error = $"step {env.step_id} action {actionIndex + 1}: {error}";
-                        return false;
+                        return TruncateOrReject(env.step_id, planned, ref error);
                     }
                 }
                 else if (action.function == "lift")
@@ -971,7 +1013,7 @@ public class JsonExecutor : MonoBehaviour
                     if (!PlanJointPose(pa, ref reference, x, y, z + height, orientation, out error))
                     {
                         error = $"step {env.step_id} action {actionIndex + 1}: {error}";
-                        return false;
+                        return TruncateOrReject(env.step_id, planned, ref error);
                     }
                 }
                 else if (action.function == "go_home")
@@ -980,7 +1022,7 @@ public class JsonExecutor : MonoBehaviour
                     if (!ValidateJointTransition(reference, home, out error, allowSingularEnd: true))
                     {
                         error = $"step {env.step_id} action {actionIndex + 1}: {error}";
-                        return false;
+                        return TruncateOrReject(env.step_id, planned, ref error);
                     }
                     pa.targets.Add(home);
                     reference = (double[])home.Clone();
@@ -1002,18 +1044,19 @@ public class JsonExecutor : MonoBehaviour
         // would then have to cross q3=0/PI and trip the elbow singularity gate.
         // Preserve the calibrated Ready TCP pose, but solve it from the current
         // branch so preview and hardware can return without changing branches.
+        planningContext = "batch final Ready/Home";
         var readyPose = UR3eKinematics.FKPose(calibratedReady);
         var readySolution = UR3eKinematics.IKNearest(readyPose, reference);
         if (!readySolution.ok)
         {
             error = $"final Ready IK {readySolution.error}: {readySolution.message}";
-            return false;
+            return TruncateOrReject(null, null, ref error);
         }
         double[] ready = readySolution.q;
         if (!ValidateJointTransition(reference, ready, out error, allowSingularEnd: false))
         {
             error = "final Ready transition: " + error;
-            return false;
+            return TruncateOrReject(null, null, ref error);
         }
         sharedFinalTrajectory.Add((double[])ready.Clone());
         reference = ready;
@@ -1021,13 +1064,42 @@ public class JsonExecutor : MonoBehaviour
         if (!ValidateJointTransition(reference, homeTarget, out error, allowSingularEnd: true))
         {
             error = "final Home transition: " + error;
-            return false;
+            return TruncateOrReject(null, null, ref error);
         }
         sharedFinalTrajectory.Add(homeTarget);
 
         error = null;
-        Debug.Log($"[Executor-shared] Built and collision-checked shared movej trajectory for {sharedTrajectory.Count} steps.");
+        Debug.Log(verificationEnabled
+            ? $"[Executor-shared] Built and collision-checked shared movej trajectory for {sharedTrajectory.Count} steps."
+            : $"[Executor-shared] Built shared movej trajectory for {sharedTrajectory.Count} steps (verification off: checks recorded, not enforced).");
         return true;
+    }
+
+    bool TruncateOrReject(int? stepId, List<PlannedJointAction> plannedSoFar, ref string error)
+    {
+        if (verificationEnabled) return false;
+        if (stepId.HasValue && plannedSoFar != null)
+            sharedTrajectory[stepId.Value] = plannedSoFar;
+        sharedTrajectoryFailure = error;
+        Debug.LogWarning($"[Verification OFF] 軌跡截斷：{error}");
+        error = null;
+        return true;
+    }
+
+    bool BypassOrFail(string finding)
+    {
+        if (verificationEnabled) return false;
+        bypassedVerificationFindings.Add($"{planningContext}: {finding}");
+        return true;
+    }
+
+    void LogBypassedVerification(int batchId)
+    {
+        if (verificationEnabled) return;
+        var lines = new List<string>(bypassedVerificationFindings);
+        if (sharedTrajectoryFailure != null) lines.Add("軌跡截斷: " + sharedTrajectoryFailure);
+        Debug.LogWarning($"[Verification OFF] batch {batchId}：略過 {lines.Count} 項：\n  - "
+                         + string.Join("\n  - ", lines));
     }
 
     bool PlanMoveAbove(PlannedJointAction action, ref double[] reference,
@@ -1055,6 +1127,8 @@ public class JsonExecutor : MonoBehaviour
                 seconds = action.seconds
             };
 
+            int findingsBeforeTrial = bypassedVerificationFindings.Count;
+
             if (PlanJointPose(trial, ref trialReference, current.x, current.y,
                     travelZ, orientation, out lastError) &&
                 PlanSharedTravelXY(trial, ref trialReference, current.x, current.y,
@@ -1070,6 +1144,9 @@ public class JsonExecutor : MonoBehaviour
                 error = null;
                 return true;
             }
+
+            bypassedVerificationFindings.RemoveRange(findingsBeforeTrial,
+                bypassedVerificationFindings.Count - findingsBeforeTrial);
 
             if (travelZ <= minimumTravelZ + 1e-6)
                 break;
@@ -1218,11 +1295,13 @@ public class JsonExecutor : MonoBehaviour
                 !(allowSingularEnd && sample == samples))
             {
                 error = $"joint validation failed at {t:P0}: {jointCheck}";
+                if (BypassOrFail(error)) { error = null; return true; }
                 return false;
             }
             if (!ValidateApproximateRobotCollision(q, out string collision))
             {
                 error = $"collision at {t:P0}: {collision}";
+                if (BypassOrFail(error)) { error = null; return true; }
                 return false;
             }
         }
@@ -1696,6 +1775,9 @@ public class JsonExecutor : MonoBehaviour
                 yield return AnimateJointsTo(RadToDeg(target), 1.5f);
         }
 
+        if (sharedTrajectoryFailure != null)
+            Debug.LogWarning($"[Executor-preview] 預覽在軌跡截斷處停止：{sharedTrajectoryFailure}");
+
         // 復原：手臂角度
         if (initialArmAngles != null && robotArm != null && robotArm.Angles != null)
         {
@@ -2051,7 +2133,9 @@ public class JsonExecutor : MonoBehaviour
         if (!sharedTrajectory.TryGetValue(stepId, out var actions) ||
             actionIndex < 0 || actionIndex >= actions.Count)
         {
-            lastMotionError = $"missing shared trajectory for step {stepId} action {actionIndex + 1}";
+            lastMotionError = sharedTrajectoryFailure != null
+                ? $"verification off, trajectory truncated: {sharedTrajectoryFailure}"
+                : $"missing shared trajectory for step {stepId} action {actionIndex + 1}";
             yield break;
         }
 

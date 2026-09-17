@@ -17,6 +17,7 @@ public class UIManager : MonoBehaviour
 
     private TextField inputField;
     private Button sendButton;
+    private Button verificationButton;
     private Label statusLabel;
 
     // 手動生方塊的計數（決定下一顆放哪）
@@ -39,6 +40,16 @@ public class UIManager : MonoBehaviour
         container.style.paddingRight = 5;
         container.style.height = 50;
 
+        // 一鍵驗證開關（實驗組 / 對照組）。放在指令列最左邊，下指令時一定看得到。
+        // 寫進跟 csharp_server 共用的旗標檔；server 每收到一個指令就重讀一次，
+        // 所以切換後「下一個」指令生效，已經在跑的那一批不受影響。
+        verificationButton = new Button(() => SetVerificationEnabled(!ReadVerificationEnabled()));
+        verificationButton.style.height = 40;
+        verificationButton.style.width = 170;
+        verificationButton.style.marginRight = 5;
+        verificationButton.style.color = Color.white;
+        RefreshVerificationButton();
+
         inputField = new TextField("");
         inputField.style.flexGrow = 1;
         inputField.style.marginRight = 5;
@@ -50,6 +61,7 @@ public class UIManager : MonoBehaviour
         sendButton.style.height = 40;
         sendButton.style.width = 80;
 
+        container.Add(verificationButton);
         container.Add(inputField);
         container.Add(sendButton);
         root.Add(container);
@@ -192,6 +204,52 @@ public class UIManager : MonoBehaviour
         {
             Debug.LogWarning($"[UI] 寫入 skip_pattern_review.txt 失敗：{e.Message}");
         }
+    }
+
+    // ---------------------------------------------------------
+    // 一鍵驗證開關：跟 csharp_server/VerificationSwitch.cs 共用
+    // StreamingAssets/verification_enabled.txt，寫 "1"/"0"。
+    // 檔案不存在或讀不到都算開啟 —— 預設永遠是實驗組，只有明確按成關閉才是對照組。
+    // ---------------------------------------------------------
+    string VerificationFlagPath => Path.Combine(SHARED_DIR, "verification_enabled.txt");
+
+    bool ReadVerificationEnabled()
+    {
+        try
+        {
+            return !File.Exists(VerificationFlagPath) ||
+                   File.ReadAllText(VerificationFlagPath).Trim() != "0";
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+    }
+
+    void SetVerificationEnabled(bool enabled)
+    {
+        try
+        {
+            File.WriteAllText(VerificationFlagPath, enabled ? "1" : "0");
+            Debug.Log(enabled
+                ? "[UI] 驗證開啟（實驗組），下一個指令生效"
+                : "[UI] 驗證關閉（對照組），下一個指令生效");
+        }
+        catch (IOException e)
+        {
+            Debug.LogWarning($"[UI] 寫入 verification_enabled.txt 失敗：{e.Message}");
+        }
+        RefreshVerificationButton();
+    }
+
+    // 按鈕狀態一律從檔案讀回來，寫入失敗時畫面不會顯示成已切換
+    void RefreshVerificationButton()
+    {
+        bool enabled = ReadVerificationEnabled();
+        verificationButton.text = enabled ? "驗證：開（實驗組）" : "驗證：關（對照組）";
+        verificationButton.style.backgroundColor = enabled
+            ? new Color(0.15f, 0.5f, 0.25f)
+            : new Color(0.7f, 0.2f, 0.2f);
     }
 
     // ---------------------------------------------------------
