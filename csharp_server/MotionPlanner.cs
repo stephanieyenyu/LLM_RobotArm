@@ -9,7 +9,7 @@ public sealed class MotionPlanner
 {
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(180);
     // LLM 給了 wait 卻沒給秒數時用這個值（Unity 端的預設值要跟這裡一致）
-    public const double DefaultWaitSeconds = 0.2;
+    public const double DefaultWaitSeconds = 0.1;
     private readonly ChatClient _client;
 
     public MotionPlanner(string model = "gpt-5")
