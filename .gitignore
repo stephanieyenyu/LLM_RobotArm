@@ -76,3 +76,5 @@ csharp_server/images/
 unity_project/Assets/StreamingAssets/current_step.json*
 unity_project/Assets/StreamingAssets/step_done.json*
 unity_project/Assets/StreamingAssets/verification_enabled.txt*
+unity_project/Assets/StreamingAssets/skip_pattern_review.txt*
+unity_project/Assets/StreamingAssets/sim_check.json*

@@ -11,8 +11,8 @@ public sealed class PatternDesigner
     const double OpenAiVoteWeight = 0.80;
     const double GeminiVoteWeight = 0.20;
     // 跳過雙模型交叉審查與投票，只呼叫 OpenAI 生成一次 bitmap 就直接採用。
-    // Unity 介面已經沒有這個勾選框；要跳過就手動建立這個檔案、內容寫 "1"。
-    // 每次 DesignAsync 都重讀一次，改完不需要重開 csharp_server。
+    // 旗標檔由 Unity 指令列的「pattern審查」按鈕寫入（"1" = 跳過審查），
+    // 每次 DesignAsync 都重讀一次，切換後不需要重開 csharp_server。
     const string SkipReviewFlagPath = "../unity_project/Assets/StreamingAssets/skip_pattern_review.txt";
     static bool SkipReview
     {
