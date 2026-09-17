@@ -76,6 +76,23 @@ public class ExpectedCell
     public string orientation;
 }
 
+// 模擬結束比對 bitmap 的結果，寫到 StreamingAssets/sim_check.json 給 csharp_server 印在 terminal
+[System.Serializable]
+public class SimulationCheckReport
+{
+    public int batch_id;
+    public bool performed;             // false = 這批有 bitmap 但沒做到比對（例如沒有播模擬）
+    public string skipped_reason;
+    public bool passed;
+    public bool verification_enabled;  // 開 = 不通過就擋；關 = 只記錄
+    public int expected_count;
+    public int correct_count;
+    public List<string> expected_rows;
+    public List<string> result_rows;
+    public List<string> errors;
+    public List<string> notes;
+}
+
 [System.Serializable]
 public class RobotFunctionCall
 {
@@ -281,17 +298,11 @@ public class JsonExecutor : MonoBehaviour
     private readonly List<double[]> sharedFinalTrajectory = new List<double[]>();
     private double[] sharedTrajectoryStartQ;
 
-    // ---- 一鍵驗證開關（實驗組 / 對照組）----
+    // ---- 一鍵開關（實驗組 / 對照組）----
     // 由每一批的 BatchEnvelope.verification_disabled 決定，整批用同一個值。
-    // 關閉時略過：軌跡的奇點 / 碰撞檢查、可達性預檢。硬體安全範圍（底座排除半徑、
-    // 最大伸展、保護性停止處理）不受這個開關影響，永遠生效。
+    // 只控制「模擬結束比對 bitmap」這一關。動作規劃檢查、軌跡奇點 / 碰撞檢查、
+    // 硬體安全範圍一律開著，不受這個開關影響。
     private bool verificationEnabled = true;
-    // 對照組時被略過、但驗證開著就會擋下的項目。只記錄不影響行為，供實驗比對。
-    private readonly List<string> bypassedVerificationFindings = new List<string>();
-    // 對照組時 IK 無解、產生不出關節角的位置。軌跡只做到這裡，實機執行到這一步會停。
-    private string sharedTrajectoryFailure;
-    // 目前正在規劃哪個動作，讓略過的檢查項目記得出處
-    private string planningContext = "";
 
     // ---- 模擬結束比對 bitmap ----
     // 模擬過程中每顆方塊的狀態。落點由夾爪 TCP（正向運動學）決定，不直接瞬移到指令目標，
@@ -313,6 +324,8 @@ public class JsonExecutor : MonoBehaviour
     private readonly List<string> simPlacementNotes = new List<string>();
     // 最近一次比對的錯誤清單；null = 這一批沒有 bitmap（非排 pattern 指令），沒比對
     private List<string> bitmapCheckErrors;
+    // 這一批的比對結果有沒有寫給 csharp_server；沒寫的話要補一份「未進行」
+    private bool simCheckReported;
 
     void Awake()
     {
@@ -565,12 +578,10 @@ public class JsonExecutor : MonoBehaviour
         }
 
         verificationEnabled = !batch.verification_disabled;
-        bypassedVerificationFindings.Clear();
-        sharedTrajectoryFailure = null;
         ResetSimPlacementTracking();
         Debug.Log(verificationEnabled
-            ? $"[Verification] batch {batch.batch_id}：驗證開啟（實驗組）"
-            : $"[Verification] batch {batch.batch_id}：驗證關閉（對照組）— 模擬照常播放但不擋；硬體安全範圍仍然生效");
+            ? $"[Verification] batch {batch.batch_id}：模擬結束比對開啟（實驗組）"
+            : $"[Verification] batch {batch.batch_id}：模擬結束比對關閉（對照組）— 比對結果只記錄不擋；其他檢查照常生效");
 
         if (useSharedMovejTrajectory)
         {
@@ -614,14 +625,13 @@ public class JsonExecutor : MonoBehaviour
                 WriteStepDone(batch.batch_id, false, message, 0f);
                 yield break;
             }
-            LogBypassedVerification(batch.batch_id);
         }
 
         // ★ Pre-flight kinematics 檢查：任一步不可達/奇點就 abort，不動實機
         if (!useSharedMovejTrajectory && useCanonicalKinematics && verifyBatchReachability)
         {
             var failures = VerifyBatchReachability(batch);
-            if (failures.Count > 0 && verificationEnabled)
+            if (failures.Count > 0)
             {
                 string summary = $"batch {batch.batch_id} 有 {failures.Count} 個不可達或奇點位置，abort：\n  - "
                                  + string.Join("\n  - ", failures);
@@ -629,15 +639,7 @@ public class JsonExecutor : MonoBehaviour
                 WriteStepDone(batch.batch_id, false, summary, 0f);
                 yield break;
             }
-            if (failures.Count > 0)
-            {
-                bypassedVerificationFindings.AddRange(failures);
-                LogBypassedVerification(batch.batch_id);
-            }
-            else
-            {
-                Debug.Log($"[Executor-precheck] ✓ batch {batch.batch_id} 全部 {batch.steps.Count} steps 通過 UR3e kinematics 檢查");
-            }
+            Debug.Log($"[Executor-precheck] ✓ batch {batch.batch_id} 全部 {batch.steps.Count} steps 通過 UR3e kinematics 檢查");
         }
 
         EnsureUrConnectionStarted();
@@ -653,6 +655,7 @@ public class JsonExecutor : MonoBehaviour
             if (robotArm != null) robotArm.followRealRobotFeedback = false;
             RobotArm.FreezeVisualFeedback = false;
             yield return StartCoroutine(PreviewBatchAnimated(batch));
+            ReportSimulationCheckSkippedIfNeeded(batch, "模擬預覽沒有執行（SceneSyncer 未設定）");
 
             // 模擬結束比對 bitmap：不一致且驗證開啟時，實機完全不動
             if (!BitmapCheckAllowsContinue(batch))
@@ -663,9 +666,10 @@ public class JsonExecutor : MonoBehaviour
                 yield break;
             }
         }
-        else if (batch.expected_cells != null && batch.expected_cells.Count > 0)
+        else
         {
-            Debug.LogWarning("[BitmapCheck] previewBatchInUnityBeforeRobot 關閉，沒有模擬就無法比對 bitmap，直接送實機");
+            ReportSimulationCheckSkippedIfNeeded(batch,
+                "previewBatchInUnityBeforeRobot 關閉，沒有播模擬，直接送實機");
         }
         if (previewOnlySharedTrajectory)
         {
@@ -789,17 +793,6 @@ public class JsonExecutor : MonoBehaviour
                     currentStepId = -1;
                     yield break;
                 }
-            }
-            // 能走到這裡代表所有 step 都跑完了，截斷只可能發生在收尾的 Ready/Home。
-            // 手臂沒回到位，不能回報成功。
-            if (sharedTrajectoryFailure != null)
-            {
-                WriteStepDone(batch.batch_id, false,
-                    "verification off, final return truncated at unreachable pose: " + sharedTrajectoryFailure, 0f);
-                RobotArm.FreezeVisualFeedback = false;
-                yield return StartCoroutine(SetPerceptionMode("idle"));
-                currentStepId = -1;
-                yield break;
             }
             currentStepId = -1;
             yield return StartCoroutine(SetPerceptionMode("idle"));
@@ -1003,9 +996,6 @@ public class JsonExecutor : MonoBehaviour
     {
         sharedTrajectory.Clear();
         sharedFinalTrajectory.Clear();
-        // 左上角方塊的 180° 備案會把整批軌跡重建一次，上一次記下的略過項目不能留著
-        bypassedVerificationFindings.Clear();
-        sharedTrajectoryFailure = null;
         sharedTrajectoryStartQ = (double[])startQ.Clone();
         double[] reference = (double[])startQ.Clone();
         UR3eKinematics.toolOffsetZ = robotArm != null ? robotArm.toolOffsetZ : 0.0;
@@ -1017,14 +1007,13 @@ public class JsonExecutor : MonoBehaviour
             if (env.action_sequence == null)
             {
                 error = $"step {env.step_id} has no action_sequence";
-                return TruncateOrReject(env.step_id, planned, ref error);
+                return false;
             }
 
             bool holding = false;
             for (int actionIndex = 0; actionIndex < env.action_sequence.Count; actionIndex++)
             {
                 var action = env.action_sequence[actionIndex];
-                planningContext = $"step {env.step_id} action {actionIndex + 1} {action.function}";
                 var pa = new PlannedJointAction
                 {
                     function = action.function,
@@ -1036,7 +1025,7 @@ public class JsonExecutor : MonoBehaviour
                 if (pos == null && action.function != "wait" && action.function != "go_home")
                 {
                     error = $"step {env.step_id} action {actionIndex + 1} lacks position";
-                    return TruncateOrReject(env.step_id, planned, ref error);
+                    return false;
                 }
 
                 float x = pos == null ? 0f : QR1_X + pos.x + (source ? pickOffsetX : 0f);
@@ -1056,7 +1045,7 @@ public class JsonExecutor : MonoBehaviour
                             orientation, out error))
                     {
                         error = $"step {env.step_id} action {actionIndex + 1}: {error}";
-                        return TruncateOrReject(env.step_id, planned, ref error);
+                        return false;
                     }
                 }
                 else if (action.function == "descend")
@@ -1065,7 +1054,7 @@ public class JsonExecutor : MonoBehaviour
                     if (!PlanJointPose(pa, ref reference, x, y, z, orientation, out error))
                     {
                         error = $"step {env.step_id} action {actionIndex + 1}: {error}";
-                        return TruncateOrReject(env.step_id, planned, ref error);
+                        return false;
                     }
                 }
                 else if (action.function == "lift")
@@ -1073,7 +1062,7 @@ public class JsonExecutor : MonoBehaviour
                     if (!PlanJointPose(pa, ref reference, x, y, z + height, orientation, out error))
                     {
                         error = $"step {env.step_id} action {actionIndex + 1}: {error}";
-                        return TruncateOrReject(env.step_id, planned, ref error);
+                        return false;
                     }
                 }
                 else if (action.function == "go_home")
@@ -1082,7 +1071,7 @@ public class JsonExecutor : MonoBehaviour
                     if (!ValidateJointTransition(reference, home, out error, allowSingularEnd: true))
                     {
                         error = $"step {env.step_id} action {actionIndex + 1}: {error}";
-                        return TruncateOrReject(env.step_id, planned, ref error);
+                        return false;
                     }
                     pa.targets.Add(home);
                     reference = (double[])home.Clone();
@@ -1104,19 +1093,18 @@ public class JsonExecutor : MonoBehaviour
         // would then have to cross q3=0/PI and trip the elbow singularity gate.
         // Preserve the calibrated Ready TCP pose, but solve it from the current
         // branch so preview and hardware can return without changing branches.
-        planningContext = "batch final Ready/Home";
         var readyPose = UR3eKinematics.FKPose(calibratedReady);
         var readySolution = UR3eKinematics.IKNearest(readyPose, reference);
         if (!readySolution.ok)
         {
             error = $"final Ready IK {readySolution.error}: {readySolution.message}";
-            return TruncateOrReject(null, null, ref error);
+            return false;
         }
         double[] ready = readySolution.q;
         if (!ValidateJointTransition(reference, ready, out error, allowSingularEnd: false))
         {
             error = "final Ready transition: " + error;
-            return TruncateOrReject(null, null, ref error);
+            return false;
         }
         sharedFinalTrajectory.Add((double[])ready.Clone());
         reference = ready;
@@ -1124,55 +1112,13 @@ public class JsonExecutor : MonoBehaviour
         if (!ValidateJointTransition(reference, homeTarget, out error, allowSingularEnd: true))
         {
             error = "final Home transition: " + error;
-            return TruncateOrReject(null, null, ref error);
+            return false;
         }
         sharedFinalTrajectory.Add(homeTarget);
 
         error = null;
-        Debug.Log(verificationEnabled
-            ? $"[Executor-shared] Built and collision-checked shared movej trajectory for {sharedTrajectory.Count} steps."
-            : $"[Executor-shared] Built shared movej trajectory for {sharedTrajectory.Count} steps (verification off: checks recorded, not enforced).");
+        Debug.Log($"[Executor-shared] Built and collision-checked shared movej trajectory for {sharedTrajectory.Count} steps.");
         return true;
-    }
-
-    // 產生不出關節角時怎麼處理。
-    //   驗證開啟：整批拒絕，原本的行為。
-    //   驗證關閉：軌跡只做到失敗前一個動作，照樣預覽、照樣送實機，實機執行到
-    //             這個動作才停下 —— 也就是沒有事前驗證時實際會發生的事。
-    // 停下的那一刻還沒送出任何不可達的 movej，所以不會傷到硬體。
-    bool TruncateOrReject(int? stepId, List<PlannedJointAction> plannedSoFar, ref string error)
-    {
-        if (verificationEnabled) return false;
-        if (stepId.HasValue && plannedSoFar != null)
-            sharedTrajectory[stepId.Value] = plannedSoFar;
-        sharedTrajectoryFailure = error;
-        Debug.LogWarning($"[Verification OFF] 無法產生關節角，軌跡在此截斷：{error}" +
-                         "（預覽只演到這裡，實機執行到這一步會停止）");
-        error = null;
-        return true;
-    }
-
-    // 奇點 / 碰撞檢查失敗時怎麼處理。驗證開啟就擋；關閉就記下來、放行。
-    bool BypassOrFail(string finding)
-    {
-        if (verificationEnabled) return false;
-        bypassedVerificationFindings.Add($"{planningContext}: {finding}");
-        return true;
-    }
-
-    // 對照組跑完規劃後，把「驗證開著會擋下」的項目一次印出來，實驗時可以對照
-    void LogBypassedVerification(int batchId)
-    {
-        if (verificationEnabled) return;
-        if (bypassedVerificationFindings.Count == 0 && sharedTrajectoryFailure == null)
-        {
-            Debug.Log($"[Verification OFF] batch {batchId}：沒有任何檢查失敗，驗證開著也會通過");
-            return;
-        }
-        var lines = new List<string>(bypassedVerificationFindings);
-        if (sharedTrajectoryFailure != null) lines.Add("軌跡截斷（IK 無解）: " + sharedTrajectoryFailure);
-        Debug.LogWarning($"[Verification OFF] batch {batchId}：驗證開著會擋下這一批，略過 {lines.Count} 項：\n  - "
-                         + string.Join("\n  - ", lines));
     }
 
     // ============================================================
@@ -1180,6 +1126,7 @@ public class JsonExecutor : MonoBehaviour
     // ============================================================
     void ResetSimPlacementTracking()
     {
+        simCheckReported = false;
         simBlocks.Clear();
         simPlacementNotes.Clear();
         bitmapCheckErrors = null;
@@ -1456,6 +1403,14 @@ public class JsonExecutor : MonoBehaviour
             if (InsideCanvas(g)) Mark(g.r, g.c, grid[g.r, g.c] == '□' ? '●' : '✗');
         }
 
+        var resultRows = new List<string>();
+        for (int r = 0; r < rows; r++)
+        {
+            var line = new System.Text.StringBuilder();
+            for (int c = 0; c < cols; c++) line.Append(grid[r, c]);
+            resultRows.Add(line.ToString());
+        }
+
         var report = new System.Text.StringBuilder();
         report.AppendLine(errors.Count == 0
             ? $"[BitmapCheck] batch {batch.batch_id}：✓ 模擬結果與 bitmap 一致（{expected.Count} 個物件全部放對）"
@@ -1465,9 +1420,7 @@ public class JsonExecutor : MonoBehaviour
         for (int r = 0; r < rows; r++)
         {
             string want = batch.bitmap != null && r < batch.bitmap.Count ? batch.bitmap[r] : "";
-            var got = new System.Text.StringBuilder();
-            for (int c = 0; c < cols; c++) got.Append(grid[r, c]);
-            report.AppendLine($"  {want.PadRight(cols)}          {got}");
+            report.AppendLine($"  {want.PadRight(cols)}          {resultRows[r]}");
         }
         foreach (var error in errors) report.AppendLine("  - " + error);
         foreach (var note in simPlacementNotes) report.AppendLine("  · " + note);
@@ -1475,6 +1428,49 @@ public class JsonExecutor : MonoBehaviour
         if (errors.Count == 0) Debug.Log(report.ToString());
         else Debug.LogWarning(report.ToString());
         bitmapCheckErrors = errors;
+
+        WriteSimulationCheckReport(new SimulationCheckReport
+        {
+            batch_id = batch.batch_id,
+            performed = true,
+            passed = errors.Count == 0,
+            verification_enabled = verificationEnabled,
+            expected_count = expected.Count,
+            correct_count = correct,
+            expected_rows = batch.bitmap ?? new List<string>(),
+            result_rows = resultRows,
+            errors = errors,
+            notes = new List<string>(simPlacementNotes),
+        });
+    }
+
+    // 排 pattern 的批次一定要給 server 一個交代：沒做到比對也要寫「未進行」和原因
+    void ReportSimulationCheckSkippedIfNeeded(BatchEnvelope batch, string reason)
+    {
+        if (simCheckReported || batch.expected_cells == null || batch.expected_cells.Count == 0) return;
+        Debug.LogWarning($"[BitmapCheck] batch {batch.batch_id}：沒有進行模擬結束比對 — {reason}");
+        WriteSimulationCheckReport(new SimulationCheckReport
+        {
+            batch_id = batch.batch_id,
+            performed = false,
+            skipped_reason = reason,
+            verification_enabled = verificationEnabled,
+            expected_count = batch.expected_cells.Count,
+        });
+    }
+
+    void WriteSimulationCheckReport(SimulationCheckReport report)
+    {
+        simCheckReported = true;
+        try
+        {
+            string path = Path.Combine(Application.streamingAssetsPath, "sim_check.json");
+            File.WriteAllText(path, JsonUtility.ToJson(report, prettyPrint: true));
+        }
+        catch (IOException e)
+        {
+            Debug.LogWarning($"[BitmapCheck] 寫入 sim_check.json 失敗，server 不會印出比對結果：{e.Message}");
+        }
     }
 
     // bitmap 比對不一致時要不要擋。回傳 true = 可以繼續（送實機 / 回報完成）。
@@ -1484,7 +1480,6 @@ public class JsonExecutor : MonoBehaviour
         if (bitmapCheckErrors == null || bitmapCheckErrors.Count == 0) return true;
         if (!verificationEnabled)
         {
-            foreach (var error in bitmapCheckErrors) bypassedVerificationFindings.Add("bitmap 比對: " + error);
             Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：bitmap 比對不一致 " +
                              $"{bitmapCheckErrors.Count} 項，對照組照樣繼續");
             return true;
@@ -1520,8 +1515,6 @@ public class JsonExecutor : MonoBehaviour
                 function = action.function,
                 seconds = action.seconds
             };
-            // 這個高度若試失敗會被丟掉，途中記下的略過項目也要一起丟，免得對照組紀錄出現沒走的路徑
-            int findingsBeforeTrial = bypassedVerificationFindings.Count;
 
             if (PlanJointPose(trial, ref trialReference, current.x, current.y,
                     travelZ, orientation, out lastError) &&
@@ -1538,8 +1531,6 @@ public class JsonExecutor : MonoBehaviour
                 error = null;
                 return true;
             }
-            bypassedVerificationFindings.RemoveRange(findingsBeforeTrial,
-                bypassedVerificationFindings.Count - findingsBeforeTrial);
 
             if (travelZ <= minimumTravelZ + 1e-6)
                 break;
@@ -1648,8 +1639,6 @@ public class JsonExecutor : MonoBehaviour
         {
             error = $"base faces away from target by {System.Math.Abs(delta) * Mathf.Rad2Deg:F1} deg " +
                     $"(base={joints[0] * Mathf.Rad2Deg:F1} deg, bearing={bearing * Mathf.Rad2Deg:F1} deg)";
-            // 屬於驗證（不是硬體安全範圍），跟碰撞 / 奇點檢查一樣受一鍵開關控制
-            if (BypassOrFail(error)) { error = null; return true; }
             return false;
         }
         error = null;
@@ -1690,13 +1679,11 @@ public class JsonExecutor : MonoBehaviour
                 !(allowSingularEnd && sample == samples))
             {
                 error = $"joint validation failed at {t:P0}: {jointCheck}";
-                if (BypassOrFail(error)) { error = null; return true; }
                 return false;
             }
             if (!ValidateApproximateRobotCollision(q, out string collision))
             {
                 error = $"collision at {t:P0}: {collision}";
-                if (BypassOrFail(error)) { error = null; return true; }
                 return false;
             }
         }
@@ -2103,9 +2090,6 @@ public class JsonExecutor : MonoBehaviour
                 yield return AnimateJointsTo(RadToDeg(target), 1.5f);
         }
 
-        if (sharedTrajectoryFailure != null)
-            Debug.LogWarning($"[Executor-preview] 對照組預覽只演到軌跡截斷處：{sharedTrajectoryFailure}");
-
         // 模擬結束、復原場景之前比對 bitmap（復原之後落點就沒了）
         RunBitmapCheck(batch);
 
@@ -2450,10 +2434,7 @@ public class JsonExecutor : MonoBehaviour
         if (!sharedTrajectory.TryGetValue(stepId, out var actions) ||
             actionIndex < 0 || actionIndex >= actions.Count)
         {
-            // 對照組的軌跡在 IK 無解處截斷：實機執行到這裡停下，不送出不可達的 movej
-            lastMotionError = sharedTrajectoryFailure != null
-                ? $"verification off, trajectory truncated at unreachable pose: {sharedTrajectoryFailure}"
-                : $"missing shared trajectory for step {stepId} action {actionIndex + 1}";
+            lastMotionError = $"missing shared trajectory for step {stepId} action {actionIndex + 1}";
             yield break;
         }
 

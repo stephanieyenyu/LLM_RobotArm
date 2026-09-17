@@ -161,8 +161,8 @@ public class BatchEnvelope
     [JsonPropertyName("steps")]
     public List<StepEnvelope> Steps { get; set; } = new();
 
-    // 這一批是否關閉驗證（對照組）。欄位名刻意用 disabled：Unity 讀不到這個欄位時
-    // 預設 false，等於驗證開啟，版本不同步時不會默默變成對照組。
+    // 這一批是否關閉「模擬結束比對 bitmap」（對照組）。欄位名刻意用 disabled：Unity 讀不到
+    // 這個欄位時預設 false，等於驗證開啟，版本不同步時不會默默變成對照組。
     [JsonPropertyName("verification_disabled")]
     public bool VerificationDisabled { get; set; }
 
@@ -177,6 +177,35 @@ public class BatchEnvelope
 
     [JsonPropertyName("cell_size_m")]
     public double CellSizeM { get; set; }
+}
+
+/// <summary>
+/// Unity 模擬結束比對 bitmap 的結果（StreamingAssets/sim_check.json），由 server 印在 terminal。
+/// </summary>
+public class SimulationCheckReport
+{
+    [JsonPropertyName("batch_id")]
+    public int BatchId { get; set; }
+    [JsonPropertyName("performed")]
+    public bool Performed { get; set; }
+    [JsonPropertyName("skipped_reason")]
+    public string? SkippedReason { get; set; }
+    [JsonPropertyName("passed")]
+    public bool Passed { get; set; }
+    [JsonPropertyName("verification_enabled")]
+    public bool VerificationEnabled { get; set; }
+    [JsonPropertyName("expected_count")]
+    public int ExpectedCount { get; set; }
+    [JsonPropertyName("correct_count")]
+    public int CorrectCount { get; set; }
+    [JsonPropertyName("expected_rows")]
+    public List<string> ExpectedRows { get; set; } = new();
+    [JsonPropertyName("result_rows")]
+    public List<string> ResultRows { get; set; } = new();
+    [JsonPropertyName("errors")]
+    public List<string> Errors { get; set; } = new();
+    [JsonPropertyName("notes")]
+    public List<string> Notes { get; set; } = new();
 }
 
 /// <summary>
