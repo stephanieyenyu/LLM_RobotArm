@@ -754,9 +754,11 @@ MonoBehaviour:
   freezeUnityRobotDuringRealBatch: 0
   placeDescendExtraZ: 0
   useSharedMovejTrajectory: 1
+  previewOnlySharedTrajectory: 0
   trajectoryCollisionSampleDeg: 2
-  sharedMovejAcceleration: 0.35
-  sharedMovejVelocity: 0.45
+  sharedMovejAcceleration: 0.4
+  sharedMovejVelocity: 0.5
+  allowTopLeftCubeYaw180OnHardware: 1
   pickOffsetX: 0.002
   pickOffsetY: 0.002
   useReadyPose: 1

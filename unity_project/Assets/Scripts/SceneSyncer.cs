@@ -67,9 +67,9 @@ public class SceneSyncer : MonoBehaviour
     [Header("補貨區 / 擺放區邊界（跟 PlacementPlanner 常數對齊）")]
     // 必須與 csharp_server/LayeredTypes.cs 的 WorkspaceBounds 相同（LLM 規劃目標格用的值），不開放 Inspector 覆寫
     [System.NonSerialized] public float supplyZoneXMax = 0.35f;
-    [System.NonSerialized] public float targetZoneOriginX = 0.49f;
-    [System.NonSerialized] public float targetZoneOriginY = 0.04f;
-    [System.NonSerialized] public float cellSize = 0.052f;
+    [System.NonSerialized] public float targetZoneRightX = 0.708f;
+    [System.NonSerialized] public float targetZoneBottomY = 0.02f;
+    [System.NonSerialized] public float cellSize = 0.053f;
     [System.NonSerialized] public int gridRows = 5;
     [System.NonSerialized] public int gridCols = 5;
 
@@ -147,8 +147,8 @@ public class SceneSyncer : MonoBehaviour
         target.name = "TargetZone";
         target.transform.SetParent(workspaceRoot, false);
         Vector3 targetCenter = QRToUnity(
-            targetZoneOriginX + (gridCols - 1) * cellSize / 2f,
-            targetZoneOriginY + (gridRows - 1) * cellSize / 2f,
+            targetZoneRightX - (gridCols - 1) * cellSize / 2f,
+            targetZoneBottomY + (gridRows - 1) * cellSize / 2f,
             0f);
         targetCenter.y = 0.002f;
         target.transform.localPosition = targetCenter;
