@@ -39,7 +39,7 @@ public class WorkspaceBounds
     // 2D bitmap 的右下格中心固定在 QR frame；小圖形向左、向上展開。
     // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
     // LayoutRealizer 會拒絕超出目標擺放半徑 0.16..0.47 m 的目標。
-    // 5.3 cm 格距增加相鄰積木與夾爪之間的操作空間。
+    // 5.2 cm 格距：相鄰積木之間留 2.7 cm 給夾爪手指。
     public double TargetRightX { get; set; } = 0.708;
     public double TargetBottomY { get; set; } = 0.02;
     public double TargetOriginX { get; set; } = 0.49; // 3D placement uses its own origin.
@@ -161,10 +161,78 @@ public class BatchEnvelope
     [JsonPropertyName("steps")]
     public List<StepEnvelope> Steps { get; set; } = new();
 
-    // 這一批是否關閉驗證（對照組）。欄位名刻意用 disabled：Unity 讀不到這個欄位時
-    // 預設 false，等於驗證開啟，版本不同步時不會默默變成對照組。
+    // 這一批是否關閉「模擬結束比對 bitmap」（對照組）。欄位名刻意用 disabled：Unity 讀不到
+    // 這個欄位時預設 false，等於驗證開啟，版本不同步時不會默默變成對照組。
     [JsonPropertyName("verification_disabled")]
     public bool VerificationDisabled { get; set; }
+
+    // 模擬結束比對 bitmap 用。只有排 pattern 的指令才有，其他指令為 null（Unity 就不比對）。
+    // bitmap：Layer 1 的 ■□ 字串；expected_cells：Layer 2 把 bitmap 展開成的每個物件
+    // 應該落在哪。這份清單跟 steps 分開產生，才抓得到漏排的格子。
+    [JsonPropertyName("bitmap")]
+    public List<string>? Bitmap { get; set; }
+
+    [JsonPropertyName("expected_cells")]
+    public List<ExpectedCell>? ExpectedCells { get; set; }
+
+    [JsonPropertyName("cell_size_m")]
+    public double CellSizeM { get; set; }
+}
+
+/// <summary>
+/// Unity 模擬結束比對 bitmap 的結果（StreamingAssets/sim_check.json），由 server 印在 terminal。
+/// </summary>
+public class SimulationCheckReport
+{
+    [JsonPropertyName("batch_id")]
+    public int BatchId { get; set; }
+    [JsonPropertyName("performed")]
+    public bool Performed { get; set; }
+    [JsonPropertyName("skipped_reason")]
+    public string? SkippedReason { get; set; }
+    [JsonPropertyName("passed")]
+    public bool Passed { get; set; }
+    [JsonPropertyName("verification_enabled")]
+    public bool VerificationEnabled { get; set; }
+    [JsonPropertyName("expected_count")]
+    public int ExpectedCount { get; set; }
+    [JsonPropertyName("correct_count")]
+    public int CorrectCount { get; set; }
+    [JsonPropertyName("expected_rows")]
+    public List<string> ExpectedRows { get; set; } = new();
+    [JsonPropertyName("result_rows")]
+    public List<string> ResultRows { get; set; } = new();
+    [JsonPropertyName("errors")]
+    public List<string> Errors { get; set; } = new();
+    [JsonPropertyName("notes")]
+    public List<string> Notes { get; set; } = new();
+}
+
+/// <summary>
+/// bitmap 裡一個應該放積木的物件（cube 佔一格，domino 佔兩格），QR frame 座標。
+/// </summary>
+public class ExpectedCell
+{
+    [JsonPropertyName("row")]
+    public int Row { get; set; }
+    [JsonPropertyName("col")]
+    public int Col { get; set; }
+    // domino 的第二格；cube 為 -1（Unity JsonUtility 不支援 nullable）
+    [JsonPropertyName("second_row")]
+    public int SecondRow { get; set; } = -1;
+    [JsonPropertyName("second_col")]
+    public int SecondCol { get; set; } = -1;
+    [JsonPropertyName("x")]
+    public double X { get; set; }
+    [JsonPropertyName("y")]
+    public double Y { get; set; }
+    // 方塊頂面高度
+    [JsonPropertyName("z")]
+    public double Z { get; set; }
+    [JsonPropertyName("shape")]
+    public string Shape { get; set; } = "cube";
+    [JsonPropertyName("orientation")]
+    public string? Orientation { get; set; }
 }
 
 /// <summary>

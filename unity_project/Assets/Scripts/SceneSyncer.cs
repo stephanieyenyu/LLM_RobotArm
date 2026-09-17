@@ -161,7 +161,7 @@ public class SceneSyncer : MonoBehaviour
 
     }
 
-    // 讓外部（JsonExecutor 模擬模式）依 QR frame 座標找最近的 cube
+    // 讓外部（JsonExecutor 模擬預覽）依 QR frame 座標找最近的 cube
     // qrPos: 感知/csharp_server 用的 QR frame (x=水平寬, y=水平深, z=高)
     public GameObject FindNearestCube(float qrX, float qrY, float qrZ, float maxDistM = 0.10f)
     {
@@ -181,23 +181,6 @@ public class SceneSyncer : MonoBehaviour
             }
         }
         return bestD <= maxDistM ? best : null;
-    }
-
-    // 讓外部（JsonExecutor 模擬模式）以 QR frame 座標建立新 cube
-    public GameObject SpawnCube(string name, float qrX, float qrY, float qrZ, Color color)
-    {
-        if (cubeContainer == null) return null;
-        GameObject cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        cube.name = name;
-        cube.transform.SetParent(cubeContainer, false);
-        cube.transform.localScale = Vector3.one * cubeSizeM;
-        float halfHeight = cubeSizeM / 2f;
-        Vector3 pos = QRToUnity(qrX, qrY, qrZ);
-        pos.y -= halfHeight;
-        cube.transform.localPosition = pos;
-        SetColor(cube, color);
-        currentCubes.Add(cube);
-        return cube;
     }
 
     void MakeQrMarker(string name, float qrX, float qrY, Color color)

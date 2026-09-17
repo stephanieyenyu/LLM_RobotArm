@@ -49,6 +49,8 @@ string unityStreamingAssets = "../unity_project/Assets/StreamingAssets";
 string inputPath = Path.Combine(unityStreamingAssets, "user_input.txt");
 string currentStepPath = Path.Combine(unityStreamingAssets, "current_step.json");
 string stepDonePath = Path.Combine(unityStreamingAssets, "step_done.json");
+// Unity 模擬結束比對 bitmap 的結果，印在這個 terminal
+string simCheckPath = Path.Combine(unityStreamingAssets, "sim_check.json");
 string localOutputDir = "outputs";
 Directory.CreateDirectory(localOutputDir);
 
@@ -72,14 +74,16 @@ var commandRouter = new CommandRouter();
 if (File.Exists(inputPath)) File.WriteAllText(inputPath, "");
 if (File.Exists(currentStepPath)) File.Delete(currentStepPath);
 if (File.Exists(stepDonePath)) File.Delete(stepDonePath);
+if (File.Exists(simCheckPath)) File.Delete(simCheckPath);
 
 // Keep step IDs unique when dotnet is restarted while Unity remains in Play
 // Mode; otherwise Unity can mistake a new Step 1/2/... for an old command.
 int globalStepId = checked((int)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 const double UNITY_STEP_TIMEOUT_SEC = 600;
 
-// 一鍵驗證開關。每個指令開頭從 Unity 的旗標檔讀一次，整個指令（規劃 + Unity 執行）
-// 都用同一個值，中途在 Unity 切換不會讓同一次實驗一半開、一半關。
+// 一鍵開關（實驗組 / 對照組），只控制 Unity「模擬結束比對 bitmap」。
+// 每個指令開頭從 Unity 的旗標檔讀一次，蓋在整批任務上，中途切換不會一半開、一半關。
+// 動作規劃檢查（MotionPlanValidator）一律開著，不受這個開關影響。
 bool verificationEnabled = true;
 
 while (true)
@@ -118,8 +122,8 @@ async Task RunTaskAsync(string userCommand)
 {
     verificationEnabled = VerificationSwitch.ReadEnabled();
     Console.WriteLine(verificationEnabled
-        ? "[Verification] 驗證開啟（實驗組）"
-        : "[Verification] 驗證關閉（對照組）：略過動作規劃驗證與重新規劃、Unity 預檢只記錄不擋；硬體安全範圍仍然生效");
+        ? "[Verification] 模擬結束比對開啟（實驗組）：比對不通過就不送實體手臂"
+        : "[Verification] 模擬結束比對關閉（對照組）：比對結果只記錄，實體手臂照常執行");
 
     var initialScene = await FetchSceneAsync();
     if (initialScene.Count == 0)
@@ -296,7 +300,7 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
         remainingTargets.RemoveAll(t => t.Row == assignment.Target!.Row && t.Col == assignment.Target.Col);
     }
 
-    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps);
+    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps, realize.Targets, rows);
 }
 
 async Task RunSingleObjectTaskBatchAsync(RoutedCommand routed, List<SceneObject> initialScene)
@@ -1307,18 +1311,6 @@ async Task<StepEnvelope?> BuildStepEnvelopeAsync(
             continue;
         }
 
-        if (!verificationEnabled)
-        {
-            // 對照組：LLM 第一次成功產出的規劃直接採用，不擋、不回饋、不重新規劃。
-            // 驗證器仍在旁邊跑一次，只印出「驗證開著會擋下什麼」供實驗比對。
-            // （上面呼叫 LLM 失敗的重試不是驗證，是連線／解析錯誤，所以保留。）
-            if (!MotionPlanValidator.TryValidate(
-                    motionPlan, assignment, planningScene, out string bypassedError))
-                Console.WriteLine(
-                    $"[Verification OFF] step {assignment.StepId} 規劃未通過驗證但照樣送出：{bypassedError}");
-            break;
-        }
-
         if (MotionPlanValidator.TryValidate(
                 motionPlan, assignment, planningScene, out validationError))
             break;
@@ -1356,7 +1348,8 @@ async Task<StepEnvelope?> BuildStepEnvelopeAsync(
     };
 }
 
-async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps)
+async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps,
+    List<TargetCell>? expectedTargets = null, List<string>? bitmapRows = null)
 {
     if (steps.Count == 0)
     {
@@ -1376,6 +1369,20 @@ async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps)
         Comment = comment,
         Steps = candidateSteps,
         VerificationDisabled = !verificationEnabled,
+        Bitmap = expectedTargets != null ? bitmapRows : null,
+        CellSizeM = workspace.CellSize,
+        ExpectedCells = expectedTargets?.Select(t => new ExpectedCell
+        {
+            Row = t.Row,
+            Col = t.Col,
+            SecondRow = t.SecondRow ?? -1,
+            SecondCol = t.SecondCol ?? -1,
+            X = t.WorldX,
+            Y = t.WorldY,
+            Z = t.WorldZ,
+            Shape = t.ExpectedShape,
+            Orientation = t.ExpectedOrientation,
+        }).ToList(),
     };
     WriteBatchFile(batch);
 
@@ -1454,6 +1461,8 @@ async Task<ExecutionResult?> WaitForStepDoneAsync(int stepId, double timeoutSec)
     var start = DateTime.UtcNow;
     while ((DateTime.UtcNow - start).TotalSeconds < timeoutSec)
     {
+        // 模擬結束比對一做完就印，不必等實體手臂整批跑完
+        TryPrintSimulationCheckReport(stepId);
         if (File.Exists(stepDonePath))
         {
             try
@@ -1463,6 +1472,7 @@ async Task<ExecutionResult?> WaitForStepDoneAsync(int stepId, double timeoutSec)
                 if (result != null && result.StepId == stepId)
                 {
                     File.Delete(stepDonePath);   // 避免重讀
+                    TryPrintSimulationCheckReport(stepId);   // 比對不通過時兩個檔案幾乎同時寫出
                     return result;
                 }
             }
@@ -1471,6 +1481,56 @@ async Task<ExecutionResult?> WaitForStepDoneAsync(int stepId, double timeoutSec)
         await Task.Delay(200);
     }
     return null;
+}
+
+void TryPrintSimulationCheckReport(int batchId)
+{
+    if (!File.Exists(simCheckPath)) return;
+    SimulationCheckReport? report;
+    try
+    {
+        report = JsonSerializer.Deserialize<SimulationCheckReport>(File.ReadAllText(simCheckPath), jsonOptions);
+    }
+    catch
+    {
+        return;   // Unity 可能還在寫，下一輪再讀
+    }
+    if (report == null || report.BatchId != batchId) return;
+    try { File.Delete(simCheckPath); } catch (IOException) { }
+
+    var previousColor = Console.ForegroundColor;
+    if (!report.Performed)
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"[模擬驗證] batch {report.BatchId}：未進行 — {report.SkippedReason}");
+        Console.ForegroundColor = previousColor;
+        return;
+    }
+
+    Console.ForegroundColor = report.Passed ? ConsoleColor.Green : ConsoleColor.Red;
+    Console.WriteLine(report.Passed
+        ? $"[模擬驗證] batch {report.BatchId}：✓ 通過 — {report.ExpectedCount} 個物件全部放對"
+        : $"[模擬驗證] batch {report.BatchId}：✗ 不通過 — 預期 {report.ExpectedCount} 個物件，" +
+          $"放對 {report.CorrectCount}，錯誤 {report.Errors.Count} 項");
+    Console.ForegroundColor = previousColor;
+    if (!report.Passed)
+        Console.WriteLine(report.VerificationEnabled
+            ? "           驗證開啟（實驗組）→ 已停止，實體手臂不會動作"
+            : "           驗證關閉（對照組）→ 只記錄，實體手臂照常執行");
+
+    int rows = Math.Max(report.ExpectedRows.Count, report.ResultRows.Count);
+    if (rows > 0)
+    {
+        Console.WriteLine("           預期 bitmap    模擬結果（■ 正確  ✗ 少放/錯誤  ● 多放/放錯  □ 空）");
+        for (int r = 0; r < rows; r++)
+        {
+            string want = r < report.ExpectedRows.Count ? report.ExpectedRows[r] : "";
+            string got = r < report.ResultRows.Count ? report.ResultRows[r] : "";
+            Console.WriteLine($"           {want,-13}  {got}");
+        }
+    }
+    foreach (var error in report.Errors) Console.WriteLine("           - " + error);
+    foreach (var note in report.Notes) Console.WriteLine("           · " + note);
 }
 
 // 對應 perception 回傳格式

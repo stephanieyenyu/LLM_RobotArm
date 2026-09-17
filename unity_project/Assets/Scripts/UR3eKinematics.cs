@@ -57,6 +57,19 @@ public static class UR3eKinematics
 
     public enum IKError { None, Unreachable, JointLimit, ShoulderSingular, ElbowSingular, WristSingular, NotConverged }
 
+    // 給人看的中文說明（Unity log 和回報給 csharp_server 的錯誤訊息用）
+    public static string Describe(IKError error) => error switch
+    {
+        IKError.None => "正常",
+        IKError.Unreachable => "到不了",
+        IKError.JointLimit => "超出關節極限",
+        IKError.ShoulderSingular => "肩關節奇異點",
+        IKError.ElbowSingular => "肘關節奇異點",
+        IKError.WristSingular => "腕關節奇異點",
+        IKError.NotConverged => "無法收斂",
+        _ => error.ToString(),
+    };
+
     public struct Pose
     {
         public double x, y, z;
@@ -229,7 +242,7 @@ public static class UR3eKinematics
             {
                 var check = CheckJoints(q);
                 var sol = new IKSolution { q = q, error = check };
-                if (check != IKError.None) sol.message = $"solution valid but {check}";
+                if (check != IKError.None) sol.message = $"有解，但{Describe(check)}";
                 return sol;
             }
 
@@ -249,7 +262,7 @@ public static class UR3eKinematics
                 {
                     q = q,
                     error = IKError.Unreachable,
-                    message = $"IK diverged (posErr {posErr*1000:F2}mm rotErr {rotErr:F4}rad after {iter} iter)"
+                    message = $"IK 發散（位置誤差 {posErr*1000:F2} mm、角度誤差 {rotErr:F4} rad，迭代 {iter} 次）"
                 };
             }
             posErrLast = posErr;
@@ -266,7 +279,7 @@ public static class UR3eKinematics
         {
             q = q,
             error = singCheck != IKError.None ? singCheck : IKError.Unreachable,
-            message = $"not converged after {IK_MAX_ITER} iter (posErr {pe*1000:F2}mm rotErr {re:F4}rad)"
+            message = $"迭代 {IK_MAX_ITER} 次仍未收斂（位置誤差 {pe*1000:F2} mm、角度誤差 {re:F4} rad）"
         };
         return result;
     }

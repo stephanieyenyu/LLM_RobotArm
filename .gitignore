@@ -71,3 +71,10 @@ csharp_server/runs/
 
 # Runtime debug outputs from the various detectors
 csharp_server/images/
+
+# Unity <-> csharp_server runtime files (regenerated every run)
+unity_project/Assets/StreamingAssets/current_step.json*
+unity_project/Assets/StreamingAssets/step_done.json*
+unity_project/Assets/StreamingAssets/verification_enabled.txt*
+unity_project/Assets/StreamingAssets/skip_pattern_review.txt*
+unity_project/Assets/StreamingAssets/sim_check.json*
