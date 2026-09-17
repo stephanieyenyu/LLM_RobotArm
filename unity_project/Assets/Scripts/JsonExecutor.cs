@@ -1063,7 +1063,7 @@ public class JsonExecutor : MonoBehaviour
                 else if (action.function == "descend")
                 {
                     if (!source && holding) z += Mathf.Max(0f, placeDescendExtraZ);
-                    if (!PlanJointPose(pa, ref reference, x, y, z, orientation, out error))
+                    if (!PlanValidatedDescent(pa, ref reference, x, y, z, orientation, out error))
                     {
                         error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作：{error}";
                         return false;
@@ -1604,6 +1604,55 @@ public class JsonExecutor : MonoBehaviour
             travelZ, orientation, out error);
     }
 
+    // Try the original transition first, then bounded Cartesian waypoints.
+    // All accepted joint targets are shared by preview and hardware, and every
+    // segment still passes the existing joint, base-facing and collision gates.
+    bool PlanValidatedDescent(PlannedJointAction action, ref double[] reference,
+        double x, double y, double z, string orientation, out string error)
+    {
+        var start = UR3eKinematics.FKPose(reference);
+        Debug.Log($"[Executor-descent] TCP start={start}; target={SharedTargetPose(x, y, z, orientation)}; orientation={orientation}");
+        var trial = new PlannedJointAction { function = action.function, seconds = action.seconds };
+        double[] trialReference = (double[])reference.Clone();
+        if (PlanJointPose(trial, ref trialReference, x, y, z, orientation, out error))
+        {
+            action.targets.AddRange(trial.targets);
+            reference = trialReference;
+            return true;
+        }
+        string directError = error;
+        // A descent must already be above the endpoint; do not turn this
+        // fallback into low-height lateral travel or an upward movement.
+        if (System.Math.Abs(start.x - x) > 0.002 ||
+            System.Math.Abs(start.y - y) > 0.002 || start.z < z)
+            return false;
+
+        foreach (double spacing in new double[] { 0.020, 0.010 })
+        {
+            trial = new PlannedJointAction { function = action.function, seconds = action.seconds };
+            trialReference = (double[])reference.Clone();
+            int count = System.Math.Max(1, (int)System.Math.Ceiling((start.z - z) / spacing));
+            bool accepted = true;
+            for (int i = 1; i <= count; i++)
+            {
+                double waypointZ = start.z + (z - start.z) * i / count;
+                if (!PlanJointPose(trial, ref trialReference, x, y, waypointZ, orientation, out error))
+                {
+                    accepted = false;
+                    break;
+                }
+            }
+            if (!accepted) continue;
+            action.targets.AddRange(trial.targets);
+            reference = trialReference;
+            Debug.Log($"[Executor-descent] Accepted {count} collision-checked descent segments (spacing <= {spacing:F3}m).");
+            error = null;
+            return true;
+        }
+        error = $"direct descent rejected: {directError}; segmented descent also rejected: {error}";
+        return false;
+    }
+
     bool PlanJointPose(PlannedJointAction action, ref double[] reference,
         double x, double y, double z, string orientation, out string error)
     {
@@ -1732,7 +1781,12 @@ public class JsonExecutor : MonoBehaviour
                 if (a == 3 && b == 5) continue;
                 float distance = SegmentDistance(ToVector3(p[a]), ToVector3(p[a + 1]),
                                                  ToVector3(p[b]), ToVector3(p[b + 1]));
-                float required = radii[a] + radii[b] + 0.008f;
+                // Pair-specific thresholds; other pairs retain the 8 mm margin.
+                // 0↔2: 140 mm, no extra margin beyond the capsule radii.
+                // 1↔3: 125 mm, a 5 mm margin beyond the capsule radii.
+                float required = (a == 0 && b == 2) ? 0.140f
+                    : (a == 1 && b == 3) ? 0.125f
+                    : radii[a] + radii[b] + 0.008f;
                 if (distance < required)
                 {
                     error = $"{SelfCollisionText}：連桿 {a}↔{b} 距離 {distance:F3}m，小於需要的 {required:F3}m";
