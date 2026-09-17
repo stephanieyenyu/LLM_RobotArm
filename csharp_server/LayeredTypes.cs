@@ -36,14 +36,16 @@ public class WorkspaceBounds
     // supply side; completed pattern blocks in the target side are never reused.
     public double SupplyZoneXMax { get; set; } = 0.35;
     public double TargetZoneXMin { get; set; } = 0.35;
-    // 目標區左下角在 QR frame 的座標（bitmap 最後一列、第 0 欄的中心）。
-    // 2D bitmap placement origin and cell spacing.
+    // 2D bitmap 的右下格中心固定在 QR frame；小圖形向左、向上展開。
     // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
-    // 整片 5x5 必須落在實機安全半徑 0.16..0.42 m 之間（JsonExecutor 的 BASE_EXCLUSION / MAX_REACH）。
-    // 5.2 cm 格距增加相鄰積木與夾爪之間的操作空間。
-    public double TargetOriginX { get; set; } = 0.49;
+    // LayoutRealizer 會拒絕超出目標擺放半徑 0.16..0.47 m 的目標。
+    // 5.3 cm 格距增加相鄰積木與夾爪之間的操作空間。
+    public double TargetRightX { get; set; } = 0.708;
+    public double TargetBottomY { get; set; } = 0.02;
+    public double TargetOriginX { get; set; } = 0.49; // 3D placement uses its own origin.
     public double TargetOriginY { get; set; } = 0.04;
-    public double CellSize { get; set; } = 0.052;
+    public double CellSize { get; set; } = 0.053;
+    public double SpatialCellSize { get; set; } = 0.052;
     public double DefaultBlockZ { get; set; } = 0.025;
     public int MaxRows { get; set; } = 5;
     public int MaxCols { get; set; } = 5;
@@ -166,7 +168,7 @@ public class BatchEnvelope
 
     // 模擬結束比對 bitmap 用。只有排 pattern 的指令才有，其他指令為 null（Unity 就不比對）。
     // bitmap：Layer 1 的 ■□ 字串；expected_cells：Layer 2 把 bitmap 展開成的每個物件
-    // 應該落在哪（已套用整批平移），這份清單跟 steps 分開產生，才抓得到漏排的格子。
+    // 應該落在哪。這份清單跟 steps 分開產生，才抓得到漏排的格子。
     [JsonPropertyName("bitmap")]
     public List<string>? Bitmap { get; set; }
 

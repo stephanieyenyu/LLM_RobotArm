@@ -58,7 +58,7 @@ public static class LayoutRealizer
                 if (pattern.Bitmap[r, c] == 1 && pattern.Bitmap[r, c + 1] == 1
                     && !occupied[r, c] && !occupied[r, c + 1])
                 {
-                    targets.Add(BuildDomino(r, c, r, c + 1, rows, ws, pattern.BlockColor, "horizontal"));
+                    targets.Add(BuildDomino(r, c, r, c + 1, rows, cols, ws, pattern.BlockColor, "horizontal"));
                     occupied[r, c] = true;
                     occupied[r, c + 1] = true;
                     dominosUsed++;
@@ -75,7 +75,7 @@ public static class LayoutRealizer
                 if (pattern.Bitmap[r, c] == 1 && pattern.Bitmap[r + 1, c] == 1
                     && !occupied[r, c] && !occupied[r + 1, c])
                 {
-                    targets.Add(BuildDomino(r, c, r + 1, c, rows, ws, pattern.BlockColor, "vertical"));
+                    targets.Add(BuildDomino(r, c, r + 1, c, rows, cols, ws, pattern.BlockColor, "vertical"));
                     occupied[r, c] = true;
                     occupied[r + 1, c] = true;
                     dominosUsed++;
@@ -90,7 +90,7 @@ public static class LayoutRealizer
             {
                 if (pattern.Bitmap[r, c] == 1 && !occupied[r, c])
                 {
-                    targets.Add(BuildCube(r, c, rows, ws, pattern.BlockColor));
+                    targets.Add(BuildCube(r, c, rows, cols, ws, pattern.BlockColor));
                     occupied[r, c] = true;
                 }
             }
@@ -118,102 +118,52 @@ if (dominosNeeded > dominoBudget)
     };
 }
 
-        if (!TryFitTargetsToSafeReach(targets, ws, out double shiftX, out double shiftY))
+        if (!AreTargetsWithinSafeReach(targets, ws))
         {
             return new RealizeResult
             {
-                Error = $"CellSize={ws.CellSize:F3} m 的本次圖案無法在 placement area 內平移到 " +
-                        "UR 半徑篩選 0.16..0.42 m；未停用 IK 與碰撞限制。",
+                Error = $"固定右下角的圖案超出擺放區或 UR 目標半徑 0.16..0.47 m " +
+                        $"(CellSize={ws.CellSize:F3} m)；不會自動平移或送出實體手臂。",
             };
-        }
-
-        foreach (var target in targets)
-        {
-            target.WorldX += shiftX;
-            target.WorldY += shiftY;
         }
 
         return new RealizeResult
         {
             Targets = targets,
-            PlacementShiftX = shiftX,
-            PlacementShiftY = shiftY,
         };
     }
 
-    private static bool TryFitTargetsToSafeReach(
-        IReadOnlyList<TargetCell> targets,
-        WorkspaceBounds ws,
-        out double bestShiftX,
-        out double bestShiftY)
+    private static bool AreTargetsWithinSafeReach(
+        IReadOnlyList<TargetCell> targets, WorkspaceBounds ws)
     {
         const double qrToRobotX = -0.38824;
         const double qrToRobotY = -0.35473;
         const double minReach = 0.16;
-        const double maxReach = 0.42;
+        const double maxReach = 0.47;
         const double placementMaxX = 0.72;
         const double placementMinY = 0.00;
         const double placementMaxY = 0.45;
-        const double searchStep = 0.001;
-
-        double minX = targets.Min(t => t.WorldX);
-        double maxX = targets.Max(t => t.WorldX);
-        double minY = targets.Min(t => t.WorldY);
-        double maxY = targets.Max(t => t.WorldY);
-        double minShiftX = ws.TargetZoneXMin - minX;
-        double maxShiftX = placementMaxX - maxX;
-        double minShiftY = placementMinY - minY;
-        double maxShiftY = placementMaxY - maxY;
-
-        bestShiftX = 0.0;
-        bestShiftY = 0.0;
-        double bestCost = double.PositiveInfinity;
-        double bestMargin = double.NegativeInfinity;
-
-        for (double dx = minShiftX; dx <= maxShiftX + 1e-9; dx += searchStep)
+        foreach (var target in targets)
         {
-            for (double dy = minShiftY; dy <= maxShiftY + 1e-9; dy += searchStep)
-            {
-                bool safe = true;
-                double minimumMargin = double.PositiveInfinity;
-                foreach (var target in targets)
-                {
-                    double robotX = qrToRobotX + target.WorldX + dx;
-                    double robotY = qrToRobotY + target.WorldY + dy;
-                    double radius = Math.Sqrt(robotX * robotX + robotY * robotY);
-                    if (radius < minReach || radius > maxReach)
-                    {
-                        safe = false;
-                        break;
-                    }
-                    minimumMargin = Math.Min(minimumMargin,
-                        Math.Min(radius - minReach, maxReach - radius));
-                }
-                if (!safe) continue;
-
-                double cost = dx * dx + dy * dy;
-                if (cost < bestCost - 1e-12 ||
-                    (Math.Abs(cost - bestCost) <= 1e-12 && minimumMargin > bestMargin))
-                {
-                    bestCost = cost;
-                    bestMargin = minimumMargin;
-                    bestShiftX = dx;
-                    bestShiftY = dy;
-                }
-            }
+            double robotX = qrToRobotX + target.WorldX;
+            double robotY = qrToRobotY + target.WorldY;
+            double radius = Math.Sqrt(robotX * robotX + robotY * robotY);
+            if (target.WorldX < ws.TargetZoneXMin || target.WorldX > placementMaxX ||
+                target.WorldY < placementMinY || target.WorldY > placementMaxY ||
+                radius < minReach || radius > maxReach)
+                return false;
         }
-
-        return !double.IsPositiveInfinity(bestCost);
+        return true;
     }
 
-    private static TargetCell BuildCube(int r, int c, int rows, WorkspaceBounds ws, string color)
+    private static TargetCell BuildCube(int r, int c, int rows, int cols, WorkspaceBounds ws, string color)
     {
         return new TargetCell
         {
             Row = r,
             Col = c,
-            WorldX = ws.TargetOriginX + c * ws.CellSize,
-            WorldY = ws.TargetOriginY + (rows - 1 - r) * ws.CellSize,  // row 反向：字母不上下顛倒
+            WorldX = ws.TargetRightX - (cols - 1 - c) * ws.CellSize,
+            WorldY = ws.TargetBottomY + (rows - 1 - r) * ws.CellSize,  // row 反向：字母不上下顛倒
             WorldZ = ws.DefaultBlockZ,
             ExpectedShape = "cube",
             ExpectedColor = color,
@@ -223,11 +173,11 @@ if (dominosNeeded > dominoBudget)
 
     private static TargetCell BuildDomino(
         int r1, int c1, int r2, int c2,
-        int rows, WorkspaceBounds ws, string color, string orientation)
+        int rows, int cols, WorkspaceBounds ws, string color, string orientation)
     {
         // 中心點 = 兩格中點；row 反向處理
-        double cx = ws.TargetOriginX + (c1 + c2) * 0.5 * ws.CellSize;
-        double cy = ws.TargetOriginY + ((rows - 1 - r1) + (rows - 1 - r2)) * 0.5 * ws.CellSize;
+        double cx = ws.TargetRightX - (cols - 1 - (c1 + c2) * 0.5) * ws.CellSize;
+        double cy = ws.TargetBottomY + ((rows - 1 - r1) + (rows - 1 - r2)) * 0.5 * ws.CellSize;
         return new TargetCell
         {
             Row = r1,

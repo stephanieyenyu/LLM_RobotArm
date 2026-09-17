@@ -19,12 +19,11 @@ public static class TaskAssigner
 {
     // supply 篩選：只認補貨區內、指定顏色 + 形狀對的
     private const double SUPPLY_ZONE_X_MAX = 0.35;
-    // Keep supply picks far enough from the UR base for the forearm, wrist and
-    // attached gripper to remain clear.  The old 0.16 m TCP-only check allowed
-    // a source at 0.215 m whose valid TCP pose folded the links into each other.
+    // Source reach is only a candidate filter; Unity must still reject unsafe
+    // full-arm trajectories before sending motion to the robot.
     private const double QR1_TO_UR_X = -0.38824;
     private const double QR1_TO_UR_Y = -0.35473;
-    private const double MIN_SAFE_SOURCE_RADIUS_M = 0.23;
+    private const double MIN_SAFE_SOURCE_RADIUS_M = 0.20;
     private const double MAX_SAFE_SOURCE_RADIUS_M = 0.42;
 
     /// <summary>

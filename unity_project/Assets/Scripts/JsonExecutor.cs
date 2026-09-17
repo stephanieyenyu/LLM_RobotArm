@@ -188,9 +188,11 @@ public class JsonExecutor : MonoBehaviour
 
     [Header("預演 / 實機共用 movej 軌跡")]
     public bool useSharedMovejTrajectory = true;
+    public bool previewOnlySharedTrajectory = false;
     [Range(0.5f, 5f)] public float trajectoryCollisionSampleDeg = 2f;
-    public float sharedMovejAcceleration = 0.35f;
-    public float sharedMovejVelocity = 0.45f;
+    public float sharedMovejAcceleration = 0.40f;
+    public float sharedMovejVelocity = 0.50f;
+    public bool allowTopLeftCubeYaw180OnHardware = true;
 
     [Header("模擬結束比對 bitmap（屬於驗證，受一鍵驗證開關控制）")]
     // 落點中心離 bitmap 格子中心多遠以內算放對（公尺）。格距 4 cm、方塊 2.5 cm，間隙只有 1.5 cm
@@ -225,14 +227,15 @@ public class JsonExecutor : MonoBehaviour
     private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
     // Picking needs more clearance than placing because the source-side tool
     // orientation and attached gripper can fold the wrist/forearm toward the base.
-    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.23f;
+    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.20f;
     // High-plane lateral travel is routed around this radius when a direct
     // Cartesian chord would cut through the base exclusion cylinder.
     private const float BASE_DETOUR_RADIUS_M = 0.28f;
     private const float BASE_DETOUR_MAX_ANGLE_STEP_DEG = 25f;
     // Avoid poses that make the UR3e almost fully extend. Those IK solutions are
     // fragile and can trigger a protective stop before the TCP reaches the block.
-    private const float MAX_REACH_RADIUS_M = 0.42f;
+    private const float MAX_SOURCE_REACH_RADIUS_M = 0.42f;
+    private const float MAX_TARGET_REACH_RADIUS_M = 0.47f;
     // Do not advance merely because a fixed delay elapsed.  Every motion is
     // confirmed against the UR secondary-interface feedback first.
     private const float MOTION_START_GRACE_SEC = 0.35f;
@@ -552,6 +555,14 @@ public class JsonExecutor : MonoBehaviour
     IEnumerator ExecuteBatch(BatchEnvelope batch)
     {
         Debug.Log($"[Executor] 收到 batch {batch.batch_id}: {batch.steps.Count} steps — {batch.comment}");
+        bool usingTopLeftFallback = false;
+
+        if (previewOnlySharedTrajectory && !useSharedMovejTrajectory)
+        {
+            WriteStepDone(batch.batch_id, false,
+                "preview-only requires the shared joint trajectory", 0f);
+            yield break;
+        }
 
         verificationEnabled = !batch.verification_disabled;
         bypassedVerificationFindings.Clear();
@@ -573,7 +584,30 @@ public class JsonExecutor : MonoBehaviour
             double[] startQ = useReadyPose && readyJointsRad != null && readyJointsRad.Length == 6
                 ? System.Array.ConvertAll(readyJointsRad, value => (double)value)
                 : DegArrayToRad(simIKReferenceDeg);
-            if (!BuildSharedTrajectory(batch, startQ, out string trajectoryError))
+            bool trajectoryReady = BuildSharedTrajectory(batch, startQ, false, out string trajectoryError);
+            if (!trajectoryReady)
+            {
+                StepEnvelope topLeftCube = batch.steps.Find(step =>
+                    step != null && step.target_position != null &&
+                    step.target_position.shape == "cube" &&
+                    step.target_position.name == "target_cube_r0_c0");
+                if (topLeftCube != null &&
+                    trajectoryError.StartsWith($"step {topLeftCube.step_id} action ", StringComparison.Ordinal) &&
+                    trajectoryError.Contains("self-collision"))
+                {
+                    // A 180-degree yaw preserves the parallel-jaw footprint at this cube.
+                    string originalError = trajectoryError;
+                    trajectoryReady = BuildSharedTrajectory(batch, startQ, true, out trajectoryError);
+                    if (trajectoryReady)
+                    {
+                        usingTopLeftFallback = true;
+                        Debug.Log($"[Executor-shared] step {topLeftCube.step_id} top-left cube uses 180-degree tool yaw; all other target orientations unchanged.");
+                    }
+                    else
+                        trajectoryError = originalError + "; top-left cube 180-degree yaw also rejected: " + trajectoryError;
+                }
+            }
+            if (!trajectoryReady)
             {
                 string message = $"shared movej trajectory rejected before preview: {trajectoryError}";
                 Debug.LogError("[Executor-shared] " + message);
@@ -612,7 +646,7 @@ public class JsonExecutor : MonoBehaviour
             sceneSyncer = FindObjectOfType<SceneSyncer>();
         if (robotArm == null)
             robotArm = FindObjectOfType<RobotArm>();
-        if (previewBatchInUnityBeforeRobot)
+        if (previewBatchInUnityBeforeRobot || previewOnlySharedTrajectory || usingTopLeftFallback)
         {
             // 動畫預覽：手臂 + 方塊完整演示（跑完自動復原）
             // 預覽期間關 followRealRobotFeedback，讓 Update() 用我們設的 Angles 而非實機 q_actual
@@ -632,6 +666,26 @@ public class JsonExecutor : MonoBehaviour
         else if (batch.expected_cells != null && batch.expected_cells.Count > 0)
         {
             Debug.LogWarning("[BitmapCheck] previewBatchInUnityBeforeRobot 關閉，沒有模擬就無法比對 bitmap，直接送實機");
+        }
+        if (previewOnlySharedTrajectory)
+        {
+            if (robotArm != null) robotArm.followRealRobotFeedback = true;
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            WriteStepDone(batch.batch_id, false,
+                "preview-only: shared trajectory shown; no UR motion sent", 0f);
+            Debug.Log("[Executor-preview] Preview-only finished; UR motion was not sent.");
+            yield break;
+        }
+        if (usingTopLeftFallback && !allowTopLeftCubeYaw180OnHardware)
+        {
+            if (robotArm != null) robotArm.followRealRobotFeedback = true;
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            WriteStepDone(batch.batch_id, false,
+                "top-left cube 180-degree yaw previewed; hardware motion requires explicit Inspector approval", 0f);
+            Debug.LogWarning("[Executor-preview] Top-left cube yaw fallback previewed only; no UR motion sent.");
+            yield break;
         }
         // 預覽結束、實機開始：Unity 手臂改由實機 feedback 驅動
         if (robotArm != null) robotArm.followRealRobotFeedback = true;
@@ -944,10 +998,14 @@ public class JsonExecutor : MonoBehaviour
         return r;
     }
 
-    bool BuildSharedTrajectory(BatchEnvelope batch, double[] startQ, out string error)
+    bool BuildSharedTrajectory(BatchEnvelope batch, double[] startQ,
+        bool reverseTopLeftCube, out string error)
     {
         sharedTrajectory.Clear();
         sharedFinalTrajectory.Clear();
+        // 左上角方塊的 180° 備案會把整批軌跡重建一次，上一次記下的略過項目不能留著
+        bypassedVerificationFindings.Clear();
+        sharedTrajectoryFailure = null;
         sharedTrajectoryStartQ = (double[])startQ.Clone();
         double[] reference = (double[])startQ.Clone();
         UR3eKinematics.toolOffsetZ = robotArm != null ? robotArm.toolOffsetZ : 0.0;
@@ -986,6 +1044,10 @@ public class JsonExecutor : MonoBehaviour
                 float z = pos == null ? 0f : QR1_Z + pos.z + Z_CORRECTION;
                 float height = Mathf.Clamp(action.height_m > 0f ? action.height_m : SAFE_Z_OFFSET, 0.05f, 0.15f);
                 string orientation = pos == null ? "horizontal" : EffectiveOrientation(pos, source);
+                if (!source && reverseTopLeftCube &&
+                    env.target_position != null && env.target_position.shape == "cube" &&
+                    env.target_position.name == "target_cube_r0_c0")
+                    orientation = "cube_yaw_180";
 
                 if (action.function == "move_above")
                 {
@@ -1463,8 +1525,8 @@ public class JsonExecutor : MonoBehaviour
 
             if (PlanJointPose(trial, ref trialReference, current.x, current.y,
                     travelZ, orientation, out lastError) &&
-                PlanJointPose(trial, ref trialReference, targetX, targetY,
-                    travelZ, orientation, out lastError) &&
+                PlanSharedTravelXY(trial, ref trialReference, current.x, current.y,
+                    targetX, targetY, travelZ, orientation, out lastError) &&
                 PlanJointPose(trial, ref trialReference, targetX, targetY,
                     endpointHoverZ, orientation, out lastError))
             {
@@ -1489,6 +1551,56 @@ public class JsonExecutor : MonoBehaviour
         return false;
     }
 
+    bool PlanSharedTravelXY(PlannedJointAction action, ref double[] reference,
+        double startX, double startY, double targetX, double targetY,
+        double travelZ, string orientation, out string error)
+    {
+        double dx = targetX - startX, dy = targetY - startY;
+        double lengthSquared = dx * dx + dy * dy;
+        double t = lengthSquared > 1e-9
+            ? System.Math.Max(0.0, System.Math.Min(1.0,
+                -(startX * dx + startY * dy) / lengthSquared))
+            : 0.0;
+        double closestX = startX + t * dx, closestY = startY + t * dy;
+        double startRadius = System.Math.Sqrt(startX * startX + startY * startY);
+        double targetRadius = System.Math.Sqrt(targetX * targetX + targetY * targetY);
+        double detourFloor = BASE_EXCLUSION_RADIUS_M + 0.04;
+
+        if (closestX * closestX + closestY * closestY < detourFloor * detourFloor)
+        {
+            if (startRadius < BASE_EXCLUSION_RADIUS_M ||
+                targetRadius < BASE_EXCLUSION_RADIUS_M)
+            {
+                error = "shared travel starts or ends inside the base exclusion radius";
+                return false;
+            }
+            double startAngle = System.Math.Atan2(startY, startX);
+            double targetAngle = System.Math.Atan2(targetY, targetX);
+            double delta = System.Math.Atan2(System.Math.Sin(targetAngle - startAngle),
+                System.Math.Cos(targetAngle - startAngle));
+            int steps = System.Math.Max(1, (int)System.Math.Ceiling(
+                System.Math.Abs(delta) * Mathf.Rad2Deg / BASE_DETOUR_MAX_ANGLE_STEP_DEG));
+
+            if (!PlanJointPose(action, ref reference,
+                    BASE_DETOUR_RADIUS_M * System.Math.Cos(startAngle),
+                    BASE_DETOUR_RADIUS_M * System.Math.Sin(startAngle),
+                    travelZ, orientation, out error)) return false;
+
+            for (int i = 1; i <= steps; i++)
+            {
+                double angle = startAngle + delta * i / steps;
+                if (!PlanJointPose(action, ref reference,
+                        BASE_DETOUR_RADIUS_M * System.Math.Cos(angle),
+                        BASE_DETOUR_RADIUS_M * System.Math.Sin(angle),
+                        travelZ, orientation, out error)) return false;
+            }
+            Debug.Log($"[Executor-shared] Routed move_above around base in {steps} arc segments.");
+        }
+
+        return PlanJointPose(action, ref reference, targetX, targetY,
+            travelZ, orientation, out error);
+    }
+
     bool PlanJointPose(PlannedJointAction action, ref double[] reference,
         double x, double y, double z, string orientation, out string error)
     {
@@ -1499,13 +1611,15 @@ public class JsonExecutor : MonoBehaviour
             error = $"IK {solution.error}: {solution.message} at {pose}";
             return false;
         }
-        if (!ValidateJointTransition(reference, solution.q, out error, allowSingularEnd: false))
+        if (!ValidateBaseFacing(solution.q, x, y, out error) ||
+            !ValidateJointTransition(reference, solution.q, out error, allowSingularEnd: false))
         {
             string firstTransitionError = error;
             bool foundSafeAlternative = false;
             var alternatives = UR3eKinematics.IKAlternatives(pose, reference);
             foreach (var alternative in alternatives)
             {
+                if (!ValidateBaseFacing(alternative.q, x, y, out error)) continue;
                 if (!ValidateJointTransition(reference, alternative.q, out error,
                         allowSingularEnd: false)) continue;
                 solution = alternative;
@@ -1525,9 +1639,27 @@ public class JsonExecutor : MonoBehaviour
         return true;
     }
 
+    bool ValidateBaseFacing(double[] joints, double x, double y, out string error)
+    {
+        double bearing = System.Math.Atan2(y, x);
+        double delta = System.Math.Atan2(System.Math.Sin(joints[0] - bearing),
+            System.Math.Cos(joints[0] - bearing));
+        if (System.Math.Abs(delta) > System.Math.PI / 2.0)
+        {
+            error = $"base faces away from target by {System.Math.Abs(delta) * Mathf.Rad2Deg:F1} deg " +
+                    $"(base={joints[0] * Mathf.Rad2Deg:F1} deg, bearing={bearing * Mathf.Rad2Deg:F1} deg)";
+            // 屬於驗證（不是硬體安全範圍），跟碰撞 / 奇點檢查一樣受一鍵開關控制
+            if (BypassOrFail(error)) { error = null; return true; }
+            return false;
+        }
+        error = null;
+        return true;
+    }
+
     UR3eKinematics.Pose SharedTargetPose(double x, double y, double z, string orientation)
     {
-        float toolDeg = orientation == "horizontal" ? 0f : 90f;
+        float toolDeg = orientation == "cube_yaw_180" ? 180f
+            : orientation == "horizontal" ? 0f : 90f;
         Quaternion rotation = Quaternion.AngleAxis(180f, Vector3.up) *
                               Quaternion.AngleAxis(toolDeg, Vector3.forward);
         rotation.ToAngleAxis(out float angleDeg, out Vector3 axis);
@@ -1594,9 +1726,6 @@ public class JsonExecutor : MonoBehaviour
         {
             for (int b = a + 2; b < 6; b++)
             {
-                // Direct neighbours share a joint; base versus shoulder/upper-arm
-                // contact is part of the normal mechanical assembly.
-                if (a == 0 && b <= 2) continue;
                 // Segments 3 and 5 are separated by the fixed d5 wrist spacer
                 // (about 85 mm). Their conservative capsules naturally meet at
                 // that assembly, so adding the general 8 mm clearance creates a
@@ -1663,12 +1792,12 @@ public class JsonExecutor : MonoBehaviour
             float oy = QR1_Y + env.source_position.y + pickOffsetY;
             float tx = QR1_X + env.target_position.x;
             float ty = QR1_Y + env.target_position.y;
-            if (InsideSourceBaseExclusion(ox, oy) || OutsideReachEnvelope(ox, oy))
+            if (InsideSourceBaseExclusion(ox, oy) || OutsideReachEnvelope(ox, oy, MAX_SOURCE_REACH_RADIUS_M))
                 failures.Add($"step {env.step_id} source @ UR({ox:F3},{oy:F3}) 半徑 {Mathf.Sqrt(ox * ox + oy * oy):F3} m " +
-                             $"超出實機安全範圍 {SOURCE_BASE_EXCLUSION_RADIUS_M:F2}..{MAX_REACH_RADIUS_M:F2} m");
-            if (InsideBaseExclusion(tx, ty) || OutsideReachEnvelope(tx, ty))
+                             $"超出實機安全範圍 {SOURCE_BASE_EXCLUSION_RADIUS_M:F2}..{MAX_SOURCE_REACH_RADIUS_M:F2} m");
+            if (InsideBaseExclusion(tx, ty) || OutsideReachEnvelope(tx, ty, MAX_TARGET_REACH_RADIUS_M))
                 failures.Add($"step {env.step_id} target @ UR({tx:F3},{ty:F3}) 半徑 {Mathf.Sqrt(tx * tx + ty * ty):F3} m " +
-                             $"超出實機安全範圍 {BASE_EXCLUSION_RADIUS_M:F2}..{MAX_REACH_RADIUS_M:F2} m");
+                             $"超出實機安全範圍 {BASE_EXCLUSION_RADIUS_M:F2}..{MAX_TARGET_REACH_RADIUS_M:F2} m");
 
             foreach (var (label, pos, hover) in new[]
             {
@@ -2163,12 +2292,13 @@ public class JsonExecutor : MonoBehaviour
             $"target UR=({tx:F4},{ty:F4},{tz:F4})");
 
         if (InsideSourceBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty) ||
-            OutsideReachEnvelope(ox, oy) || OutsideReachEnvelope(tx, ty))
+            OutsideReachEnvelope(ox, oy, MAX_SOURCE_REACH_RADIUS_M) ||
+            OutsideReachEnvelope(tx, ty, MAX_TARGET_REACH_RADIUS_M))
         {
             string error = $"unsafe target reach: source radius={Mathf.Sqrt(ox * ox + oy * oy):F3}m, " +
                            $"target radius={Mathf.Sqrt(tx * tx + ty * ty):F3}m, " +
-                           $"source allowed={SOURCE_BASE_EXCLUSION_RADIUS_M:F3}..{MAX_REACH_RADIUS_M:F3}m, " +
-                           $"target allowed={BASE_EXCLUSION_RADIUS_M:F3}..{MAX_REACH_RADIUS_M:F3}m";
+                           $"source allowed={SOURCE_BASE_EXCLUSION_RADIUS_M:F3}..{MAX_SOURCE_REACH_RADIUS_M:F3}m, " +
+                           $"target allowed={BASE_EXCLUSION_RADIUS_M:F3}..{MAX_TARGET_REACH_RADIUS_M:F3}m";
             Debug.LogError("[Executor] " + error);
             WriteStepDone(env.step_id, false, error, 0f);
             if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
@@ -2906,9 +3036,9 @@ public class JsonExecutor : MonoBehaviour
         return minimumRadius >= BASE_EXCLUSION_RADIUS_M;
     }
 
-    bool OutsideReachEnvelope(float x, float y)
+    bool OutsideReachEnvelope(float x, float y, float maxRadius)
     {
-        return (x * x + y * y) > MAX_REACH_RADIUS_M * MAX_REACH_RADIUS_M;
+        return (x * x + y * y) > maxRadius * maxRadius;
     }
 
     string EffectiveOrientation(NamedPosition pos, bool isSource)
