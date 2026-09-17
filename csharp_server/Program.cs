@@ -296,7 +296,7 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
         remainingTargets.RemoveAll(t => t.Row == assignment.Target!.Row && t.Col == assignment.Target.Col);
     }
 
-    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps, initialSnap, realize.Targets);
+    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps, initialSnap, realize.Targets, rows);
 }
 
 async Task RunSingleObjectTaskBatchAsync(RoutedCommand routed, List<SceneObject> initialScene)
@@ -1357,7 +1357,8 @@ async Task<StepEnvelope?> BuildStepEnvelopeAsync(
 }
 
 async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps,
-    List<SceneObject>? placementScene = null, List<TargetCell>? placementTargets = null)
+    List<SceneObject>? placementScene = null, List<TargetCell>? placementTargets = null,
+    List<string>? bitmapRows = null)
 {
     if (steps.Count == 0)
     {
@@ -1414,6 +1415,21 @@ async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps,
         Comment = comment,
         Steps = candidateSteps,
         VerificationDisabled = !verificationEnabled,
+        Bitmap = placementTargets != null ? bitmapRows : null,
+        CellSizeM = workspace.CellSize,
+        // 預期落點要跟這一輪的平移一致；placementTargets 本身要等整批成功才會加上 offset
+        ExpectedCells = placementTargets?.Select(t => new ExpectedCell
+        {
+            Row = t.Row,
+            Col = t.Col,
+            SecondRow = t.SecondRow ?? -1,
+            SecondCol = t.SecondCol ?? -1,
+            X = t.WorldX + offset.X,
+            Y = t.WorldY + offset.Y,
+            Z = t.WorldZ,
+            Shape = t.ExpectedShape,
+            Orientation = t.ExpectedOrientation,
+        }).ToList(),
     };
     WriteBatchFile(batch);
 

@@ -163,6 +163,45 @@ public class BatchEnvelope
     // 預設 false，等於驗證開啟，版本不同步時不會默默變成對照組。
     [JsonPropertyName("verification_disabled")]
     public bool VerificationDisabled { get; set; }
+
+    // 模擬結束比對 bitmap 用。只有排 pattern 的指令才有，其他指令為 null（Unity 就不比對）。
+    // bitmap：Layer 1 的 ■□ 字串；expected_cells：Layer 2 把 bitmap 展開成的每個物件
+    // 應該落在哪（已套用整批平移），這份清單跟 steps 分開產生，才抓得到漏排的格子。
+    [JsonPropertyName("bitmap")]
+    public List<string>? Bitmap { get; set; }
+
+    [JsonPropertyName("expected_cells")]
+    public List<ExpectedCell>? ExpectedCells { get; set; }
+
+    [JsonPropertyName("cell_size_m")]
+    public double CellSizeM { get; set; }
+}
+
+/// <summary>
+/// bitmap 裡一個應該放積木的物件（cube 佔一格，domino 佔兩格），QR frame 座標。
+/// </summary>
+public class ExpectedCell
+{
+    [JsonPropertyName("row")]
+    public int Row { get; set; }
+    [JsonPropertyName("col")]
+    public int Col { get; set; }
+    // domino 的第二格；cube 為 -1（Unity JsonUtility 不支援 nullable）
+    [JsonPropertyName("second_row")]
+    public int SecondRow { get; set; } = -1;
+    [JsonPropertyName("second_col")]
+    public int SecondCol { get; set; } = -1;
+    [JsonPropertyName("x")]
+    public double X { get; set; }
+    [JsonPropertyName("y")]
+    public double Y { get; set; }
+    // 方塊頂面高度
+    [JsonPropertyName("z")]
+    public double Z { get; set; }
+    [JsonPropertyName("shape")]
+    public string Shape { get; set; } = "cube";
+    [JsonPropertyName("orientation")]
+    public string? Orientation { get; set; }
 }
 
 /// <summary>

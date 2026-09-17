@@ -56,6 +56,24 @@ public class BatchEnvelope
     // 刻意用 disabled 當欄位名：舊版 server 沒送這個欄位時 JsonUtility 讀成 false，
     // 等於驗證開啟，不會因為兩邊版本不同就默默變成對照組。
     public bool verification_disabled;
+    // 模擬結束比對 bitmap 用；只有排 pattern 的指令才有，其他指令為空，Unity 就不比對
+    public List<string> bitmap;
+    public List<ExpectedCell> expected_cells;
+    public float cell_size_m;
+}
+
+// bitmap 裡一個應該放積木的物件（cube 佔一格，domino 佔兩格），QR frame 座標
+[System.Serializable]
+public class ExpectedCell
+{
+    public int row;
+    public int col;
+    public int second_row = -1;   // domino 的第二格；cube 為 -1
+    public int second_col = -1;
+    public float x, y;
+    public float z;               // 方塊頂面高度
+    public string shape;
+    public string orientation;
 }
 
 [System.Serializable]
@@ -92,8 +110,7 @@ public class JsonExecutor : MonoBehaviour
     [Header("UI（保留既有按鈕相容性）")]
     public UIManager uiManager;
 
-    [Header("模擬模式（不接實機、Unity 內部演示 pick-and-place）")]
-    public bool simulationOnly = true;
+    [Header("Unity 模擬預覽（實機執行前演一次）")]
     public SceneSyncer sceneSyncer;         // 拖 PerceptionSync GameObject 進來
     public RobotArm robotArm;                // 拖 UR3 GameObject 進來，null 會自動找
     public float simMoveSecPerStep = 10.0f;  // 每步動畫秒數（含手臂 + 方塊）
@@ -174,6 +191,14 @@ public class JsonExecutor : MonoBehaviour
     [Range(0.5f, 5f)] public float trajectoryCollisionSampleDeg = 2f;
     public float sharedMovejAcceleration = 0.35f;
     public float sharedMovejVelocity = 0.45f;
+
+    [Header("模擬結束比對 bitmap（屬於驗證，受一鍵驗證開關控制）")]
+    // 落點中心離 bitmap 格子中心多遠以內算放對（公尺）。格距 4 cm、方塊 2.5 cm，間隙只有 1.5 cm
+    public float bitmapXYToleranceM = 0.010f;
+    // 落點頂面高度跟預期差多少以內算對；超過代表疊到別的方塊上，或在空中放開
+    public float bitmapZToleranceM = 0.010f;
+    // 模擬夾取時，夾爪 TCP 離方塊中心多遠以內才夾得到
+    public float simGraspToleranceM = 0.015f;
 
     [Header("實機夾取校正（只影響 source，不影響放置矩陣）")]
     public float pickOffsetX = -0.002f;
@@ -265,6 +290,27 @@ public class JsonExecutor : MonoBehaviour
     // 目前正在規劃哪個動作，讓略過的檢查項目記得出處
     private string planningContext = "";
 
+    // ---- 模擬結束比對 bitmap ----
+    // 模擬過程中每顆方塊的狀態。落點由夾爪 TCP（正向運動學）決定，不直接瞬移到指令目標，
+    // 比對才驗得出「手臂實際把方塊放在哪」，而不是「指令寫了放哪」。
+    class SimBlockState
+    {
+        public bool isDomino;
+        public float angleDeg;       // domino 長軸：0 = 沿 robot X（horizontal），90 = 沿 robot Y（vertical）
+        public float graspYawDeg;    // 夾起時夾爪的 yaw；放開時的差值就是方塊被轉的角度
+        public float graspOffsetZ;   // 夾起時 TCP 在方塊頂面上方多少；搬運中方塊跟著夾爪，這個距離不變
+        public bool held;
+        public bool released;        // 這一批裡被放下過
+        public Vector3 landedQR;     // x, y = 中心；z = 頂面
+        public float dropM;          // 放開瞬間方塊底面離支撐面；>0 在空中放開，<0 壓進下面的方塊
+        public string releaseLabel;
+    }
+    private readonly Dictionary<GameObject, SimBlockState> simBlocks = new Dictionary<GameObject, SimBlockState>();
+    // 夾取落空、序列結束仍夾著等狀況。通常就是「少放」的原因，跟報告一起印，但本身不算錯
+    private readonly List<string> simPlacementNotes = new List<string>();
+    // 最近一次比對的錯誤清單；null = 這一批沒有 bitmap（非排 pattern 指令），沒比對
+    private List<string> bitmapCheckErrors;
+
     void Awake()
     {
         // A second executor would open another UR connection and could execute the
@@ -282,37 +328,54 @@ public class JsonExecutor : MonoBehaviour
     {
         if (!enabled) return;
 
-        if (simulationOnly)
+        DiscardStaleCommandFile();
+        EnsureUrConnectionStarted();
+        StartCoroutine(PollLoop());
+    }
+
+    // PollLoop 用 lastProcessedStepJson 判斷指令是不是新的，但這份紀錄每次按 Play 都從空的開始；
+    // current_step.json 執行完又沒有人刪（只有 csharp_server 重開時才清），
+    // 所以不清掉的話，重按 Play 會把上一批當新指令整批重跑，實機也會跟著動。
+    // 啟動時一律刪掉；若那一批還沒結束，回報失敗，讓還在等它的 server 立刻回到待命，不用空等到逾時。
+    void DiscardStaleCommandFile()
+    {
+        string stepPath = Path.Combine(Application.streamingAssetsPath, currentStepFile);
+        if (!File.Exists(stepPath)) return;
+
+        int staleId = -1;
+        bool staleDone = true;
+        try
         {
-            RobotArm.FreezeVisualFeedback = false;
-            Debug.Log("[Executor] 模擬模式啟用：不連線實機、Unity 內部動畫演示");
-            // 自動找 SceneSyncer / RobotArm（如果 Inspector 沒拖）
-            if (sceneSyncer == null)
-                sceneSyncer = FindObjectOfType<SceneSyncer>();
-            if (robotArm == null)
-                robotArm = FindObjectOfType<RobotArm>();
-            if (robotArm == null)
+            string json = File.ReadAllText(stepPath);
+            File.Delete(stepPath);
+            try
             {
-                Debug.LogWarning("[Executor-sim] 找不到 RobotArm，手臂不會動");
+                if (json.Contains("\"steps\""))
+                {
+                    var batch = JsonUtility.FromJson<BatchEnvelope>(json);
+                    if (batch != null) { staleId = batch.batch_id; staleDone = batch.done; }
+                }
+                else
+                {
+                    var step = JsonUtility.FromJson<StepEnvelope>(json);
+                    if (step != null) { staleId = step.step_id; staleDone = step.done; }
+                }
             }
-            else
+            catch (Exception)
             {
-                // 模擬模式：關掉 followRealRobotFeedback，避免 URPackageListener 每 frame
-                // 用 q_actual=0 覆蓋我們的 Angles。RobotArm.Update() 仍會套 Angles → Transforms。
-                robotArm.followRealRobotFeedback = false;
-                int tCount = robotArm.Transforms != null ? robotArm.Transforms.Length : 0;
-                int aCount = robotArm.Angles != null ? robotArm.Angles.Length : 0;
-                Debug.Log($"[Executor-sim] RobotArm='{robotArm.name}', Transforms={tCount}, Angles={aCount}, followFeedback={robotArm.followRealRobotFeedback} (sim 模式已關實機 feedback)");
-                if (tCount == 0 || aCount == 0)
-                    Debug.LogWarning("[Executor-sim] RobotArm 的 Transforms 或 Angles 陣列為空！請到 Inspector 檢查 UR3 的 Transforms/RotationAxis/RotationOffsets 有沒有配好");
+                // 內容壞掉也沒關係，檔案已經刪了，只是不知道要回報哪個 id
             }
         }
-        else
+        catch (IOException ex)
         {
-            EnsureUrConnectionStarted();
+            Debug.LogError($"[Executor] 無法刪除上一次留下的 {currentStepFile}：{ex.Message}。" +
+                           "請手動刪除，否則上一批會被重新執行");
+            return;
         }
 
-        StartCoroutine(PollLoop());
+        Debug.LogWarning($"[Executor] 啟動時發現上一次留下的 {currentStepFile}（id {staleId}），已刪除、不會執行");
+        if (!staleDone && staleId > 0)
+            WriteStepDone(staleId, false, "Unity restarted; stale command discarded without execution", 0f);
     }
 
     void OnDestroy()
@@ -333,7 +396,6 @@ public class JsonExecutor : MonoBehaviour
     // -----------------------------------------------------------
     public void ReleaseGripper()
     {
-        if (simulationOnly) { Debug.Log("[Executor-sim] release (無實機)"); return; }
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
@@ -346,7 +408,6 @@ public class JsonExecutor : MonoBehaviour
 
     public void GripGripper()
     {
-        if (simulationOnly) { Debug.Log("[Executor-sim] grip (無實機)"); return; }
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
@@ -359,20 +420,6 @@ public class JsonExecutor : MonoBehaviour
 
     public void GoHome()
     {
-        if (simulationOnly)
-        {
-            Debug.Log("[Executor-sim] home (無實機)，中止當前 step");
-            if (currentStepCoroutine != null)
-            {
-                executionEpoch++;
-                int abortedStepId = currentStepId;
-                StopCoroutine(currentStepCoroutine);
-                currentStepCoroutine = null;
-                currentStepId = -1;
-                WriteStepDone(abortedStepId, false, "aborted by user (GoHome sim)", 0f);
-            }
-            return;
-        }
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
@@ -509,6 +556,7 @@ public class JsonExecutor : MonoBehaviour
         verificationEnabled = !batch.verification_disabled;
         bypassedVerificationFindings.Clear();
         sharedTrajectoryFailure = null;
+        ResetSimPlacementTracking();
         Debug.Log(verificationEnabled
             ? $"[Verification] batch {batch.batch_id}：驗證開啟（實驗組）"
             : $"[Verification] batch {batch.batch_id}：驗證關閉（對照組）— 模擬照常播放但不擋；硬體安全範圍仍然生效");
@@ -558,74 +606,84 @@ public class JsonExecutor : MonoBehaviour
             }
         }
 
-        if (!simulationOnly)
+        EnsureUrConnectionStarted();
+        yield return StartCoroutine(SetPerceptionMode("executing"));
+        if (sceneSyncer == null)
+            sceneSyncer = FindObjectOfType<SceneSyncer>();
+        if (robotArm == null)
+            robotArm = FindObjectOfType<RobotArm>();
+        if (previewBatchInUnityBeforeRobot)
         {
-            EnsureUrConnectionStarted();
-            yield return StartCoroutine(SetPerceptionMode("executing"));
-            if (sceneSyncer == null)
-                sceneSyncer = FindObjectOfType<SceneSyncer>();
-            if (robotArm == null)
-                robotArm = FindObjectOfType<RobotArm>();
-            if (previewBatchInUnityBeforeRobot)
-            {
-                // 動畫預覽：手臂 + 方塊完整演示（跑完自動復原）
-                // 預覽期間關 followRealRobotFeedback，讓 Update() 用我們設的 Angles 而非實機 q_actual
-                if (robotArm != null) robotArm.followRealRobotFeedback = false;
-                RobotArm.FreezeVisualFeedback = false;
-                yield return StartCoroutine(PreviewBatchAnimated(batch));
-            }
-            // 預覽結束、實機開始：Unity 手臂改由實機 feedback 驅動
-            if (robotArm != null) robotArm.followRealRobotFeedback = true;
-            RobotArm.FreezeVisualFeedback = freezeUnityRobotDuringRealBatch;
+            // 動畫預覽：手臂 + 方塊完整演示（跑完自動復原）
+            // 預覽期間關 followRealRobotFeedback，讓 Update() 用我們設的 Angles 而非實機 q_actual
+            if (robotArm != null) robotArm.followRealRobotFeedback = false;
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(PreviewBatchAnimated(batch));
 
-            float waited = 0f;
-            while (!urListener.Connected && waited < 3f)
+            // 模擬結束比對 bitmap：不一致且驗證開啟時，實機完全不動
+            if (!BitmapCheckAllowsContinue(batch))
             {
-                yield return new WaitForSeconds(0.1f);
-                waited += 0.1f;
-            }
-            if (!urListener.Connected)
-            {
-                Debug.LogError("無法連線到 UR");
-                WriteStepDone(batch.batch_id, false, "UR 未連線", 0f);
+                if (robotArm != null) robotArm.followRealRobotFeedback = true;
                 RobotArm.FreezeVisualFeedback = false;
                 yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
+        }
+        else if (batch.expected_cells != null && batch.expected_cells.Count > 0)
+        {
+            Debug.LogWarning("[BitmapCheck] previewBatchInUnityBeforeRobot 關閉，沒有模擬就無法比對 bitmap，直接送實機");
+        }
+        // 預覽結束、實機開始：Unity 手臂改由實機 feedback 驅動
+        if (robotArm != null) robotArm.followRealRobotFeedback = true;
+        RobotArm.FreezeVisualFeedback = freezeUnityRobotDuringRealBatch;
 
-            if (IsRecoverableSafetyStop())
-            {
-                currentStepId = batch.batch_id;
-                long recoveryEpoch = ++executionEpoch;
-                yield return WaitForManualSafetyRecovery(
-                    "before executing the batch", recoveryEpoch, batch.batch_id);
-                currentStepId = -1;
-                if (!safetyRecoverySucceeded)
-                {
-                    string error = lastMotionError ?? "UR safety recovery failed";
-                    WriteStepDone(batch.batch_id, false, error, 0f);
-                    RobotArm.FreezeVisualFeedback = false;
-                    yield return StartCoroutine(SetPerceptionMode("idle"));
-                    yield break;
-                }
-            }
+        float waited = 0f;
+        while (!urListener.Connected && waited < 3f)
+        {
+            yield return new WaitForSeconds(0.1f);
+            waited += 0.1f;
+        }
+        if (!urListener.Connected)
+        {
+            Debug.LogError("無法連線到 UR");
+            WriteStepDone(batch.batch_id, false, "UR 未連線", 0f);
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            yield break;
+        }
 
+        if (IsRecoverableSafetyStop())
+        {
             currentStepId = batch.batch_id;
-            long readyEpoch = ++executionEpoch;
-            yield return SendReady("batch initial ready", readyEpoch, batch.batch_id);
-            if (!lastMotionSucceeded)
+            long recoveryEpoch = ++executionEpoch;
+            yield return WaitForManualSafetyRecovery(
+                "before executing the batch", recoveryEpoch, batch.batch_id);
+            currentStepId = -1;
+            if (!safetyRecoverySucceeded)
             {
-                string error = string.IsNullOrEmpty(lastMotionError)
-                    ? "UR initial Ready failed"
-                    : lastMotionError;
+                string error = lastMotionError ?? "UR safety recovery failed";
                 WriteStepDone(batch.batch_id, false, error, 0f);
                 RobotArm.FreezeVisualFeedback = false;
                 yield return StartCoroutine(SetPerceptionMode("idle"));
-                currentStepId = -1;
                 yield break;
             }
-            currentStepId = -1;
         }
+
+        currentStepId = batch.batch_id;
+        long readyEpoch = ++executionEpoch;
+        yield return SendReady("batch initial ready", readyEpoch, batch.batch_id);
+        if (!lastMotionSucceeded)
+        {
+            string error = string.IsNullOrEmpty(lastMotionError)
+                ? "UR initial Ready failed"
+                : lastMotionError;
+            WriteStepDone(batch.batch_id, false, error, 0f);
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            currentStepId = -1;
+            yield break;
+        }
+        currentStepId = -1;
 
         for (int i = 0; i < batch.steps.Count; i++)
         {
@@ -637,14 +695,15 @@ public class JsonExecutor : MonoBehaviour
                 Debug.LogWarning($"[Executor] batch step {env?.step_id} 缺少 source/target");
                 WriteStepDone(env != null ? env.step_id : batch.batch_id, false, "batch step missing source/target", 0f);
                 RobotArm.FreezeVisualFeedback = false;
-                if (!simulationOnly) yield return StartCoroutine(SetPerceptionMode("idle"));
+                yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
 
             lastExecutedStepId = env.step_id;
             currentStepId = env.step_id;
             long stepEpoch = ++executionEpoch;
-            currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch, simulationOnly));
+            // perception mode 由整批統一管理，單步不自己切換
+            currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch, managePerceptionMode: false));
             yield return currentStepCoroutine;
             currentStepCoroutine = null;
             currentStepId = -1;
@@ -653,88 +712,36 @@ public class JsonExecutor : MonoBehaviour
             {
                 Debug.LogWarning($"[Executor] batch {batch.batch_id} stopped after step {env.step_id}");
                 RobotArm.FreezeVisualFeedback = false;
-                if (!simulationOnly) yield return StartCoroutine(SetPerceptionMode("idle"));
+                yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
         }
 
-        if (!simulationOnly)
+        if (useSharedMovejTrajectory)
         {
-            if (useSharedMovejTrajectory)
+            currentStepId = batch.batch_id;
+            long finalEpoch = ++executionEpoch;
+            for (int i = 0; i < sharedFinalTrajectory.Count; i++)
             {
-                currentStepId = batch.batch_id;
-                long finalEpoch = ++executionEpoch;
-                for (int i = 0; i < sharedFinalTrajectory.Count; i++)
-                {
-                    yield return SendExplicitJointTarget(sharedFinalTrajectory[i],
-                        $"batch final shared {i + 1}/{sharedFinalTrajectory.Count}",
-                        finalEpoch, batch.batch_id);
-                    if (!lastMotionSucceeded)
-                    {
-                        WriteStepDone(batch.batch_id, false,
-                            lastMotionError ?? "UR final shared trajectory failed", 0f);
-                        RobotArm.FreezeVisualFeedback = false;
-                        yield return StartCoroutine(SetPerceptionMode("idle"));
-                        currentStepId = -1;
-                        yield break;
-                    }
-                }
-                // 能走到這裡代表所有 step 都跑完了，截斷只可能發生在收尾的 Ready/Home。
-                // 手臂沒回到位，不能回報成功。
-                if (sharedTrajectoryFailure != null)
+                yield return SendExplicitJointTarget(sharedFinalTrajectory[i],
+                    $"batch final shared {i + 1}/{sharedFinalTrajectory.Count}",
+                    finalEpoch, batch.batch_id);
+                if (!lastMotionSucceeded)
                 {
                     WriteStepDone(batch.batch_id, false,
-                        "verification off, final return truncated at unreachable pose: " + sharedTrajectoryFailure, 0f);
+                        lastMotionError ?? "UR final shared trajectory failed", 0f);
                     RobotArm.FreezeVisualFeedback = false;
                     yield return StartCoroutine(SetPerceptionMode("idle"));
                     currentStepId = -1;
                     yield break;
                 }
-                currentStepId = -1;
-                yield return StartCoroutine(SetPerceptionMode("idle"));
-                yield return new WaitForSeconds(1.5f);
             }
-            else
+            // 能走到這裡代表所有 step 都跑完了，截斷只可能發生在收尾的 Ready/Home。
+            // 手臂沒回到位，不能回報成功。
+            if (sharedTrajectoryFailure != null)
             {
-            currentStepId = batch.batch_id;
-            long finalLiftEpoch = ++executionEpoch;
-            yield return SendCurrentTcpLiftToTravelHeight(
-                QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE,
-                "batch final safe lift", finalLiftEpoch, batch.batch_id);
-            if (!lastMotionSucceeded)
-            {
-                string error = string.IsNullOrEmpty(lastMotionError)
-                    ? "UR final safe lift failed"
-                    : lastMotionError;
-                WriteStepDone(batch.batch_id, false, error, 0f);
-                RobotArm.FreezeVisualFeedback = false;
-                yield return StartCoroutine(SetPerceptionMode("idle"));
-                currentStepId = -1;
-                yield break;
-            }
-
-            long readyEpoch = ++executionEpoch;
-            yield return SendReady("batch final ready", readyEpoch, batch.batch_id);
-            if (!lastMotionSucceeded)
-            {
-                string error = string.IsNullOrEmpty(lastMotionError)
-                    ? "UR final Ready failed"
-                    : lastMotionError;
-                WriteStepDone(batch.batch_id, false, error, 0f);
-                RobotArm.FreezeVisualFeedback = false;
-                yield return StartCoroutine(SetPerceptionMode("idle"));
-                currentStepId = -1;
-                yield break;
-            }
-
-            long homeEpoch = ++executionEpoch;
-            yield return SendHome("batch final go_home", homeEpoch, batch.batch_id);
-            if (!lastMotionSucceeded)
-            {
-                string error = string.IsNullOrEmpty(lastMotionError)
-                    ? "UR final Home failed"
-                    : lastMotionError;
-                WriteStepDone(batch.batch_id, false, error, 0f);
+                WriteStepDone(batch.batch_id, false,
+                    "verification off, final return truncated at unreachable pose: " + sharedTrajectoryFailure, 0f);
                 RobotArm.FreezeVisualFeedback = false;
                 yield return StartCoroutine(SetPerceptionMode("idle"));
                 currentStepId = -1;
@@ -743,7 +750,56 @@ public class JsonExecutor : MonoBehaviour
             currentStepId = -1;
             yield return StartCoroutine(SetPerceptionMode("idle"));
             yield return new WaitForSeconds(1.5f);
-            }
+        }
+        else
+        {
+        currentStepId = batch.batch_id;
+        long finalLiftEpoch = ++executionEpoch;
+        yield return SendCurrentTcpLiftToTravelHeight(
+            QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE,
+            "batch final safe lift", finalLiftEpoch, batch.batch_id);
+        if (!lastMotionSucceeded)
+        {
+            string error = string.IsNullOrEmpty(lastMotionError)
+                ? "UR final safe lift failed"
+                : lastMotionError;
+            WriteStepDone(batch.batch_id, false, error, 0f);
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            currentStepId = -1;
+            yield break;
+        }
+
+        long finalReadyEpoch = ++executionEpoch;
+        yield return SendReady("batch final ready", finalReadyEpoch, batch.batch_id);
+        if (!lastMotionSucceeded)
+        {
+            string error = string.IsNullOrEmpty(lastMotionError)
+                ? "UR final Ready failed"
+                : lastMotionError;
+            WriteStepDone(batch.batch_id, false, error, 0f);
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            currentStepId = -1;
+            yield break;
+        }
+
+        long homeEpoch = ++executionEpoch;
+        yield return SendHome("batch final go_home", homeEpoch, batch.batch_id);
+        if (!lastMotionSucceeded)
+        {
+            string error = string.IsNullOrEmpty(lastMotionError)
+                ? "UR final Home failed"
+                : lastMotionError;
+            WriteStepDone(batch.batch_id, false, error, 0f);
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            currentStepId = -1;
+            yield break;
+        }
+        currentStepId = -1;
+        yield return StartCoroutine(SetPerceptionMode("idle"));
+        yield return new WaitForSeconds(1.5f);
         }
 
         currentStepId = batch.batch_id;
@@ -754,8 +810,7 @@ public class JsonExecutor : MonoBehaviour
 
     // --- 執行單一步驟：依序解讀 LLM Motion Planner 的 robot functions ---
     // ----------------------------------------------------------
-    // 模擬模式：不接實機，直接在 Unity 桌面上動畫演示 pick-and-place
-    // 模擬手臂預設姿態（從 Inspector 讀，方便動態調整）
+    // 模擬預覽的手臂預設姿態（從 Inspector 讀，方便動態調整）
     float[] BuildHomePose() => new float[] {
         simHomeBase, simHomeShoulder, simHomeElbow, simHomeWrist1, simHomeWrist2, simHomeWrist3
     };
@@ -1058,6 +1113,327 @@ public class JsonExecutor : MonoBehaviour
                          + string.Join("\n  - ", lines));
     }
 
+    // ============================================================
+    // 模擬結束比對 bitmap
+    // ============================================================
+    void ResetSimPlacementTracking()
+    {
+        simBlocks.Clear();
+        simPlacementNotes.Clear();
+        bitmapCheckErrors = null;
+    }
+
+    SimBlockState SimBlock(GameObject block)
+    {
+        if (simBlocks.TryGetValue(block, out var state)) return state;
+        Vector3 scale = block.transform.localScale;
+        state = new SimBlockState
+        {
+            isDomino = block.name.Contains("domino"),
+            // SceneSyncer 的慣例：vertical 長軸沿 Unity X（= robot Y），horizontal 沿 Unity Z（= robot X）
+            angleDeg = Mathf.Abs(scale.x) > Mathf.Abs(scale.z) + 1e-4f ? 90f : 0f,
+        };
+        simBlocks[block] = state;
+        return state;
+    }
+
+    static bool DominoIsVertical(float angleDeg)
+    {
+        float a = Mathf.Repeat(angleDeg, 180f);
+        return a >= 45f && a < 135f;
+    }
+
+    Transform SimBlockFrame() =>
+        sceneSyncer.GetCubeContainer() != null ? sceneSyncer.GetCubeContainer() : sceneSyncer.transform;
+
+    // 方塊在 QR frame 的位置：x, y = 中心，z = 頂面（跟 perception / csharp_server 同一個慣例）
+    Vector3 BlockQR(GameObject block)
+    {
+        Vector3 local = SimBlockFrame().InverseTransformPoint(block.transform.position);
+        Vector3 qr = SceneSyncer.UnityToQR(local);
+        qr.z += sceneSyncer.cubeSizeM / 2f;
+        return qr;
+    }
+
+    // 找 source 位置上相機實際看到的方塊。找不到只提醒、不補生：
+    // 真實場景那裡沒有方塊，實機就會夾空，預覽也該演成夾空。
+    GameObject WarnIfNoSourceBlock(StepEnvelope env, string tag)
+    {
+        var block = sceneSyncer.FindNearestCube(
+            env.source_position.x, env.source_position.y, env.source_position.z, simGraspToleranceM);
+        if (block == null)
+            Debug.LogWarning($"[Executor-{tag}] step {env.step_id}: source QR({env.source_position.x:F3}, " +
+                             $"{env.source_position.y:F3}) {simGraspToleranceM * 1000f:F0} mm 內沒有方塊，實機會夾空");
+        return block;
+    }
+
+    bool CanReadSimTcp() =>
+        robotArm != null && robotArm.Angles != null && robotArm.Angles.Length >= 6;
+
+    // 模擬手臂 TCP 在 QR frame 的位置，以及夾爪繞垂直軸的 yaw（度）。
+    // 跟產生軌跡用同一套運動學，所以就是實機 movej 到這組關節角時的落點。
+    Vector3 SimTcpQR(out float toolYawDeg)
+    {
+        var q = new double[6];
+        for (int i = 0; i < 6; i++) q[i] = robotArm.Angles[i] * Mathf.Deg2Rad;
+        UR3eKinematics.toolOffsetZ = robotArm.toolOffsetZ;
+        double[,] T = UR3eKinematics.FK(q);
+        toolYawDeg = (float)(System.Math.Atan2(T[1, 0], T[0, 0]) * 180.0 / System.Math.PI);
+        return new Vector3((float)T[0, 3] - QR1_X, (float)T[1, 3] - QR1_Y, (float)T[2, 3] - QR1_Z);
+    }
+
+    // 模擬夾取：只夾得到夾爪正下方的方塊。descend 之後 TCP 在方塊頂面上方 contactClearanceM。
+    // 夾不到就回傳 null —— 動畫照演，但沒有方塊被搬走，比對時就會出現「少放」。
+    GameObject SimGrasp(float contactClearanceM, string label)
+    {
+        if (!CanReadSimTcp())
+        {
+            simPlacementNotes.Add($"{label}: 讀不到模擬手臂姿態，無法判斷夾取");
+            return null;
+        }
+        Vector3 tcp = SimTcpQR(out float yawDeg);
+        float expectedTop = tcp.z - contactClearanceM;
+        GameObject best = null;
+        float bestDistance = float.MaxValue;
+        float bestTop = 0f;
+        foreach (var block in sceneSyncer.GetCurrentCubes())
+        {
+            if (block == null || SimBlock(block).held) continue;
+            Vector3 qr = BlockQR(block);
+            float d = Vector2.Distance(new Vector2(qr.x, qr.y), new Vector2(tcp.x, tcp.y));
+            if (d > simGraspToleranceM || Mathf.Abs(qr.z - expectedTop) > bitmapZToleranceM) continue;
+            if (d < bestDistance) { bestDistance = d; best = block; bestTop = qr.z; }
+        }
+        if (best == null)
+        {
+            simPlacementNotes.Add($"{label}: 夾取落空，TCP QR({tcp.x:F3},{tcp.y:F3}) 下方 " +
+                                  $"{simGraspToleranceM * 1000f:F0} mm 內沒有頂面在 {expectedTop:F3} m 的方塊");
+            return null;
+        }
+        var state = SimBlock(best);
+        state.held = true;
+        state.graspYawDeg = yawDeg;
+        state.graspOffsetZ = tcp.z - bestTop;
+        return best;
+    }
+
+    // 模擬放開：方塊中心落在 TCP 正下方，往下掉到最近的支撐面（桌面或其他方塊頂）。
+    // domino 方向 = 夾起時的方向 + 搬運途中夾爪轉過的角度。畫面跟判定用同一個落點。
+    void SimRelease(GameObject block, string label)
+    {
+        var state = SimBlock(block);
+        state.held = false;
+        if (!CanReadSimTcp())
+        {
+            simPlacementNotes.Add($"{label}: 讀不到模擬手臂姿態，無法判斷落點");
+            return;
+        }
+        Vector3 tcp = SimTcpQR(out float yawDeg);
+        float size = sceneSyncer.cubeSizeM;
+
+        float supportTop = 0f;
+        foreach (var other in sceneSyncer.GetCurrentCubes())
+        {
+            if (other == null || other == block || SimBlock(other).held) continue;
+            Vector3 qr = BlockQR(other);
+            if (Vector2.Distance(new Vector2(qr.x, qr.y), new Vector2(tcp.x, tcp.y)) < size * 0.9f)
+                supportTop = Mathf.Max(supportTop, qr.z);
+        }
+
+        float heldBottom = tcp.z - state.graspOffsetZ - size;
+        state.dropM = heldBottom - supportTop;
+        state.landedQR = new Vector3(tcp.x, tcp.y, supportTop + size);
+        if (state.isDomino)
+            state.angleDeg = Mathf.Repeat(state.angleDeg + Mathf.DeltaAngle(state.graspYawDeg, yawDeg), 180f);
+        state.released = true;
+        state.releaseLabel = label;
+
+        block.transform.SetParent(SimBlockFrame(), true);
+        Vector3 local = SceneSyncer.QRToUnity(state.landedQR.x, state.landedQR.y, state.landedQR.z);
+        local.y -= size / 2f;
+        block.transform.localPosition = local;
+        block.transform.localRotation = Quaternion.identity;
+        block.transform.localScale = !state.isDomino
+            ? Vector3.one * size
+            : DominoIsVertical(state.angleDeg)
+                ? new Vector3(size * 2f, size, size)
+                : new Vector3(size, size, size * 2f);
+    }
+
+    static string ExpectedCellName(ExpectedCell cell)
+    {
+        string cells = cell.second_row >= 0
+            ? $"r{cell.row}c{cell.col}+r{cell.second_row}c{cell.second_col}"
+            : $"r{cell.row}c{cell.col}";
+        return cell.shape == "domino" ? $"{cells} domino {cell.orientation}" : $"{cells} {cell.shape}";
+    }
+
+    // 模擬結束後比對：每個 bitmap 物件是否有一顆方塊落在對應格子（容許誤差內），
+    // 形狀、domino 方向、高度也要對；多放、少放、放錯格、在空中放開都算錯。
+    // 把報告印出來，錯誤清單存在 bitmapCheckErrors（空 = 通過，null = 這批沒有 bitmap）。
+    void RunBitmapCheck(BatchEnvelope batch)
+    {
+        bitmapCheckErrors = null;
+        if (batch.expected_cells == null || batch.expected_cells.Count == 0 || sceneSyncer == null) return;
+
+        var expected = batch.expected_cells;
+        var errors = new List<string>();
+        float cell = batch.cell_size_m > 0f ? batch.cell_size_m : 0.04f;
+
+        // 用任一個預期物件推回格子座標系。row 往下增加時 y 變小（LayoutRealizer 讓字母不上下顛倒）
+        ExpectedCell anchor = expected[0];
+        float anchorX = anchor.x - (anchor.second_col >= 0 ? (anchor.second_col - anchor.col) * 0.5f * cell : 0f);
+        float anchorY = anchor.y + (anchor.second_row >= 0 ? (anchor.second_row - anchor.row) * 0.5f * cell : 0f);
+        int rows = batch.bitmap != null && batch.bitmap.Count > 0
+            ? batch.bitmap.Count
+            : expected.Max(c => Mathf.Max(c.row, c.second_row)) + 1;
+        int cols = batch.bitmap != null && batch.bitmap.Count > 0
+            ? batch.bitmap[0].Length
+            : expected.Max(c => Mathf.Max(c.col, c.second_col)) + 1;
+        (int r, int c) NearestGridCell(Vector3 qr) => (
+            anchor.row - Mathf.RoundToInt((qr.y - anchorY) / cell),
+            anchor.col + Mathf.RoundToInt((qr.x - anchorX) / cell));
+        bool InsideCanvas((int r, int c) g) => g.r >= 0 && g.r < rows && g.c >= 0 && g.c < cols;
+
+        // 候選：這一批放下的方塊 + 原本就躺在圖案範圍內的方塊（殘留的方塊一樣會破壞字形）
+        var candidates = new List<(GameObject block, Vector3 qr, SimBlockState state)>();
+        foreach (var block in sceneSyncer.GetCurrentCubes())
+        {
+            if (block == null) continue;
+            var state = SimBlock(block);
+            if (state.held) continue;
+            Vector3 qr = state.released ? state.landedQR : BlockQR(block);
+            if (!state.released && !InsideCanvas(NearestGridCell(qr))) continue;
+            candidates.Add((block, qr, state));
+        }
+
+        // 一對一配對：全部距離由小到大，各自還沒配到才配
+        var pairs = new List<(int e, int c, float d)>();
+        for (int e = 0; e < expected.Count; e++)
+            for (int c = 0; c < candidates.Count; c++)
+            {
+                float d = Vector2.Distance(new Vector2(expected[e].x, expected[e].y),
+                                           new Vector2(candidates[c].qr.x, candidates[c].qr.y));
+                if (d <= bitmapXYToleranceM) pairs.Add((e, c, d));
+            }
+        pairs.Sort((a, b) => a.d.CompareTo(b.d));
+        var matchOf = Enumerable.Repeat(-1, expected.Count).ToArray();
+        var candidateUsed = new bool[candidates.Count];
+        foreach (var p in pairs)
+        {
+            if (matchOf[p.e] >= 0 || candidateUsed[p.c]) continue;
+            matchOf[p.e] = p.c;
+            candidateUsed[p.c] = true;
+        }
+
+        var grid = new char[rows, cols];
+        for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) grid[r, c] = '□';
+        void Mark(int r, int c, char symbol) { if (r >= 0 && r < rows && c >= 0 && c < cols) grid[r, c] = symbol; }
+
+        int correct = 0;
+        for (int e = 0; e < expected.Count; e++)
+        {
+            var exp = expected[e];
+            string name = ExpectedCellName(exp);
+            bool ok = true;
+            if (matchOf[e] < 0)
+            {
+                errors.Add($"少放 {name} @ QR({exp.x:F3},{exp.y:F3})");
+                ok = false;
+            }
+            else
+            {
+                var cand = candidates[matchOf[e]];
+                bool expectDomino = exp.shape == "domino";
+                if (expectDomino != cand.state.isDomino)
+                {
+                    errors.Add($"形狀不符 {name}：放的是 {(cand.state.isDomino ? "domino" : "cube")}（{cand.block.name}）");
+                    ok = false;
+                }
+                else if (expectDomino && (exp.orientation == "vertical") != DominoIsVertical(cand.state.angleDeg))
+                {
+                    errors.Add($"方向不符 {name}：放成 {(DominoIsVertical(cand.state.angleDeg) ? "vertical" : "horizontal")}");
+                    ok = false;
+                }
+                if (Mathf.Abs(cand.qr.z - exp.z) > bitmapZToleranceM)
+                {
+                    errors.Add($"高度不符 {name}：頂面 {cand.qr.z:F3} m，應為 {exp.z:F3} m（疊到其他方塊上）");
+                    ok = false;
+                }
+                if (cand.state.released && cand.state.dropM > bitmapZToleranceM)
+                {
+                    errors.Add($"在空中放開 {name}：方塊離支撐面 {cand.state.dropM * 100f:F1} cm（{cand.state.releaseLabel}）");
+                    ok = false;
+                }
+                else if (cand.state.released && cand.state.dropM < -bitmapZToleranceM)
+                {
+                    errors.Add($"放開時壓到下方方塊 {name}：重疊 {-cand.state.dropM * 100f:F1} cm（{cand.state.releaseLabel}）");
+                    ok = false;
+                }
+            }
+            if (ok) correct++;
+            char symbol = ok ? '■' : '✗';
+            Mark(exp.row, exp.col, symbol);
+            if (exp.second_row >= 0) Mark(exp.second_row, exp.second_col, symbol);
+        }
+
+        for (int c = 0; c < candidates.Count; c++)
+        {
+            if (candidateUsed[c]) continue;
+            var cand = candidates[c];
+            var g = NearestGridCell(cand.qr);
+            string where = InsideCanvas(g) ? $"r{g.r}c{g.c}" : "圖案範圍外";
+            var nearest = expected.OrderBy(x => Vector2.Distance(new Vector2(x.x, x.y),
+                                                                 new Vector2(cand.qr.x, cand.qr.y))).First();
+            float offMm = Vector2.Distance(new Vector2(nearest.x, nearest.y), new Vector2(cand.qr.x, cand.qr.y)) * 1000f;
+            if (cand.state.released)
+                errors.Add($"放錯位置 {cand.block.name} @ QR({cand.qr.x:F3},{cand.qr.y:F3}) 落在 {where}，" +
+                           $"最近的預期格 {ExpectedCellName(nearest)} 偏 {offMm:F0} mm（{cand.state.releaseLabel}）");
+            else
+                errors.Add($"多放 {cand.block.name} @ QR({cand.qr.x:F3},{cand.qr.y:F3})：原本就在圖案範圍 {where}");
+            if (InsideCanvas(g)) Mark(g.r, g.c, grid[g.r, g.c] == '□' ? '●' : '✗');
+        }
+
+        var report = new System.Text.StringBuilder();
+        report.AppendLine(errors.Count == 0
+            ? $"[BitmapCheck] batch {batch.batch_id}：✓ 模擬結果與 bitmap 一致（{expected.Count} 個物件全部放對）"
+            : $"[BitmapCheck] batch {batch.batch_id}：✗ 模擬結果與 bitmap 不一致，" +
+              $"預期 {expected.Count} 個物件，放對 {correct}，錯誤 {errors.Count} 項");
+        report.AppendLine("  預期 bitmap    模擬結果（■ 正確  ✗ 少放/錯誤  ● 多放/放錯  □ 空）");
+        for (int r = 0; r < rows; r++)
+        {
+            string want = batch.bitmap != null && r < batch.bitmap.Count ? batch.bitmap[r] : "";
+            var got = new System.Text.StringBuilder();
+            for (int c = 0; c < cols; c++) got.Append(grid[r, c]);
+            report.AppendLine($"  {want.PadRight(cols)}          {got}");
+        }
+        foreach (var error in errors) report.AppendLine("  - " + error);
+        foreach (var note in simPlacementNotes) report.AppendLine("  · " + note);
+
+        if (errors.Count == 0) Debug.Log(report.ToString());
+        else Debug.LogWarning(report.ToString());
+        bitmapCheckErrors = errors;
+    }
+
+    // bitmap 比對不一致時要不要擋。回傳 true = 可以繼續（送實機 / 回報完成）。
+    // 屬於驗證：開啟就擋；關閉就記錄、放行。
+    bool BitmapCheckAllowsContinue(BatchEnvelope batch)
+    {
+        if (bitmapCheckErrors == null || bitmapCheckErrors.Count == 0) return true;
+        if (!verificationEnabled)
+        {
+            foreach (var error in bitmapCheckErrors) bypassedVerificationFindings.Add("bitmap 比對: " + error);
+            Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：bitmap 比對不一致 " +
+                             $"{bitmapCheckErrors.Count} 項，對照組照樣繼續");
+            return true;
+        }
+        string summary = $"simulation bitmap check failed ({bitmapCheckErrors.Count}): " +
+                         string.Join(" | ", bitmapCheckErrors);
+        Debug.LogError("[BitmapCheck] " + summary);
+        WriteStepDone(batch.batch_id, false, summary, 0f);
+        return false;
+    }
+
     bool PlanMoveAbove(PlannedJointAction action, ref double[] reference,
         UR3eKinematics.Pose current, double targetX, double targetY,
         double endpointHoverZ, string orientation, out string error)
@@ -1323,49 +1699,22 @@ public class JsonExecutor : MonoBehaviour
         return failures;
     }
 
-    IEnumerator ExecuteStepSimulated(StepEnvelope env)
-    {
-        DateTime t0 = DateTime.UtcNow;
-
-        if (sceneSyncer == null)
-        {
-            Debug.LogWarning("[Executor-sim] SceneSyncer 未設定，跳過此 step");
-            WriteStepDone(env.step_id, false, "sceneSyncer missing", 0f);
-            yield break;
-        }
-
-        yield return AnimateOneStep(env, "sim");
-
-        float dur = (float)(DateTime.UtcNow - t0).TotalSeconds;
-        WriteStepDone(env.step_id, true, null, dur);
-        Debug.Log($"[Executor-sim] step {env.step_id} 完成，{dur:F2}s");
-    }
-
     // 純動畫：pick-and-place 一步（手臂 + 方塊），不寫 step_done
-    // 給 simulation mode 和實機執行前的預覽共用
+    // 實機執行前的預覽在 useSharedMovejTrajectory 關閉時用這個
     IEnumerator AnimateOneStep(StepEnvelope env, string tag)
     {
         if (sceneSyncer == null) yield break;
 
-        // 找 source 位置最接近的 cube；找不到就自動生一顆代替（用 target 期望顏色）
-        GameObject cube = sceneSyncer.FindNearestCube(
-            env.source_position.x, env.source_position.y, env.source_position.z);
-
-        if (cube == null)
-        {
-            Color guess = env.source_position.name != null && env.source_position.name.Contains("yellow")
-                ? new Color(1f, 0.85f, 0.1f) : new Color(0.4f, 0.4f, 0.4f);
-            cube = sceneSyncer.SpawnCube(
-                $"{tag}_cube_{env.step_id}",
-                env.source_position.x, env.source_position.y, env.source_position.z, guess);
-            Debug.Log($"[Executor-{tag}] source cube 不存在，生成一顆代替 @ ({env.source_position.x:F3}, {env.source_position.y:F3})");
-        }
-        cube.transform.localScale = SimScaleFor(env.source_position);
+        // 預覽只用相機實際看到的方塊，不補生、也不改它的形狀；找不到就照演手臂動作，
+        // 夾取會落空、bitmap 比對抓成少放。cube 只在沒有手臂動畫時拿來直接搬。
+        GameObject cube = WarnIfNoSourceBlock(env, tag);
 
         // QR frame → Unity local（統一走 SceneSyncer.QRToUnity）
         // 加上 Inspector 放置微調（simPlaceOffsetX/Y/Z 也視為 QR frame 的偏移）
         float halfHeight = sceneSyncer.cubeSizeM / 2f;
-        Vector3 sourceLocal = cube.transform.localPosition;
+        Vector3 sourceLocal = SceneSyncer.QRToUnity(
+            env.source_position.x, env.source_position.y, env.source_position.z);
+        sourceLocal.y -= halfHeight;
         Vector3 targetLocal = SceneSyncer.QRToUnity(
             env.target_position.x + simPlaceOffsetX,
             env.target_position.y + simPlaceOffsetY,
@@ -1389,9 +1738,6 @@ public class JsonExecutor : MonoBehaviour
                 ? robotArm.TCP
                 : robotArm.Transforms[robotArm.Transforms.Length - 1];
         }
-
-        // 保留 cube 原始 parent (CubeContainer)，之後 restore 用
-        Transform cubeOriginalParent = cube.transform.parent;
 
         // 7-phase 動畫：hover 掃 → 下降到 cube 頂 → 抬 → hover 掃 → 下降 → 抬 → home
         // 每個 phase 的 Z 都用該 step 自己的 qrZ 算，所以 source / target 高度不同也自動處理。
@@ -1442,39 +1788,48 @@ public class JsonExecutor : MonoBehaviour
         // 實機放置時（手上有方塊）descend 會再加 placeDescendExtraZ，這裡照做
         float tgtContactZ = tgtZ + ContactExtraZ + (useCanonicalKinematics ? Mathf.Max(0f, placeDescendExtraZ) : 0f);
         if (armEnabled) yield return AnimateArmVertical(srcX, srcY, srcZ, HoverArmZFor(srcZ), srcContactZ, tA2);
-        else            yield return AnimateLocalTo(cube.transform, sourceLocal, tA2);
-        // 夾爪碰到方塊後 attach
-        if (armEnabled && gripper != null)
+        else if (cube != null) yield return AnimateLocalTo(cube.transform, sourceLocal, tA2);
+        // 夾爪碰到方塊後 attach：只夾得到 TCP 正下方的方塊，跟 bitmap 比對用同一套判定
+        GameObject held = null;
+        if (armEnabled)
         {
-            cube.transform.SetParent(gripper, worldPositionStays: true);
+            held = SimGrasp(ContactExtraZ, $"{tag} step {env.step_id} grasp");
+            if (held != null && gripper != null) held.transform.SetParent(gripper, worldPositionStays: true);
         }
         yield return new WaitForSeconds(simHoldSec);
 
         // ---- B. Arm 垂直抬回 hover（cube 隨 gripper 上來） ----
         if (armEnabled) yield return AnimateArmVertical(srcX, srcY, srcZ, srcContactZ, HoverArmZFor(srcZ), tB);
-        else            yield return AnimateLocalTo(cube.transform, sourceHover, tB);
+        else if (cube != null) yield return AnimateLocalTo(cube.transform, sourceHover, tB);
         yield return new WaitForSeconds(simHoldSec);
 
         // ---- C. Arm swing 到 target XY（hover Z，cube 隨 gripper 飛） ----
         if (armEnabled) yield return AnimateJointsTo(poseTargetHover, tC);
-        else            yield return AnimateLocalTo(cube.transform, targetHover, tC);
+        else if (cube != null) yield return AnimateLocalTo(cube.transform, targetHover, tC);
         yield return new WaitForSeconds(simHoldSec);
 
         // ---- C2. Arm 垂直下降到 target 位置（Cartesian 直線） ----
         if (armEnabled) yield return AnimateArmVertical(tgtX, tgtY, tgtZ, HoverArmZFor(tgtZ), tgtContactZ, tC2);
-        else            yield return AnimateLocalTo(cube.transform, targetLocal, tC2);
+        else if (cube != null) yield return AnimateLocalTo(cube.transform, targetLocal, tC2);
         yield return new WaitForSeconds(simHoldSec);
 
-        // ---- release：unparent，snap 到精確 target local，改成 target scale ----
-        if (armEnabled && gripper != null)
+        // ---- release ----
+        if (armEnabled)
         {
-            if (cubeOriginalParent != null)
-                cube.transform.SetParent(cubeOriginalParent, worldPositionStays: true);
-            else
-                cube.transform.SetParent(null, worldPositionStays: true);
+            // 落點由夾爪實際位置決定，不直接瞬移到 target，bitmap 比對才驗得出放錯
+            if (held != null)
+            {
+                SimRelease(held, $"{tag} step {env.step_id} release");
+                held.name = $"{tag}_step{env.step_id}_{(SimBlock(held).isDomino ? "domino" : "cube")}";
+            }
         }
-        cube.transform.localScale = SimScaleFor(env.target_position);
-        cube.transform.localPosition = targetLocal;
+        else if (cube != null)
+        {
+            // 沒有手臂動畫就無從判斷落點，只能照指令擺放
+            cube.transform.localScale = SimScaleFor(env.target_position);
+            cube.transform.localPosition = targetLocal;
+            cube.name = $"{tag}_step{env.step_id}_{(env.target_position.shape == "domino" ? "domino" : "cube")}";
+        }
 
         // ---- D. Arm 垂直抬回 target hover（cube 已放，不跟） ----
         if (armEnabled) yield return AnimateArmVertical(tgtX, tgtY, tgtZ, tgtContactZ, HoverArmZFor(tgtZ), tD);
@@ -1483,8 +1838,6 @@ public class JsonExecutor : MonoBehaviour
         // ---- F. Arm 回 home ----
         if (armEnabled) yield return AnimateJointsTo(BuildHomePose(), tF);
         yield return new WaitForSeconds(0.15f);
-
-        cube.name = $"{tag}_step{env.step_id}";
     }
 
     // 依 QR frame (x, y) 計算 UR base 平面上的基座 yaw（度）
@@ -1567,47 +1920,6 @@ public class JsonExecutor : MonoBehaviour
         for (int i = 0; i < n; i++) robotArm.Angles[i] = targetDeg[i];
     }
 
-    // 舊版：直接把方塊瞬移到最終位置（沒動畫）。保留給需要 fast preview 的情境。
-    void PreviewBatchFinalLayout(BatchEnvelope batch)
-    {
-        if (sceneSyncer == null)
-        {
-            Debug.LogWarning("[Executor] SceneSyncer 未設定，略過 batch 最終畫面預覽");
-            return;
-        }
-
-        int previewed = 0;
-        foreach (StepEnvelope env in batch.steps)
-        {
-            if (env == null || env.done ||
-                env.source_position == null || env.target_position == null)
-                continue;
-
-            GameObject cube = sceneSyncer.FindNearestCube(
-                env.source_position.x, env.source_position.y, env.source_position.z);
-            if (cube == null)
-            {
-                Color guess = env.source_position.name != null && env.source_position.name.Contains("yellow")
-                    ? new Color(1f, 0.85f, 0.1f)
-                    : new Color(0.4f, 0.4f, 0.4f);
-                cube = sceneSyncer.SpawnCube(
-                    $"preview_cube_{env.step_id}",
-                    env.source_position.x, env.source_position.y, env.source_position.z, guess);
-            }
-
-            float halfHeight = sceneSyncer.cubeSizeM / 2f;
-            cube.transform.localScale = SimScaleFor(env.target_position);
-            Vector3 previewPos = SceneSyncer.QRToUnity(
-                env.target_position.x, env.target_position.y, env.target_position.z);
-            previewPos.y -= halfHeight;
-            cube.transform.localPosition = previewPos;
-            cube.name = $"preview_step{env.step_id}";
-            previewed++;
-        }
-
-        Debug.Log($"[Executor] 已先在 Unity 預覽 batch {batch.batch_id} 最終位置：{previewed} 個物件");
-    }
-
     // 新版：完整動畫 preview（手臂 + 方塊逐 step 演示），跑完後復原初始狀態，實機才開始動
     IEnumerator PreviewBatchAnimated(BatchEnvelope batch)
     {
@@ -1639,9 +1951,6 @@ public class JsonExecutor : MonoBehaviour
         if (robotArm != null && robotArm.Angles != null)
             initialArmAngles = (float[])robotArm.Angles.Clone();
 
-        // 記錄 preview 過程中新生成的 cube（結束時要刪掉，不留垃圾）
-        int cubesBeforePreview = cubes.Count;
-
         // The real batch moves to Ready before consuming the shared trajectory.
         // Show the same starting joint pose before previewing its waypoints.
         if (useSharedMovejTrajectory && sharedTrajectoryStartQ != null && robotArm != null)
@@ -1668,6 +1977,9 @@ public class JsonExecutor : MonoBehaviour
         if (sharedTrajectoryFailure != null)
             Debug.LogWarning($"[Executor-preview] 對照組預覽只演到軌跡截斷處：{sharedTrajectoryFailure}");
 
+        // 模擬結束、復原場景之前比對 bitmap（復原之後落點就沒了）
+        RunBitmapCheck(batch);
+
         // 復原：手臂角度
         if (initialArmAngles != null && robotArm != null && robotArm.Angles != null)
         {
@@ -1675,26 +1987,18 @@ public class JsonExecutor : MonoBehaviour
             for (int i = 0; i < n; i++) robotArm.Angles[i] = initialArmAngles[i];
         }
 
-        // 復原：原本 cube 的位置/名稱；preview 過程中新增的 cube 直接刪除
+        // 復原：原本 cube 的位置/名稱（預覽不會新增方塊，所以只需要還原）
         var currentCubes = sceneSyncer.GetCurrentCubes();
         for (int i = currentCubes.Count - 1; i >= 0; i--)
         {
             var cube = currentCubes[i];
             if (cube == null) { currentCubes.RemoveAt(i); continue; }
-            if (initialCubePositions.ContainsKey(cube))
-            {
-                if (initialCubeParents[cube] != null && cube.transform.parent != initialCubeParents[cube])
-                    cube.transform.SetParent(initialCubeParents[cube], worldPositionStays: false);
-                cube.transform.localPosition = initialCubePositions[cube];
-                cube.transform.localScale = initialCubeScales[cube];
-                cube.name = initialCubeNames[cube];
-            }
-            else
-            {
-                // preview 過程新生成的臨時 cube
-                Destroy(cube);
-                currentCubes.RemoveAt(i);
-            }
+            if (!initialCubePositions.ContainsKey(cube)) continue;
+            if (initialCubeParents[cube] != null && cube.transform.parent != initialCubeParents[cube])
+                cube.transform.SetParent(initialCubeParents[cube], worldPositionStays: false);
+            cube.transform.localPosition = initialCubePositions[cube];
+            cube.transform.localScale = initialCubeScales[cube];
+            cube.name = initialCubeNames[cube];
         }
 
         Debug.Log($"[Executor-preview] 動畫預覽結束，已復原場景。實機開始執行");
@@ -1703,18 +2007,13 @@ public class JsonExecutor : MonoBehaviour
     IEnumerator AnimateSharedTrajectoryStep(StepEnvelope env, string tag)
     {
         if (!sharedTrajectory.TryGetValue(env.step_id, out var actions)) yield break;
-        GameObject cube = sceneSyncer.FindNearestCube(
-            env.source_position.x, env.source_position.y, env.source_position.z);
-        if (cube == null)
-        {
-            Color color = env.source_position.name != null && env.source_position.name.Contains("yellow")
-                ? new Color(1f, 0.85f, 0.1f) : new Color(0.4f, 0.4f, 0.4f);
-            cube = sceneSyncer.SpawnCube($"{tag}_cube_{env.step_id}",
-                env.source_position.x, env.source_position.y, env.source_position.z, color);
-        }
-        Transform originalParent = cube.transform.parent;
+        // 預覽只用相機實際看到的方塊，不補生。source 附近沒有方塊就照演手臂動作，
+        // 夾取會落空、bitmap 比對抓成少放 —— 跟實機遇到同樣情況的結果一致。
+        WarnIfNoSourceBlock(env, tag);
         Transform gripper = robotArm != null ? robotArm.TCP : null;
         SyncGripper previewGripper = FindObjectOfType<SyncGripper>();
+        GameObject held = null;
+        string stepLabel = $"{tag} step {env.step_id}";
 
         for (int i = 0; i < actions.Count; i++)
         {
@@ -1733,25 +2032,30 @@ public class JsonExecutor : MonoBehaviour
             if (action.function == "grasp")
             {
                 if (previewGripper != null) previewGripper.SetPreviewGrip(true);
-                Transform gripParent = previewGripper != null
-                    ? previewGripper.transform
-                    : gripper;
-                if (gripParent != null) cube.transform.SetParent(gripParent, true);
+                // 只夾得到夾爪正下方的方塊；夾不到就什麼都不搬（比對時會變成少放）
+                var grabbed = SimGrasp(Z_CORRECTION, $"{stepLabel} action {i + 1} grasp");
+                if (grabbed != null)
+                {
+                    held = grabbed;
+                    Transform gripParent = previewGripper != null
+                        ? previewGripper.transform
+                        : gripper;
+                    if (gripParent != null) held.transform.SetParent(gripParent, true);
+                }
                 yield return new WaitForSeconds(1.5f);
             }
             else if (action.function == "release")
             {
                 if (previewGripper != null) previewGripper.SetPreviewGrip(false);
-                cube.transform.SetParent(originalParent, true);
-                Vector3 targetLocal = SceneSyncer.QRToUnity(
-                    env.target_position.x, env.target_position.y, env.target_position.z);
-                targetLocal.y -= sceneSyncer.cubeSizeM / 2f;
-                cube.transform.localPosition = targetLocal;
-                cube.transform.localScale = SimScaleFor(env.target_position);
-                // Target scale already encodes horizontal/vertical domino
-                // direction. Keeping the tool's world rotation here applied the
-                // orientation twice and made the preview disagree with reality.
-                cube.transform.localRotation = Quaternion.identity;
+                if (held != null)
+                {
+                    // 落點由夾爪實際位置決定，不直接瞬移到 target_position，
+                    // bitmap 比對才驗得出手臂把方塊放在哪。旋轉歸零、方向由 scale 表示。
+                    SimRelease(held, $"{stepLabel} action {i + 1} release");
+                    string shape = SimBlock(held).isDomino ? "domino" : "cube";
+                    held.name = $"{tag}_step{env.step_id}_{shape}";
+                    held = null;
+                }
                 yield return new WaitForSeconds(1.5f);
                 if (previewGripper != null) previewGripper.ClearPreviewGripOverride();
             }
@@ -1760,7 +2064,8 @@ public class JsonExecutor : MonoBehaviour
                 yield return new WaitForSeconds(action.seconds);
             }
         }
-        cube.name = $"{tag}_step{env.step_id}";
+        if (held != null)
+            simPlacementNotes.Add($"{stepLabel}: 動作序列結束時方塊還夾在夾爪上（沒有 release）");
     }
 
     static float[] RadToDeg(double[] radians)
@@ -1811,13 +2116,6 @@ public class JsonExecutor : MonoBehaviour
     IEnumerator ExecuteStep(StepEnvelope env, long stepEpoch, bool managePerceptionMode = true)
     {
         Debug.Log($"═══ Step {env.step_id} ═══ {env.comment}");
-
-        // 模擬模式：直接動畫演示 cube，不走 URScript 那條路
-        if (simulationOnly)
-        {
-            yield return StartCoroutine(ExecuteStepSimulated(env));
-            yield break;
-        }
 
         // 等待連線
         EnsureUrConnectionStarted();
