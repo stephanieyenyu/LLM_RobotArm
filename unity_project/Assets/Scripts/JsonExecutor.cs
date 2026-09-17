@@ -234,6 +234,8 @@ public class JsonExecutor : MonoBehaviour
     public const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;
+    // wait 沒給秒數時的預設值，跟 csharp_server MotionPlanner.DefaultWaitSeconds 一致
+    private const float DefaultWaitSeconds = 0.2f;
     private const float Z_CORRECTION = 0.02f;
     private const float TRAVEL_Z_ABOVE_WORKSPACE = 0.24f;
     // Fine-angle correction is intentionally disabled. We retain only the two
@@ -1017,7 +1019,7 @@ public class JsonExecutor : MonoBehaviour
                 var pa = new PlannedJointAction
                 {
                     function = action.function,
-                    seconds = Mathf.Clamp(action.seconds > 0f ? action.seconds : 0.5f, 0.1f, 3f)
+                    seconds = Mathf.Clamp(action.seconds > 0f ? action.seconds : DefaultWaitSeconds, 0.1f, 3f)
                 };
 
                 bool source = action.location == "source";
@@ -2379,7 +2381,7 @@ public class JsonExecutor : MonoBehaviour
                         tag, true, stepEpoch, env.step_id);
                     break;
                 case "wait":
-                    yield return new WaitForSeconds(Mathf.Clamp(action.seconds > 0f ? action.seconds : 0.5f, 0.1f, 3f));
+                    yield return new WaitForSeconds(Mathf.Clamp(action.seconds > 0f ? action.seconds : DefaultWaitSeconds, 0.1f, 3f));
                     break;
                 case "go_home":
                     yield return SendHome(tag, stepEpoch, env.step_id);
