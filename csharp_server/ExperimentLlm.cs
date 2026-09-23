@@ -21,14 +21,14 @@ public sealed class ExperimentLlm
     static string Prompt(List<string> rules) => Role + (rules.Count == 0 ? "" : "\n本任務自行產生的暫定規則與失敗摘要：\n" + string.Join("\n", rules));
     static string SceneText(List<SceneObject> scene) => JsonSerializer.Serialize(scene.Select((item, index) => new { index, item }));
     public Task<string> Decompose(string goal, List<SceneObject> scene, List<string> rules, string feedback, byte[]? image, string dir) => Call(Prompt(rules),
-        $"目標：{goal}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n請自行拆解本輪的子任務，以自然語言描述。", image, dir, "decomposition");
+        $"目標：{goal}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n注意：index 只代表這一張目前場景清單的位置，每次重新觀測都可能重排，不能當作跨輪次的物件身分。請自行拆解本輪的子任務，以自然語言描述。", image, dir, "decomposition");
     public Task<string> Plan(string goal, List<SceneObject> scene, string hierarchy, List<string> rules, string feedback, byte[]? image, string dir) => Call(Prompt(rules),
         $"目標：{goal}\n子任務：{hierarchy}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n" +
-        "環境：QR 座標為公尺，X/Y 在桌面上，Z 向上；物件 Z 為頂面高度。cube 尺寸 0.025m，domino 為 0.05×0.025×0.025m。\n" +
-        "執行介面提供 move_above(location,height_m)、descend(location)、grasp()、release()、lift(location,height_m)、wait(seconds)、go_home()。location 可為 source 或 target；source/target 是本次操作所選物件與位置的代稱；height_m 是端點上方的距離。這只是設備能力說明，不規定任務拆解、動作順序或完成方式。單次最多 50 個操作，每個操作最多 20 個函式。請以自然語言自行決定本輪操作與參數。", image, dir, "operation_plan");
+        "環境：QR 座標為公尺，X/Y 在桌面上，Z 向上；物件 Z 為頂面高度。cube 尺寸 0.025m，domino 為 0.05×0.025×0.025m。場景 index 只適用本輪目前清單，重新觀測後可能重排。\n" +
+        "執行介面提供 move_above(location,height_m)、descend(location)、grasp()、release()、lift(location,height_m)、wait(seconds)、go_home()。location 可為 source 或 target；source/target 是本次操作所選物件與位置的代稱；height_m 是端點上方的距離。介面不提供任意 XY 偏移、條件分支或同輪失敗後續跑；每輪只能提交一條確定且可執行的動作路徑，執行失敗後由下一輪根據新觀測重規劃。這只是設備能力說明，不規定任務拆解、動作順序或完成方式。單次最多 50 個操作，每個操作最多 20 個函式。請以自然語言自行決定本輪操作與參數。", image, dir, "operation_plan");
     public async Task<TranslatedPlan> Translate(string plan, List<SceneObject> scene, string dir)
     {
-        var text = await Call("你是忠實的執行介面轉譯器。只能轉譯明確寫出的操作；不得補上抓放順序、參數、物件選擇、布局、完成狀態或修正。location 只能是 source、target 或不適用時的 null。缺失或歧義時回報 error，steps 為空。",
+        var text = await Call("你是忠實的執行介面轉譯器。只能轉譯明確寫出的操作；不得補上抓放順序、參數、物件選擇、布局、完成狀態或修正。function 只能是 move_above、descend、grasp、release、lift、wait、go_home；location 只能是 source、target 或不適用時的 null。介面不支援任意 XY 偏移、條件分支或自訂函式。缺失、歧義或無法忠實轉譯時回報 error，steps 為空。",
             $"場景：{SceneText(scene)}\n原始操作描述：{plan}\n" +
             "輸出內部 JSON：{\"error\":\"\",\"steps\":[{\"source_index\":0,\"target\":{\"name\":\"來源的原始name\",\"x\":0.0,\"y\":0.0,\"z\":0.0,\"shape\":\"cube\",\"orientation\":null},\"actions\":[{\"function\":\"函式名\",\"location\":null,\"height_m\":null,\"seconds\":null}]}]}。target 是原始自然語言計畫明確指定的操作位置；若計畫沒有另一位置，複製 source 位置供內部通訊。數字只是格式示意，不是預設值。", null, dir, "translation");
         try
@@ -48,6 +48,22 @@ public sealed class ExperimentLlm
                 if (!target.TryGetProperty(field, out _)) throw new InvalidOperationException($"轉譯器 steps[{stepIndex}].target 缺少欄位：{field}。");
             if (!step.TryGetProperty("actions", out var actions) || actions.ValueKind != JsonValueKind.Array)
                 throw new InvalidOperationException($"轉譯器 steps[{stepIndex}] 缺少 actions 陣列。");
+            int actionIndex = -1;
+            foreach (var action in actions.EnumerateArray())
+            {
+                actionIndex++;
+                if (!action.TryGetProperty("function", out var function) ||
+                    function.ValueKind != JsonValueKind.String ||
+                    !AllowedFunctions.Contains(function.GetString() ?? ""))
+                    throw new InvalidOperationException(
+                        $"轉譯器 steps[{stepIndex}].actions[{actionIndex}] 使用不支援的 function。");
+                if (action.TryGetProperty("location", out var location) &&
+                    location.ValueKind != JsonValueKind.Null &&
+                    (location.ValueKind != JsonValueKind.String ||
+                     (location.GetString() != "source" && location.GetString() != "target")))
+                    throw new InvalidOperationException(
+                        $"轉譯器 steps[{stepIndex}].actions[{actionIndex}] 使用不支援的 location。");
+            }
         }
         return JsonSerializer.Deserialize<TranslatedPlan>(text.Trim(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? throw new InvalidOperationException("轉譯器没有產生可讀資料。");
         }
@@ -60,7 +76,7 @@ public sealed class ExperimentLlm
         "你是獨立的結果驗證者。只根據原始目標、初始場景及目前實際觀測判斷，不提供操作解法。檢查整體目標與局部幾何完整度（包含直線、連接與堆疊）。沒有足夠觀測證據或目標含糊時不可通過。第一行僅寫 PASS 或 FAIL，後續自然語言描述觀測問題與不確定性。",
         $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n" + (image == null ? "影像不可取得，證據不足，不能通過。" : "附圖是目前實際相機畫面。"), image, dir, "global_validation");
     public Task<string> Reflect(string goal, string plan, string feedback, List<string> rules, string dir) => Call(
-        "你是 UR3 任務控制者。分析未達標結果，區分觀測事實與原因假設，以自然語言產生下一輪暫定規則。規則必須來自本輪失敗證據；資訊不足時寫明未知，不能把假設當事實，不能改變原始目標。設備實際只提供 source/target 與 move_above、descend、grasp、release、lift、wait、go_home；這是能力邊界，不是預先指定的解題順序。",
+        "你是 UR3 任務控制者。分析未達標結果，區分觀測事實與原因假設，以自然語言產生下一輪暫定規則。規則必須來自本輪失敗證據；資訊不足時寫明未知，不能把假設當事實，不能改變原始目標。保留舊規則中仍有證據支持的限制；只有出現新的相反證據時才能取代，並明確說明。場景 index 每次觀測可能重排，不是跨輪次物件身分。設備實際只提供 source/target 與 move_above、descend、grasp、release、lift、wait、go_home，不提供任意 XY 偏移、條件分支或同輪失敗後續跑；每輪只能提交一條確定的動作路徑。這是能力邊界，不是預先指定的解題順序。",
         $"目標：{goal}\n本輪操作：{plan}\n結果：{feedback}\n舊規則：{string.Join("\n", rules)}", null, dir, "reflection");
     async Task<string> Call(string system, string user, byte[]? image, string dir, string name)
     {
@@ -98,6 +114,11 @@ public sealed class ExperimentLlm
             Console.WriteLine($"[LLM] {name} 仍在執行，已等待 {elapsed} 秒（無逾時限制）...");
         }
     }
+
+    static readonly HashSet<string> AllowedFunctions = new(StringComparer.Ordinal)
+    {
+        "move_above", "descend", "grasp", "release", "lift", "wait", "go_home"
+    };
 }
 public sealed class TranslatedPlan
 {

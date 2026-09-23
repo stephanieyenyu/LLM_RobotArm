@@ -81,9 +81,13 @@ while (true)
                 // A task attempt starts only after the internal adapter has
                 // produced a readable contract. Adapter failures are not task
                 // reasoning failures and never enter reflection.
+                if (!string.IsNullOrWhiteSpace(translated.Error))
+                    throw new TranslationContractException("轉譯失敗：" + translated.Error,
+                        new InvalidOperationException(translated.Error));
+                if (translated.Steps == null || translated.Steps.Count > 50)
+                    throw new TranslationContractException("執行資料無效或超過單次 50 步上限。",
+                        new InvalidOperationException("Invalid translated step count."));
                 attempts = attempt;
-                if (!string.IsNullOrWhiteSpace(translated.Error)) throw new InvalidOperationException("轉譯失敗：" + translated.Error);
-                if (translated.Steps == null || translated.Steps.Count > 50) throw new InvalidOperationException("執行資料無效或超過單次 50 步上限。");
                 foreach (var step in translated.Steps)
                 {
                     var current = await Scene();
@@ -100,12 +104,24 @@ while (true)
                     AtomicWrite(Path.Combine(assets, "current_step.json"), new BatchEnvelope {
                         BatchId = batchId, Steps = new List<StepEnvelope> { env }, Comment = env.Comment
                     });
+                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 Unity/UR3：step {assignment.StepId}、batch {batchId}。");
                     executionPending = true;
-                    var execution = await Wait(batchId);
+                    var execution = await Wait(attempt, batchId);
                     if (execution != null) executionPending = false;
                     Save(dir, $"execution_{stepId}.json", execution);
                     if (execution == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
-                    if (!execution.Completed) throw new InvalidOperationException(execution.Error ?? "執行失敗");
+                    if (!execution.Completed)
+                    {
+                        string sourceContext = assignment.Source == null
+                            ? ""
+                            : $"\n失敗步驟來源（當輪 QR 座標）：{assignment.Source.Name} " +
+                              $"x={assignment.Source.X:F3}, y={assignment.Source.Y:F3}, " +
+                              $"z={assignment.Source.Z:F3} m；source_index={step.SourceIndex} 只適用本輪觀測。";
+                        var executionError = (execution.Error ?? "執行失敗") + sourceContext;
+                        Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 退回：{executionError}");
+                        throw new InvalidOperationException(executionError);
+                    }
+                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 已完成 batch {batchId}。");
                     await Task.Delay(1200);
                     var afterStep = await Scene();
                     var outcome = ClassifyOutcome(step.Actions);
@@ -133,7 +149,7 @@ while (true)
             success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
             if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
             var reflection = await llm.Reflect(goal, plan, feedback, rules, dir);
-            rules = new List<string> { reflection };
+            rules.Add(reflection);
             File.WriteAllText(Path.Combine(dir, "rules_for_next_attempt.txt"), reflection);
         }
     }
@@ -185,7 +201,7 @@ async Task<byte[]?> Frame(string dir, string name)
         throw new SceneUnavailableException("相機影像不可取得，不能作為任務失敗進行 Reflection。");
     }
 }
-async Task<ExecutionResult?> Wait(int id)
+async Task<ExecutionResult?> Wait(int attempt, int id)
 {
     var path = Path.Combine(assets, "step_done.json");
     var started = DateTime.UtcNow;
@@ -205,7 +221,7 @@ async Task<ExecutionResult?> Wait(int id)
         if (elapsedSeconds >= lastReportedSeconds + 15)
         {
             lastReportedSeconds = elapsedSeconds;
-            Console.WriteLine($"[Unity/UR3] batch {id} 仍在執行，已等待 {elapsedSeconds} 秒（無逾時限制）...");
+            Console.WriteLine($"[Unity/UR3] 第 {attempt}/10 輪，batch {id} 仍在執行，已等待 {elapsedSeconds} 秒（無逾時限制）...");
         }
         await Task.Delay(200);
     }
