@@ -2,6 +2,8 @@
 
 以中文自然語言指令控制 UR3e 機械手臂的框架。RealSense D435i 即時偵測工作台物件 → OpenAI gpt-5 解析指令 → Unity 送 URScript 到手臂。
 
+目前採自由規劃與失敗反思實驗流程；任務間恢復初始桌面，任務內不重置，最多嘗試十次。操作方式、重置基準與評分限制見 [實驗協定](docs/experiment_protocol.md)。
+
 ## 系統流程
 
 ```
@@ -14,11 +16,12 @@ perception_server (Python + Flask)
    ├─ YOLO11n（COCO 物件） + HSV 立方體 + ArUco QR
    └─ 每 200ms 更新場景，回傳 3D 世界座標
    ↓
-LLM CommandRouter（arrange_pattern / move_relative / stack）
-   ├─ PatternDesigner：OpenAI + Gemini 獨立生成 bitmap 並交叉評審
-   └─ SingleObjectTaskBuilder：方向/距離或疊放目標 → 實際座標
+LLM 自由拆解子任務 → 自然語言操作計畫
+   ↓  忠實轉譯（內部執行資料）
+MotionPlanValidator → Unity 逐操作執行
    ↓
-LLM MotionPlanner → MotionPlanValidator
+局部觀測檢查 + 獨立視覺模型整體驗證
+   └─ 未達標：失敗摘要 → 自行生成規則 → 更新 prompt（最多 10 次）
    ↓  StreamingAssets/current_step.json（robot function sequence）
 Unity JsonExecutor（高階 function → URScript）
    ↓  TCP 30002 URScript
@@ -29,11 +32,10 @@ UR3e
 
 **csharp_server/**
 - `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP
-- `Program.cs` — 監聽 user_input.txt、路由任務、執行感知/規劃/驗證閉環
-- `CommandRouter.cs` — LLM 判斷排圖、相對移動或疊放
-- `PatternDesigner.cs` — OpenAI 與 Gemini 各自生成 bitmap、互審對方候選後選出結果
-- `SingleObjectTaskBuilder.cs` — 用確定性幾何計算相對移動與疊放座標
-- `MotionPlanner.cs` — LLM 使用白名單 robot functions 規劃動作
+- `Program.cs` — 任務間初始配置檢查、任務內保留現況、十次嘗試與逐操作執行
+- `ExperimentLlm.cs` — 自由拆解、自然語言規劃、轉譯、獨立結果驗證及反思
+- `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
+- `ExperimentMetrics.cs` — 首次／十次內成功率及各次累積成功率
 - `MotionPlanValidator.cs` — 執行前安全狀態機驗證
 - `RobotPlan.cs` — plan / SceneObject 資料類別
 - `models/pliers.pt`、`yolo11n.pt` — YOLO 權重
@@ -52,8 +54,7 @@ UR3e
 - Unity 2022.3 LTS
 - Intel RealSense D435i（USB 3 直接接筆電）
 - `setx OPENAI_API_KEY "sk-你的-key"` 後重開 PowerShell
-- `setx GEMINI_API_KEY "你的-Gemini-key"` 後重開 PowerShell
-- 可選：`setx GEMINI_MODEL "gemini-3.1-flash-lite"` 指定有 Free Tier 的 Gemini 模型（程式預設值亦相同）
+- 可選：ROBOT_MODEL 指定本次實驗的 OpenAI 模型
 - UR3e 或 URSim（Teach Pendant 切 Remote Control、TCP Z offset 設 0.170、速度滑桿 100%）
 - 工作台貼四張 ArUco（QR1 左下、QR2 右下、QR3 左上、QR4 右上）
 
@@ -77,18 +78,12 @@ dotnet run
 
 ## 指令範例
 
-- 「排 H」→ `arrange_pattern`
-- 「把黃色方塊往前移 5 公分」→ `move_relative`
-- 「把黃色方塊往左移 10 公分」→ `move_relative`
-- 「把黑色方塊疊在黃色方塊上面」→ `stack`
+- 「排 H」
+- 「把黃色方塊往前移 5 公分」
+- 「把黃色方塊往左移 10 公分」
+- 「把黑色方塊疊在黃色方塊上面」
 
-相對方向沿用 QR 工作座標定義：`left=+X`、`right=-X`、`forward=-Y`、`backward=+Y`。
-如果現場視角相反，只需在 `SingleObjectTaskBuilder.cs` 調整這四個映射。
-
-疊放高度不使用固定積木高度。感知伺服器透過 RealSense depth 取得來源積木頂面
-`source.Z`；來源積木位於 QR 桌面時，此值就是實測積木高度。疊放目標使用
-`targetZ = reference.Z + source.Z`。若量到的來源高度不在 0.005–0.100 m，系統會拒絕
-執行並要求刷新場景，避免使用錯誤深度撞擊積木。
+任務拆解、來源選擇、布局、相對方向與疊放目標均由模型根據觀測規劃，程式不再預先計算解法。執行前驗證仍可拒絕不可達、碰撞或不安全的操作，拒絕結果會進入下一輪反思。
 
 ## 支援的物件
 

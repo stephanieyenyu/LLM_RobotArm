@@ -591,7 +591,16 @@ public class JsonExecutor : MonoBehaviour
             ? $"[Verification] batch {batch.batch_id}：模擬結束比對開啟（實驗組）"
             : $"[Verification] batch {batch.batch_id}：模擬結束比對關閉（對照組）— 比對結果只記錄不擋；其他檢查照常生效");
 
-        if (useSharedMovejTrajectory)
+        if (BatchEndsHolding(batch))
+        {
+            // The final LLM action already lifted to a validated safe height.
+            // Returning Ready/Home here would move a held block and contradict
+            // the requested completion state.
+            currentStepId = -1;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            yield return new WaitForSeconds(1.5f);
+        }
+        else if (useSharedMovejTrajectory)
         {
             if (!useReadyPose || readyJointsRad == null || readyJointsRad.Length != 6)
             {
@@ -1096,6 +1105,13 @@ public class JsonExecutor : MonoBehaviour
             sharedTrajectory[env.step_id] = planned;
         }
 
+        if (BatchEndsHolding(batch))
+        {
+            error = null;
+            Debug.Log($"[Executor-shared] Built holding trajectory for {sharedTrajectory.Count} steps; final Ready/Home omitted.");
+            return true;
+        }
+
         // The old executor returned through Ready and Home after the batch. Plan
         // and validate that return too so preview and hardware end with the same
         // motions rather than appending unpreviewed commands.
@@ -1131,6 +1147,23 @@ public class JsonExecutor : MonoBehaviour
         error = null;
         Debug.Log($"[Executor-shared] Built and collision-checked shared movej trajectory for {sharedTrajectory.Count} steps.");
         return true;
+    }
+
+    static bool BatchEndsHolding(BatchEnvelope batch)
+    {
+        bool holding = false;
+        if (batch == null || batch.steps == null) return false;
+        foreach (var step in batch.steps)
+        {
+            if (step == null || step.action_sequence == null) continue;
+            foreach (var action in step.action_sequence)
+            {
+                if (action == null) continue;
+                if (action.function == "grasp") holding = true;
+                else if (action.function == "release") holding = false;
+            }
+        }
+        return holding;
     }
 
     // ============================================================
