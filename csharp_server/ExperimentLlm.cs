@@ -60,7 +60,7 @@ public sealed class ExperimentLlm
         "你是獨立的結果驗證者。只根據原始目標、初始場景及目前實際觀測判斷，不提供操作解法。檢查整體目標與局部幾何完整度（包含直線、連接與堆疊）。沒有足夠觀測證據或目標含糊時不可通過。第一行僅寫 PASS 或 FAIL，後續自然語言描述觀測問題與不確定性。",
         $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n" + (image == null ? "影像不可取得，證據不足，不能通過。" : "附圖是目前實際相機畫面。"), image, dir, "global_validation");
     public Task<string> Reflect(string goal, string plan, string feedback, List<string> rules, string dir) => Call(
-        "你是 UR3 任務控制者。分析未達標結果，區分觀測事實與原因假設，以自然語言產生下一輪暫定規則。規則必須來自本輪失敗證據；資訊不足時寫明未知，不能把假設當事實，不能改變原始目標。設備實際只提供 source/target 與 move_above、descend、grasp、release、lift、wait、go_home；這是能力邊界，不是預先指定的解題順序。",
+        "你是 UR3 任務控制者。分析未達標結果，區分觀測事實與原因假設。先判斷本輪失敗是否代表目標本質上不可能達成（例如這組結構在物理上不可能疊放穩定），第一行只寫 GIVE_UP 或 CONTINUE；只有清楚的物理不可能證據才能寫 GIVE_UP，只是這次嘗試方法不對或資訊不足時寫 CONTINUE。第二行起，CONTINUE 時以自然語言產生下一輪暫定規則，GIVE_UP 時說明判斷依據。規則必須來自本輪失敗證據；資訊不足時寫明未知，不能把假設當事實，不能改變原始目標。設備實際只提供 source/target 與 move_above、descend、grasp、release、lift、wait、go_home；這是能力邊界，不是預先指定的解題順序。",
         $"目標：{goal}\n本輪操作：{plan}\n結果：{feedback}\n舊規則：{string.Join("\n", rules)}", null, dir, "reflection");
     async Task<string> Call(string system, string user, byte[]? image, string dir, string name)
     {

@@ -28,8 +28,15 @@ import sys
 from pathlib import Path
 
 # 必須第一步啟動 Isaac Sim
+# headless 預設開啟，讓 C# 那邊（IsaacSimGate.cs）能夠無人值守呼叫、不用開
+# 視窗；本機手動測試想看畫面的話，用 --gui 關掉 headless。
+import sys as _sys
+_headless = "--gui" not in _sys.argv
+if "--gui" in _sys.argv:
+    _sys.argv.remove("--gui")
+
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": False})
+simulation_app = SimulationApp({"headless": _headless})
 
 # ---- 只有 SimulationApp 啟動後才能 import isaac 相關模組 ----
 import numpy as np

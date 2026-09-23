@@ -84,6 +84,21 @@ while (true)
                 attempts = attempt;
                 if (!string.IsNullOrWhiteSpace(translated.Error)) throw new InvalidOperationException("轉譯失敗：" + translated.Error);
                 if (translated.Steps == null || translated.Steps.Count > 50) throw new InvalidOperationException("執行資料無效或超過單次 50 步上限。");
+                // 疊放檢查：規劃裡有目標不是貼桌面（疊在別的積木上）才跑，先在
+                // Isaac Sim 完整模擬這輪所有步驟（真的模擬 UR3e 抓放動作，不是
+                // 瞬間擺放），用模擬相機 + llm.Validate 判斷 PASS/FAIL（跟下面
+                // 判斷真實執行結果同一套邏輯），不通過就直接算這次 attempt 失敗、
+                // 不送真實手臂，走跟其他失敗一樣的路徑進 Reflect 產生下一輪教訓。
+                // 存檔另開子資料夾，避免跟下面真實執行後的 llm.Validate 存檔撞名。
+                if (IsaacSimExecutor.RequiresCheck(translated.Steps))
+                {
+                    var isaacDir = Path.Combine(dir, "isaac_sim");
+                    Directory.CreateDirectory(isaacDir);
+                    var (isaacScene, isaacFrame) = await IsaacSimExecutor.SimulateAsync(before, translated.Steps, isaacDir);
+                    var isaacVerdict = await llm.Validate(goal, before, isaacScene, isaacFrame, isaacDir);
+                    if (isaacVerdict.Split('\n')[0].Trim() != "PASS")
+                        throw new InvalidOperationException("Isaac Sim 模擬：" + isaacVerdict);
+                }
                 foreach (var step in translated.Steps)
                 {
                     var current = await Scene();
@@ -133,8 +148,13 @@ while (true)
             success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
             if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
             var reflection = await llm.Reflect(goal, plan, feedback, rules, dir);
-            rules = new List<string> { reflection };
             File.WriteAllText(Path.Combine(dir, "rules_for_next_attempt.txt"), reflection);
+            if (reflection.Split('\n')[0].Trim() == "GIVE_UP")
+            {
+                Console.WriteLine($"[實驗] LLM 判斷本任務無法達成，第 {attempt} 次後結束嘗試。");
+                break;
+            }
+            rules = new List<string> { reflection };
         }
     }
     catch (Exception ex)
