@@ -142,8 +142,13 @@ while (true)
             success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
             if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
             var reflection = await llm.Reflect(goal, plan, feedback, rules, dir);
-            rules = new List<string> { reflection };
             File.WriteAllText(Path.Combine(dir, "rules_for_next_attempt.txt"), reflection);
+            if (reflection.Split('\n')[0].Trim() == "GIVE_UP")
+            {
+                Console.WriteLine($"[實驗] LLM 判斷本任務無法達成，第 {attempt} 次後結束嘗試。");
+                break;
+            }
+            rules = new List<string> { reflection };
         }
     }
     catch (Exception ex)
