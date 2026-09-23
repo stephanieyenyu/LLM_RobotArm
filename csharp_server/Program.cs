@@ -85,13 +85,19 @@ while (true)
                 if (!string.IsNullOrWhiteSpace(translated.Error)) throw new InvalidOperationException("轉譯失敗：" + translated.Error);
                 if (translated.Steps == null || translated.Steps.Count > 50) throw new InvalidOperationException("執行資料無效或超過單次 50 步上限。");
                 // 疊放檢查：規劃裡有目標不是貼桌面（疊在別的積木上）才跑，先在
-                // Isaac Sim 用物理引擎確認穩不穩，不穩就直接算這次 attempt 失敗、
+                // Isaac Sim 完整模擬這輪所有步驟（真的模擬 UR3e 抓放動作，不是
+                // 瞬間擺放），用模擬相機 + llm.Validate 判斷 PASS/FAIL（跟下面
+                // 判斷真實執行結果同一套邏輯），不通過就直接算這次 attempt 失敗、
                 // 不送真實手臂，走跟其他失敗一樣的路徑進 Reflect 產生下一輪教訓。
-                if (IsaacSimGate.RequiresCheck(translated.Steps))
+                // 存檔另開子資料夾，避免跟下面真實執行後的 llm.Validate 存檔撞名。
+                if (IsaacSimExecutor.RequiresCheck(translated.Steps))
                 {
-                    var (stable, detail) = IsaacSimGate.CheckStability(translated.Steps, dir);
-                    Save(dir, "isaac_gate.json", new { stable, detail });
-                    if (!stable) throw new InvalidOperationException("Isaac Sim 疊放模擬：" + detail);
+                    var isaacDir = Path.Combine(dir, "isaac_sim");
+                    Directory.CreateDirectory(isaacDir);
+                    var (isaacScene, isaacFrame) = await IsaacSimExecutor.SimulateAsync(before, translated.Steps, isaacDir);
+                    var isaacVerdict = await llm.Validate(goal, before, isaacScene, isaacFrame, isaacDir);
+                    if (isaacVerdict.Split('\n')[0].Trim() != "PASS")
+                        throw new InvalidOperationException("Isaac Sim 模擬：" + isaacVerdict);
                 }
                 foreach (var step in translated.Steps)
                 {
