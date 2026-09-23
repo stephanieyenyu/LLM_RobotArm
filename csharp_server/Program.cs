@@ -84,6 +84,15 @@ while (true)
                 attempts = attempt;
                 if (!string.IsNullOrWhiteSpace(translated.Error)) throw new InvalidOperationException("轉譯失敗：" + translated.Error);
                 if (translated.Steps == null || translated.Steps.Count > 50) throw new InvalidOperationException("執行資料無效或超過單次 50 步上限。");
+                // 疊放檢查：規劃裡有目標不是貼桌面（疊在別的積木上）才跑，先在
+                // Isaac Sim 用物理引擎確認穩不穩，不穩就直接算這次 attempt 失敗、
+                // 不送真實手臂，走跟其他失敗一樣的路徑進 Reflect 產生下一輪教訓。
+                if (IsaacSimGate.RequiresCheck(translated.Steps))
+                {
+                    var (stable, detail) = IsaacSimGate.CheckStability(translated.Steps, dir);
+                    Save(dir, "isaac_gate.json", new { stable, detail });
+                    if (!stable) throw new InvalidOperationException("Isaac Sim 疊放模擬：" + detail);
+                }
                 foreach (var step in translated.Steps)
                 {
                     var current = await Scene();
