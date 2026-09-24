@@ -66,6 +66,7 @@ while (true)
             var dir = Path.Combine(run, $"attempt_{attempt:00}");
             Directory.CreateDirectory(dir);
             Console.WriteLine($"[實驗] 第 {attempt}/10 次規劃，保留目前場景。");
+            attempts = attempt;
             string failure = "", plan = "";
             var local = new List<VerifyResult>();
             try
@@ -78,16 +79,12 @@ while (true)
                 plan = await llm.Plan(goal, before, hierarchy, rules, feedback, image, dir);
                 var translated = await llm.Translate(plan, before, dir);
                 Save(dir, "translated_plan.json", translated);
-                // A task attempt starts only after the internal adapter has
-                // produced a readable contract. Adapter failures are not task
-                // reasoning failures and never enter reflection.
                 if (!string.IsNullOrWhiteSpace(translated.Error))
                     throw new TranslationContractException("轉譯失敗：" + translated.Error,
                         new InvalidOperationException(translated.Error));
                 if (translated.Steps == null || translated.Steps.Count > 50)
                     throw new TranslationContractException("執行資料無效或超過單次 50 步上限。",
                         new InvalidOperationException("Invalid translated step count."));
-                attempts = attempt;
                 foreach (var step in translated.Steps)
                 {
                     var current = await Scene();
@@ -139,6 +136,11 @@ while (true)
                 }
             }
             catch (ExecutionUnknownException) { throw; }
+            catch (TranslationContractException ex)
+            {
+                failure = ex.Message;
+                Console.WriteLine($"[實驗] 第 {attempt}/10 輪轉譯失敗，將進入 Reflection：{failure}");
+            }
             catch (InvalidOperationException ex) { failure = ex.Message; }
             var after = await Scene();
             Save(dir, "after_scene.json", after);
@@ -148,7 +150,7 @@ while (true)
             File.WriteAllText(Path.Combine(dir, "feedback.txt"), feedback);
             success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
             if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
-            var reflection = await llm.Reflect(goal, plan, feedback, rules, dir);
+            var reflection = await llm.Reflect(goal, plan, feedback, rules, after, dir);
             rules.Add(reflection);
             File.WriteAllText(Path.Combine(dir, "rules_for_next_attempt.txt"), reflection);
         }
