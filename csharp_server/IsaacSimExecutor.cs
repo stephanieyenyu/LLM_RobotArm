@@ -1,26 +1,25 @@
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
 // -----------------------------------------------------------------
-// 送真實手臂執行前，先在 Isaac Sim 裡完整模擬這輪要做的每一步操作
-// （真的模擬 UR3e 抓放動作，不是只把積木瞬間擺好），確認抓放過程跟
-// 疊放結果都沒問題，才送真實手臂。取代原本 IsaacSimGate.cs 的簡化版
-// （那個只瞬間擺放積木檢查穩不穩，不模擬抓放過程）。
+// Isaac Sim 3D 疊放驗證（isaac_sim_server.py，常駐 HTTP 服務，位址用 ISAAC_SIM_URL
+// 環境變數指定，預設 http://localhost:6000/）。場景座標一律用 QR 座標系
+// （跟 perception /scene 相同），換到 UR 基座 / Isaac 世界由 isaac_sim_server.py 負責。
 //
-// Isaac Sim 常駐在另一台電腦，那邊跑一個常駐 HTTP 服務
-// （isaac_sim_server.py），這裡用 HttpClient 呼叫。服務位址用
-// ISAAC_SIM_URL 環境變數指定（跟現有 perception_server.py 走
-// http://localhost:5000 是同一種模式，只是 Isaac Sim 在不同機器上，
-// 所以位址要指到那台機器的 IP，例如 http://192.168.x.x:6000/）。
-//
-// 這整個檔案沒辦法在這個環境測試過，isaac_sim_server.py 那邊的 API
-// 對不對要在 Isaac Sim 機器上實際跑過才能確認。
+// 3D 疊放的流程（2D 平面移動不經過這裡，照舊由 Unity 模擬驗證）：
+//   BeginVerifyAsync  把真實場景投影到 Isaac、記錄起始狀態；Isaac 手臂即時跟隨 URSim。
+//   （Program 把整輪步驟以 robot_target = "ursim" 交給 Unity，在 URSim 執行）
+//   EndVerifyAsync    URSim 跑完後，Isaac 等積木靜止做幾何檢查，回傳結果與模擬截圖；
+//                     呼叫端再讓 LLM 看截圖，都通過才送真實手臂。
+//   SyncRealScene     嘗試開始 / 結束時把真實場景投影到 Isaac（背景，只更新畫面）。
+// 同一時間只有一組呼叫在 Isaac 上跑（依序排隊）。
 // -----------------------------------------------------------------
 public static class IsaacSimExecutor
 {
     const double CubeSizeM = 0.025;
-    // 貼桌面的允許誤差；目標 Z 超過這個高度才視為「疊在別的積木上」。
-    const double RestingZToleranceM = 0.004;
+    // 目標壓在另一塊積木上（中心 XY 在這之內）就算疊放
+    const double StackFootprintM = 0.020;
 
     static readonly HttpClient Http = new()
     {
@@ -28,70 +27,158 @@ public static class IsaacSimExecutor
         Timeout = TimeSpan.FromMinutes(5),
     };
     static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
+    static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };
+    static readonly SemaphoreSlim IsaacLock = new(1, 1);
+    static int unavailableReported;
 
     /// <summary>
-    /// 這批步驟裡只要有一個目標明顯不是貼著桌面，就代表這次規劃有疊放，
-    /// 需要先在 Isaac Sim 完整模擬。邏輯跟舊版 IsaacSimGate.RequiresCheck
-    /// 一樣，維持不變。
+    /// 是否為 3D 疊放：任何一步的目標壓在另一塊積木上，或比來源積木高出半層以上。
+    /// 不用目標 Z 的絕對值判斷，因為 perception 的頂面高度系統性偏低約 2 cm
+    /// （Unity 用 Z_CORRECTION 補償），疊放目標常常只有 0.024 m。
     /// </summary>
-    public static bool RequiresCheck(IEnumerable<TranslatedStep> steps)
-        => steps.Any(s => s.Target != null && s.Target.Z > CubeSizeM + RestingZToleranceM);
-
-    /// <summary>
-    /// 在 Isaac Sim 裡完整模擬這輪所有步驟：先依 initial 場景擺好積木，
-    /// 逐步驅動 UR3e 執行每個 step 的 actions，最後回報模擬後的場景跟
-    /// 一張模擬相機截圖。呼叫端拿這兩樣東西跟現有 llm.Validate 一樣判斷
-    /// PASS/FAIL，不通過就直接讓這次 attempt 失敗、不送真實手臂。
-    /// </summary>
-    public static async Task<(List<SceneObject> Scene, byte[]? Frame)> SimulateAsync(
-        List<SceneObject> initial, List<TranslatedStep> steps, string dir)
-    {
-        await Post("reset", new { scene = initial });
-
-        foreach (var step in steps)
+    public static bool RequiresCheck(IEnumerable<TranslatedStep> steps, IReadOnlyList<SceneObject> scene)
+        => steps.Any(s =>
         {
+            if (s.Target == null) return false;
+            var source = s.SourceIndex >= 0 && s.SourceIndex < scene.Count ? scene[s.SourceIndex] : null;
+            if (source != null && s.Target.Z > source.Z + CubeSizeM / 2) return true;
+            return scene.Where(o => o != source)
+                .Any(o => Math.Sqrt(Math.Pow(o.X - s.Target.X, 2) + Math.Pow(o.Y - s.Target.Y, 2)) < StackFootprintM);
+        });
+
+    /// <summary>投影真實場景並開始驗證；Isaac 或 URSim 不可用時丟 SimulationUnavailableException。</summary>
+    public static async Task BeginVerifyAsync(List<SceneObject> scene, List<TranslatedStep> steps,
+        JsonElement? camera, byte[]? realFrame, string dir)
+    {
+        await IsaacLock.WaitAsync();
+        try
+        {
+            var body = new
+            {
+                scene,
+                camera,
+                steps = steps.Select(s => new { source_index = s.SourceIndex, target = s.Target, actions = s.Actions }),
+            };
+            File.WriteAllText(Path.Combine(dir, "isaac_verify_begin.json"), await Post("verify/begin", body));
+            await SaveFrame(dir, "isaac_before.jpg");
+            if (realFrame != null) await SaveOverlay(dir, realFrame);
+        }
+        finally { IsaacLock.Release(); }
+    }
+
+    /// <summary>URSim 跑完後取得 Isaac 幾何檢查結果、模擬後場景與截圖。</summary>
+    public static async Task<VerifyReport> EndVerifyAsync(string dir)
+    {
+        await IsaacLock.WaitAsync();
+        try
+        {
+            var text = await Post("verify/end", new { });
+            File.WriteAllText(Path.Combine(dir, "isaac_verify.json"), text);
+            using var doc = JsonDocument.Parse(text);
+            var root = doc.RootElement;
+            var report = new VerifyReport
+            {
+                Pass = root.GetProperty("pass").GetBoolean(),
+                Reasons = root.GetProperty("reasons").EnumerateArray().Select(r => r.GetString() ?? "").ToList(),
+                Scene = root.GetProperty("objects").Deserialize<List<SceneObject>>(Json) ?? new(),
+            };
+            File.WriteAllText(Path.Combine(dir, "isaac_after_scene.json"), JsonSerializer.Serialize(report.Scene, Indented));
+            report.Frame = await SaveFrame(dir, "isaac_after.jpg");
+            return report;
+        }
+        finally { IsaacLock.Release(); }
+    }
+
+    /// <summary>背景把真實場景投影到 Isaac（積木、相機；手臂由 Isaac 跟隨 URSim）。立即返回。</summary>
+    public static void SyncRealScene(List<SceneObject> scene, JsonElement? camera)
+    {
+        _ = Task.Run(async () =>
+        {
+            await IsaacLock.WaitAsync();
             try
             {
-                await Post("execute_step", new { source_index = step.SourceIndex, target = step.Target, actions = step.Actions });
+                await Post("reset", new { scene, camera });
+                ReportAvailable();
             }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException($"Isaac Sim 執行 step（source_index={step.SourceIndex}）失敗：{ex.Message}");
-            }
-        }
-
-        List<SceneObject> scene;
-        try
-        {
-            var sceneJson = await Http.GetStringAsync("scene");
-            using var doc = JsonDocument.Parse(sceneJson);
-            scene = doc.RootElement.GetProperty("objects").Deserialize<List<SceneObject>>(Json) ?? new();
-        }
-        catch (Exception ex)
-        {
-            throw new InvalidOperationException("Isaac Sim 讀取模擬結果場景失敗：" + ex.Message);
-        }
-        File.WriteAllText(Path.Combine(dir, "isaac_after_scene.json"), JsonSerializer.Serialize(scene, new JsonSerializerOptions { WriteIndented = true }));
-
-        byte[]? frame = null;
-        try
-        {
-            frame = await Http.GetByteArrayAsync("frame");
-            File.WriteAllBytes(Path.Combine(dir, "isaac_after.jpg"), frame);
-        }
-        catch (Exception ex)
-        {
-            File.WriteAllText(Path.Combine(dir, "isaac_after.jpg.error.txt"), ex.Message);
-        }
-
-        return (scene, frame);
+            catch (Exception ex) { ReportUnavailable(ex); }
+            finally { IsaacLock.Release(); }
+        });
     }
 
-    static async Task Post(string path, object body)
+    static async Task SaveOverlay(string dir, byte[] realFrame)
     {
-        var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-        var resp = await Http.PostAsync(path, content);
-        if (!resp.IsSuccessStatusCode)
-            throw new InvalidOperationException($"{path} 回應 {(int)resp.StatusCode}：{await resp.Content.ReadAsStringAsync()}");
+        // 疊合檢查只用來診斷對位，失敗不影響驗證流程。
+        try
+        {
+            var content = new ByteArrayContent(realFrame);
+            content.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+            var resp = await Http.PostAsync("overlay", content);
+            resp.EnsureSuccessStatusCode();
+            File.WriteAllBytes(Path.Combine(dir, "isaac_overlay_before.jpg"), await resp.Content.ReadAsByteArrayAsync());
+        }
+        catch (Exception ex)
+        {
+            File.WriteAllText(Path.Combine(dir, "isaac_overlay_before.jpg.error.txt"), ex.Message);
+        }
     }
+
+    static async Task<byte[]?> SaveFrame(string dir, string name)
+    {
+        try
+        {
+            var frame = await Http.GetByteArrayAsync("frame");
+            File.WriteAllBytes(Path.Combine(dir, name), frame);
+            return frame;
+        }
+        catch (Exception ex)
+        {
+            File.WriteAllText(Path.Combine(dir, name + ".error.txt"), ex.Message);
+            return null;
+        }
+    }
+
+    static async Task<string> Post(string path, object body)
+    {
+        HttpResponseMessage resp;
+        try
+        {
+            var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+            resp = await Http.PostAsync(path, content);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            throw new SimulationUnavailableException($"連不到 Isaac Sim（{Http.BaseAddress}{path}）：{ex.Message}", ex);
+        }
+        var text = await resp.Content.ReadAsStringAsync();
+        if (!resp.IsSuccessStatusCode)
+            throw new SimulationUnavailableException($"Isaac Sim {path} 回應 {(int)resp.StatusCode}：{text}", null);
+        return text;
+    }
+
+    // 沒開 Isaac Sim（只跑 Unity 2D）時背景投影會一直失敗，只提示一次，恢復連線後再重新提示。
+    static void ReportUnavailable(Exception ex)
+    {
+        if (Interlocked.Exchange(ref unavailableReported, 1) == 0)
+            Console.WriteLine($"[Isaac Sim] 畫面更新失敗（沒開 isaac_sim_server 可忽略）：{ex.Message}");
+    }
+
+    static void ReportAvailable()
+    {
+        if (Interlocked.Exchange(ref unavailableReported, 0) == 1)
+            Console.WriteLine("[Isaac Sim] 已恢復連線。");
+    }
+}
+
+public sealed class VerifyReport
+{
+    public bool Pass { get; set; }
+    public List<string> Reasons { get; set; } = new();
+    public List<SceneObject> Scene { get; set; } = new();
+    public byte[]? Frame { get; set; }
+}
+
+/// <summary>Isaac Sim / URSim 不可用：屬於基礎設施錯誤，不是規劃失敗，不進 Reflection、不計成功率。</summary>
+public sealed class SimulationUnavailableException : Exception
+{
+    public SimulationUnavailableException(string message, Exception? inner) : base(message, inner) { }
 }

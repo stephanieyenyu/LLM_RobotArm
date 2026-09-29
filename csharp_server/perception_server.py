@@ -14,7 +14,8 @@ perception_server.py - 即時場景感知服務
 Endpoint：
     GET /scene         - 當下 detection JSON（含物件、QR、時間戳）
     GET /health        - 服務健康度、FPS、上次更新時間
-    GET /debug/frame   - 最新一幀原圖（JPEG，方便瀏覽器直接開起來對照）
+    GET /camera        - 相機內參 + 相機在 QR 座標系的位姿（Isaac Sim 對齊用）
+    GET /debug/frame   - 最新一幀原圖（JPEG，方便瀏覽器直接開起來對照；?raw=1 不畫標註）
 """
 
 import threading
@@ -120,6 +121,9 @@ IOU_DEDUPE_THRESHOLD = 0.5
 ROI_MIN_QRS = 3
 # 把工作區多邊形往外擴（正值）或往內縮（負值）幾個像素
 ROI_MARGIN_PX = 10
+# 偵測框面積超過工作區多邊形面積的這個比例就丟掉：這麼大不可能是手臂能抓的物件
+# （實例：YOLO 把整張有孔洞的桌面當成 keyboard，框幾乎是整個畫面，時有時無會讓任務重置檢查卡住）
+ROI_MAX_BBOX_AREA_RATIO = 0.5
 
 CUBE_SKEW_TOL_DEG = 6.0
 
@@ -571,6 +575,20 @@ def build_workspace_frame(p1, p2, p3):
     }
 
 
+def camera_pose_in_qr_frame(frame):
+    """
+    workspace frame 是「QR 座標系在相機座標系裡」的描述；反過來就是相機在 QR 座標系的位姿，
+    給 Isaac Sim 把模擬相機擺到跟 RealSense 同一個位置。
+    rotation 的三個欄 = 相機光學座標軸（x 右、y 下、z 朝前，OpenCV/ROS 慣例）在 QR 座標系的方向。
+    """
+    rotation = np.vstack([frame["x_axis"], frame["z_axis"], frame["normal"]])  # 相機座標 → QR 座標
+    position = -rotation @ frame["origin"]                                      # 相機光心在 QR 座標系的位置
+    return {
+        "position": [round(float(v), 6) for v in position],
+        "rotation": [[round(float(v), 6) for v in row] for row in rotation],
+    }
+
+
 def project_pixel_to_workspace(pixel, camera_matrix, frame, obj_top_z_m=OBJECT_HEIGHT_OFFSET_M):
     """
     像素 → 相機射線 → 「工作平面 + obj_top_z_m 高度」的平面交點 → 局部 (x, y) 座標（公尺）。
@@ -811,16 +829,18 @@ def build_workspace_polygon(qrcodes):
 
 
 def filter_by_workspace(detections, polygon):
-    """把 bbox 中心點不在 polygon 內的偵測濾掉。polygon=None 時不過濾。"""
+    """把 bbox 中心點不在 polygon 內、或 bbox 比工作區還大的偵測濾掉。polygon=None 時不過濾。"""
     if polygon is None:
         return detections
 
     poly = polygon.astype(np.float32)
+    max_bbox_area = cv2.contourArea(poly) * ROI_MAX_BBOX_AREA_RATIO
     kept = []
     for d in detections:
         cx, cy = d["center_pixel"]
         inside = cv2.pointPolygonTest(poly, (float(cx), float(cy)), False)
-        if inside >= 0:                               # 0 = 在邊上，>0 = 在內部
+        x1, y1, x2, y2 = d["bbox"]
+        if inside >= 0 and (x2 - x1) * (y2 - y1) <= max_bbox_area:   # 0 = 在邊上，>0 = 在內部
             kept.append(d)
     return kept
 
@@ -1086,6 +1106,41 @@ def endpoint_health():
     return jsonify(info)
 
 
+@app.route("/camera")
+def endpoint_camera():
+    """相機內參 + 相機在 QR 座標系的位姿（Isaac Sim 用來對齊模擬相機）。/scene 格式不變。"""
+    frame = _cached_workspace_frame
+    info = _cached_workspace_info
+    if frame is None:
+        return jsonify({"error": "workspace frame not available yet (QR1-3 not seen)"}), 503
+    intr = RS_INTRINSICS
+    intrinsics = {
+        "width": intr.width if intr is not None else CAMERA_WIDTH,
+        "height": intr.height if intr is not None else CAMERA_HEIGHT,
+        "fx": CAMERA_INTRINSICS["fx"], "fy": CAMERA_INTRINSICS["fy"],
+        "ppx": CAMERA_INTRINSICS["ppx"], "ppy": CAMERA_INTRINSICS["ppy"],
+        "model": str(intr.model) if intr is not None else "default_estimate",
+        "coeffs": [float(c) for c in intr.coeffs] if intr is not None else [0.0] * 5,
+    }
+    # 這一幀看得到的 QR 中心投影回 QR 平面（z=0），Isaac Sim 用來畫 QR1-4 範圍與桌面；被遮住的就不列
+    with state_lock:
+        qrcodes = list(latest_state["qrcodes"])
+    camera_matrix = build_camera_matrix(intrinsics["width"], intrinsics["height"])
+    qr_markers = {}
+    for qr in qrcodes:
+        pos = project_pixel_to_workspace(qr["center_pixel"], camera_matrix, frame, obj_top_z_m=0.0)
+        if pos is not None:
+            qr_markers[qr["id"]] = [pos["x"], pos["y"]]
+    return jsonify({
+        "timestamp": time.time(),
+        "intrinsics": intrinsics,
+        "pose_in_qr": camera_pose_in_qr_frame(frame),
+        "frame_source": (info or {}).get("source"),
+        "qr_markers": qr_markers,
+        "qr_size_m": QR_SIZE_M,
+    })
+
+
 @app.route("/debug/live")
 def endpoint_live():
     """HTML 頁面：每 200ms 自動重載 /debug/frame，看起來像即時影片。"""
@@ -1124,6 +1179,13 @@ def endpoint_frame():
         frame = latest_frame.copy() if latest_frame is not None else None
     if frame is None:
         return "no frame yet", 503
+
+    # ?raw=1：不畫標註，給 Isaac Sim 疊合比對用
+    if request.args.get("raw") == "1":
+        ok, buf = cv2.imencode(".jpg", frame)
+        if not ok:
+            return "encode failed", 500
+        return Response(buf.tobytes(), mimetype="image/jpeg")
 
     # 順便畫上 detection bbox 方便 debug
     with state_lock:
@@ -1174,7 +1236,8 @@ def main():
     print(f"  GET /scene/mode       - 執行狀態（idle / executing）")
     print(f"  POST /scene/mode      - 由 Unity 切換執行狀態")
     print(f"  GET /health           - FPS / 上次更新時間")
-    print(f"  GET /debug/frame      - 標好 bbox 的最新一幀 JPEG")
+    print(f"  GET /camera           - 相機內參 + 相機在 QR 座標系的位姿（Isaac Sim 對齊用）")
+    print(f"  GET /debug/frame      - 標好 bbox 的最新一幀 JPEG（?raw=1 不畫標註）")
     print()
 
     try:
