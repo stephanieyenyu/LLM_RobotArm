@@ -31,7 +31,8 @@ UR3e
 ## 檔案總覽
 
 **csharp_server/**
-- `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP
+- `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP（`/camera` 提供相機內參與位姿給 Isaac Sim）
+- `IsaacSimExecutor.cs` — 疊放規劃先送 Isaac Sim 模擬，存模擬 / 疊合截圖
 - `Program.cs` — 任務間初始配置檢查、任務內保留現況、十次嘗試與逐操作執行
 - `ExperimentLlm.cs` — 自由拆解、自然語言規劃、轉譯、獨立結果驗證及反思
 - `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
@@ -40,6 +41,10 @@ UR3e
 - `RobotPlan.cs` — plan / SceneObject 資料類別
 - `models/pliers.pt`、`yolo11n.pt` — YOLO 權重
 - `QRcode/aruco_1~4.png` — 可列印定位碼
+
+**isaac_sim/**
+- `isaac_sim_server.py` — Isaac Sim 常駐服務：真實場景 → 3D 數位孿生（積木、相機、手臂關節）+ UR3e 抓放模擬
+- `sync_check.py` — 把目前真實場景投影到 Isaac Sim，輸出疊合圖檢查對位
 
 **unity_project/Assets/Scripts/**
 - `UIManager.cs` — 指令輸入 UI、監看計畫更新
@@ -76,6 +81,56 @@ dotnet run
 
 **Debug**：瀏覽器 `http://localhost:5000/debug/live` 看即時偵測畫面。
 
+## 3D 疊放驗證：URSim + Isaac Sim
+
+- **2D 平面移動**：照舊，Unity 模擬預覽驗證後直接送實體手臂。
+- **3D 疊放**（任一步的目標壓在另一塊積木上，或比來源高出半層）：
+  1. csharp_server 把真實場景投影到 Isaac Sim（積木、相機、桌面與 QR1-4 範圍）。
+  2. 整輪步驟以 `robot_target = "ursim"` 交給 Unity，Unity 用同一套關節軌跡只在 **URSim** 執行，實體手臂不動。
+  3. Isaac Sim 的手臂即時跟隨 URSim（唯讀埠 30013 的關節角 + DO4 夾爪），積木用物理模擬被夾起、放下。
+  4. URSim 跑完，Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定度、指尖是否低於桌面），
+     再由 LLM 看模擬畫面；都通過才逐步送實體手臂。不通過就算這次嘗試失敗、進 Reflection。
+
+Isaac Sim 不連實體手臂。URSim / Isaac 無法使用時記為 `infrastructure_error`（不計成功率）。
+
+**3D 分層夾取（只有 3D 批次）**：3D 的每一批（URSim 與通過後的實機）帶 `layered_grasp`，每一步帶
+`source_top_m` / `target_top_m`。descend 時指尖停在積木真實頂面下 19 mm（離下層 6 mm），取代 2D 用的
+「感知頂面 + Z_CORRECTION」。真實頂面由 `csharp_server/LayeredHeights.cs` 依場景結構算：
+- 佔地跟目標重疊的積木就是支撐，放置高度至少是最高支撐 + 1 層；同一批前面步驟放下的積木也算。
+- 感知 z 對齊 2.5 cm 層高，只當作下限參考（黑色積木的感知 z 在桌面上實測偏差 −32～+3 mm，超過一層）。
+- LLM 的 target.z 只能把放開高度往上調，不會讓夾爪壓進支撐。
+- 目前不支援從疊好的積木中間抽出。
+
+這時 Unity 的碰撞模型只在 3D 批次把手指段改成「指尖在桌面上方 3 mm」的檢查，前提是實體手指至少 30 mm 長。
+2D 批次不帶這些欄位，送給 Unity 的 JSON 跟以前逐字相同，計算也完全相同。
+層高與夾取深度的數字在 `unity_project/Assets/Scripts/LayeredGraspGeometry.cs`，Unity 與 csharp_server 共用；
+Isaac 的投影用同規則的 `isaac_sim/block_layers.py`。
+
+**Terminal 3**（Isaac Sim，第一次啟動約 1 分鐘）：
+```powershell
+D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui
+```
+Unity Inspector 的 JsonExecutor 多一個 `Ursim IP`（預設 192.168.50.221）。Isaac Sim 在別台電腦時，
+csharp_server 那邊 `setx ISAAC_SIM_URL "http://<IP>:6000/"`。
+
+必須跟 Unity 一致的參數：`--qr1`（JsonExecutor.cs QR1_X/Y/Z）、`--gripper_do`（夾爪 DO 編號）、
+`--ready_q`（Inspector 的 Ready Joints Rad；URSim 到 Ready 之後才開始記錄指尖最低點，之前 URSim 從上一次停留的
+姿勢移過來的過程不算）、`--layer_snap_offset`（LayeredGraspGeometry.cs LayerSnapOffsetM）。
+驗證報告的物件 z 維持 perception 慣例：每塊積木加回投影時自己的量測偏差，沒動過的積木回報值跟輸入相同。
+`--fingertip_m`（預設 0.123）是實體夾爪法蘭面 → 指尖的實測距離；夾爪 3D 模型是 179 mm，啟動時整支夾爪
+（手指 + 本體）往法蘭移到這個長度。換夾爪或手指時要重新量。
+UR 基座 → Isaac 世界在啟動時用 FK 自動校正（本資產實測差 180°）；`GET /status` 看是否跟上 URSim。
+
+每次 3D 驗證的紀錄在 `attempt_XX/isaac_sim/`：`ursim_batch.json`、`ursim_execution.json`、
+`isaac_verify.json`（每項檢查的結果）、`isaac_before.jpg`、`isaac_after.jpg`、`isaac_overlay_before.jpg`。
+
+**對位檢查**（perception 與 Isaac Sim 都啟動後）：
+```powershell
+csharp_server\yolo11_env\Scripts\python.exe isaac_sim\sync_check.py
+```
+輸出 `isaac_sim/sync_check_output/overlay.jpg`（真實 / 模擬半透明疊合）。積木整片平移 → QR1 偏移不準；
+旋轉或越遠越偏 → 相機位姿 / 內參。
+
 ## 指令範例
 
 - 「排 H」
@@ -96,7 +151,7 @@ QR：QR1-4（ArUco Dict4X4_50）
 `unity_project/Assets/Scripts/JsonExecutor.cs` 頂部三個常數：
 ```csharp
 QR1_X, QR1_Y, QR1_Z   // Teach Pendant 手動 jog TCP 到 QR1 上方 5cm 讀值，Z 減 0.05 填入
-Z_CORRECTION = 0.02f  // 補償 depth 系統性偏低
+Z_CORRECTION = 0.02f  // 2D：descend 時 TCP 停在感知頂面上方這個距離（3D 改用分層夾取，見上）
 SAFE_Z_OFFSET = 0.08f // 抓取前後在物件上方留 8cm 安全空間
 ```
 換場地或重貼 QRCode 一定要重新量測。

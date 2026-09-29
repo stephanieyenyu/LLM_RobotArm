@@ -80,3 +80,6 @@ unity_project/Assets/StreamingAssets/step_done.json*
 unity_project/Assets/StreamingAssets/verification_enabled.txt*
 unity_project/Assets/StreamingAssets/skip_pattern_review.txt*
 unity_project/Assets/StreamingAssets/sim_check.json*
+
+# Isaac Sim 對位檢查輸出
+isaac_sim/sync_check_output/

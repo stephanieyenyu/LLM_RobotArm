@@ -24,7 +24,7 @@ while (true)
     Directory.CreateDirectory(run);
     File.WriteAllText(Path.Combine(run, "task.txt"), goal);
     Save(run, "config.json", new { model, max_attempts = 10, reset_between_tasks = true,
-        reset_within_task = false, reset_xy_m = 0.015, reset_z_m = 0.01,
+        reset_within_task = false, reset_xy_m = ExperimentChecks.ResetXYToleranceM, reset_z_m = ExperimentChecks.ResetZToleranceM,
         rule_scope = "task", evaluation = "independent_visual_model", started_utc = DateTime.UtcNow });
     bool success = false;
     bool executionPending = false;
@@ -51,11 +51,18 @@ while (true)
             resetWaitSeconds++;
             if (resetWaitSeconds % 15 == 0)
             {
-                string expectedSummary = SceneInventory(baseline ?? previous ?? new List<SceneObject>());
-                string actualSummary = SceneInventory(initial);
                 Console.WriteLine($"[任務重置] 仍在等待初始桌面，已等待 {resetWaitSeconds} 秒（無逾時限制）。");
-                Console.WriteLine($"             基準：{expectedSummary}");
-                Console.WriteLine($"             目前：{actualSummary}");
+                if (expected == null || initial.Count == 0)
+                {
+                    Console.WriteLine($"             目前：{SceneInventory(initial)}");
+                    continue;
+                }
+                // 還沒有基準時是在等連續幾幀穩定，比的是上一幀
+                Console.WriteLine(baseline != null
+                    ? $"             基準：{SceneInventory(baseline)}；目前：{SceneInventory(initial)}"
+                    : "             建立基準中，跟上一幀比：");
+                foreach (var line in ExperimentChecks.DescribeMismatch(expected, initial))
+                    Console.WriteLine($"             {line}");
             }
         }
         if (baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
@@ -66,61 +73,133 @@ while (true)
             var dir = Path.Combine(run, $"attempt_{attempt:00}");
             Directory.CreateDirectory(dir);
             Console.WriteLine($"[實驗] 第 {attempt}/10 次規劃，保留目前場景。");
-            string failure = "", plan = "";
+            string failure = "", plan = "", translationText = "（沒有產生轉譯結果）";
             var local = new List<VerifyResult>();
+            var isaacDir = Path.Combine(dir, "isaac_sim");
+            JsonElement? camera = null;
+            // 系統實際走過的流程，給下一輪規劃與反思當觀測事實；沒有記在這裡的步驟都沒有發生。
+            var trace = new List<string>();
+            string stage = "觀測場景";
+            int robotOperations = 0;
             try
             {
                 var before = await Scene();
                 if (before.Count == 0) throw new SceneUnavailableException("沒有有效場景觀測。");
                 Save(dir, "before_scene.json", before);
                 var image = await Frame(dir, "before.jpg");
+                camera = await CameraInfo();
+                // 收到指令就先把目前真實場景投影到 Isaac Sim（背景），不必等 LLM 規劃完才看得到積木。
+                IsaacSimExecutor.SyncRealScene(before, camera);
+                trace.Add($"觀測到 {before.Count} 個物件");
+                stage = "拆解子任務";
                 var hierarchy = await llm.Decompose(goal, before, rules, feedback, image, dir);
+                stage = "操作規劃";
                 plan = await llm.Plan(goal, before, hierarchy, rules, feedback, image, dir);
+                stage = "轉譯成執行資料";
                 var translated = await llm.Translate(plan, before, dir);
                 Save(dir, "translated_plan.json", translated);
+                translationText = JsonSerializer.Serialize(translated,
+                    new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
                 // A task attempt starts only after the internal adapter has
                 // produced a readable contract. Adapter failures are not task
                 // reasoning failures and never enter reflection.
                 attempts = attempt;
                 if (!string.IsNullOrWhiteSpace(translated.Error)) throw new InvalidOperationException("轉譯失敗：" + translated.Error);
                 if (translated.Steps == null || translated.Steps.Count > 50) throw new InvalidOperationException("執行資料無效或超過單次 50 步上限。");
-                // 疊放檢查：規劃裡有目標不是貼桌面（疊在別的積木上）才跑，先在
-                // Isaac Sim 完整模擬這輪所有步驟（真的模擬 UR3e 抓放動作，不是
-                // 瞬間擺放），用模擬相機 + llm.Validate 判斷 PASS/FAIL（跟下面
-                // 判斷真實執行結果同一套邏輯），不通過就直接算這次 attempt 失敗、
-                // 不送真實手臂，走跟其他失敗一樣的路徑進 Reflect 產生下一輪教訓。
-                // 存檔另開子資料夾，避免跟下面真實執行後的 llm.Validate 存檔撞名。
-                if (IsaacSimExecutor.RequiresCheck(translated.Steps))
+                trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
+                // 3D 疊放：整輪步驟先交給 Unity 在 URSim 執行（robot_target = "ursim"），Isaac Sim 的手臂
+                // 即時跟隨 URSim、積木用物理模擬；URSim 跑完由 Isaac 做幾何檢查，再讓 LLM 看模擬畫面，
+                // 都通過才進下面的逐步實機執行。不通過就算這次 attempt 失敗、實機完全不動，照常進 Reflect。
+                // 2D 平面移動不經過這裡，照舊由 Unity 的模擬預覽驗證。存檔另開子資料夾，避免跟實機結果撞名。
+                // 3D 的每一批（URSim 與之後的實機）都帶 layered_grasp：Unity 用分層夾取深度，實機執行的就是
+                // Isaac 驗證過的同一套深度；2D 批次不帶這個欄位，Unity 照舊。
+                bool stacked3d = IsaacSimExecutor.RequiresCheck(translated.Steps, before);
+                if (stacked3d)
                 {
-                    var isaacDir = Path.Combine(dir, "isaac_sim");
+                    trace.Add("判定為 3D 疊放，先在 URSim 執行並由 Isaac Sim 驗證");
                     Directory.CreateDirectory(isaacDir);
-                    var (isaacScene, isaacFrame) = await IsaacSimExecutor.SimulateAsync(before, translated.Steps, isaacDir);
-                    var isaacVerdict = await llm.Validate(goal, before, isaacScene, isaacFrame, isaacDir);
+                    var ursimSteps = new List<StepEnvelope>();
+                    var heights = LayeredHeights.ForSteps(translated.Steps, before);
+                    for (int k = 0; k < translated.Steps.Count; k++)
+                    {
+                        var step = translated.Steps[k];
+                        stage = $"送 URSim 前第 {k + 1} 個操作的執行前檢查";
+                        if (!ExperimentChecks.Resolve(step, before, before, out var planned, out var error))
+                            throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
+                        planned.StepId = ++stepId;
+                        if (!MotionPlanValidator.TryValidate(new MotionPlan { ActionSequence = step.Actions, Reasoning = plan }, planned, before, out error))
+                            throw new InvalidOperationException($"第 {k + 1} 個操作執行前檢查：{error}");
+                        ursimSteps.Add(new StepEnvelope { StepId = planned.StepId, SourcePosition = planned.Source,
+                            TargetPosition = step.Target, ActionSequence = step.Actions, Comment = "3D 疊放 URSim 驗證",
+                            SourceTopM = heights[k].SourceTopM, TargetTopM = heights[k].TargetTopM });
+                    }
+                    Console.WriteLine($"[Isaac Sim] 3D 疊放：{ursimSteps.Count} 步先在 URSim 執行，Isaac Sim 跟隨驗證。");
+                    stage = "URSim 執行";
+                    await IsaacSimExecutor.BeginVerifyAsync(before, translated.Steps, camera, image, isaacDir);
+                    int ursimBatchId = ++stepId;
+                    var ursimBatch = new BatchEnvelope { BatchId = ursimBatchId, Steps = ursimSteps,
+                        Comment = "3D 疊放 URSim 驗證", RobotTarget = "ursim", LayeredGrasp = true };
+                    Save(isaacDir, "ursim_batch.json", ursimBatch);
+                    AtomicWrite(Path.Combine(assets, "current_step.json"), ursimBatch);
+                    var ursimExecution = await Wait(ursimBatchId);
+                    Save(isaacDir, "ursim_execution.json", ursimExecution);
+                    if (ursimExecution == null || !ursimExecution.Completed)
+                    {
+                        string reason = ursimExecution?.Error ?? "沒有回報原因";
+                        if (reason.Contains("未連線") || reason.Contains("未設定")) throw new SimulationUnavailableException("URSim 無法使用：" + reason, null);
+                        throw new InvalidOperationException("URSim 執行失敗（實機未動）：" + reason);
+                    }
+                    trace.Add("URSim 執行完成");
+                    stage = "Isaac Sim 幾何驗證";
+                    var report = await IsaacSimExecutor.EndVerifyAsync(isaacDir);
+                    if (!report.Pass)
+                        throw new InvalidOperationException("Isaac Sim 驗證未通過（實機未動）：" + string.Join("；", report.Reasons));
+                    trace.Add("Isaac Sim 幾何驗證通過");
+                    stage = "Isaac Sim 模擬畫面判定";
+                    var isaacVerdict = await llm.Validate(goal, before, report.Scene, report.Frame, isaacDir);
                     if (isaacVerdict.Split('\n')[0].Trim() != "PASS")
-                        throw new InvalidOperationException("Isaac Sim 模擬：" + isaacVerdict);
+                        throw new InvalidOperationException("Isaac Sim 模擬畫面判定未通過（實機未動）：" + isaacVerdict);
+                    trace.Add("Isaac Sim 模擬畫面判定通過");
+                    Console.WriteLine("[Isaac Sim] 3D 驗證通過，開始送實體手臂。");
                 }
-                foreach (var step in translated.Steps)
+                for (int k = 0; k < translated.Steps.Count; k++)
                 {
+                    var step = translated.Steps[k];
+                    stage = $"第 {k + 1} 個操作的執行前檢查";
                     var current = await Scene();
-                    if (!ExperimentChecks.Resolve(step, before, current, out var assignment, out var error)) throw new InvalidOperationException(error);
+                    if (!ExperimentChecks.Resolve(step, before, current, out var assignment, out var error))
+                        throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
                     assignment.StepId = ++stepId;
                     var motion = new MotionPlan { ActionSequence = step.Actions, Reasoning = plan };
-                    if (!MotionPlanValidator.TryValidate(motion, assignment, current, out error)) throw new InvalidOperationException("執行前檢查：" + error);
+                    if (!MotionPlanValidator.TryValidate(motion, assignment, current, out error))
+                        throw new InvalidOperationException($"第 {k + 1} 個操作執行前檢查：{error}");
+                    stage = $"第 {k + 1} 個操作在實體手臂執行";
                     var env = new StepEnvelope { StepId = assignment.StepId, SourcePosition = assignment.Source,
                         TargetPosition = step.Target, ActionSequence = step.Actions, Comment = "自由規劃實驗" };
+                    if (stacked3d)
+                    {
+                        // 用這一步開始前重新觀測的場景算高度（前面的實機步驟已經改變了場景）
+                        var observed = new TranslatedStep { SourceIndex = current.IndexOf(assignment.Source!),
+                            Target = step.Target, Actions = step.Actions };
+                        (env.SourceTopM, env.TargetTopM) = LayeredHeights.ForSteps(new[] { observed }, current)[0];
+                    }
                     Save(dir, $"step_{stepId}.json", env);
                     int batchId = ++stepId;
                     // Use the existing batch entry point even for one operation:
                     // it prepares shared trajectories and honors preview-only.
                     AtomicWrite(Path.Combine(assets, "current_step.json"), new BatchEnvelope {
-                        BatchId = batchId, Steps = new List<StepEnvelope> { env }, Comment = env.Comment
+                        BatchId = batchId, Steps = new List<StepEnvelope> { env }, Comment = env.Comment,
+                        LayeredGrasp = stacked3d
                     });
                     executionPending = true;
                     var execution = await Wait(batchId);
                     if (execution != null) executionPending = false;
                     Save(dir, $"execution_{stepId}.json", execution);
                     if (execution == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
-                    if (!execution.Completed) throw new InvalidOperationException(execution.Error ?? "執行失敗");
+                    if (!execution.Completed) throw new InvalidOperationException($"第 {k + 1} 個操作執行失敗：{execution.Error ?? "沒有回報原因"}");
+                    robotOperations++;
+                    trace.Add($"第 {k + 1} 個操作實體手臂執行完成");
+                    stage = $"第 {k + 1} 個操作的局部驗證";
                     await Task.Delay(1200);
                     var afterStep = await Scene();
                     var outcome = ClassifyOutcome(step.Actions);
@@ -134,20 +213,24 @@ while (true)
                     local.Add(check);
                     Save(dir, $"after_step_{stepId}.json", afterStep);
                     Save(dir, "local_validation.json", local);
-                    if (check.OverallStatus != "ok") throw new InvalidOperationException("局部驗證：" + check.Note);
+                    if (check.OverallStatus != "ok") throw new InvalidOperationException($"第 {k + 1} 個操作局部驗證：{check.Note}");
+                    trace.Add($"第 {k + 1} 個操作局部驗證通過");
                 }
             }
             catch (ExecutionUnknownException) { throw; }
-            catch (InvalidOperationException ex) { failure = ex.Message; }
+            catch (InvalidOperationException ex) { failure = ex.Message; trace.Add($"在「{stage}」停止"); }
+            trace.Add($"實體手臂完整執行了 {robotOperations} 個操作");
             var after = await Scene();
             Save(dir, "after_scene.json", after);
+            // 跟 Unity SceneSyncer 執行後刷新場景對應：把這次嘗試的真實結果投影回 Isaac Sim（背景）。
+            IsaacSimExecutor.SyncRealScene(after, camera);
             var afterImage = await Frame(dir, "after.jpg");
             var verdict = await llm.Validate(goal, initial, after, afterImage, dir);
-            feedback = $"執行／局部觀察：{failure}\n整體觀察：{verdict}";
+            feedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n執行／局部觀察：{failure}\n整體觀察：{verdict}";
             File.WriteAllText(Path.Combine(dir, "feedback.txt"), feedback);
             success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
             if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
-            var reflection = await llm.Reflect(goal, plan, feedback, rules, dir);
+            var reflection = await llm.Reflect(goal, plan, translationText, feedback, rules, dir);
             File.WriteAllText(Path.Combine(dir, "rules_for_next_attempt.txt"), reflection);
             if (reflection.Split('\n')[0].Trim() == "GIVE_UP")
             {
@@ -203,6 +286,20 @@ async Task<byte[]?> Frame(string dir, string name)
     {
         File.WriteAllText(Path.Combine(dir, name + ".error.txt"), ex.Message);
         throw new SceneUnavailableException("相機影像不可取得，不能作為任務失敗進行 Reflection。");
+    }
+}
+// 相機內參與位姿只用來對齊 Isaac Sim 的模擬相機；取不到時模擬端沿用上次的相機，不中斷實驗。
+async Task<JsonElement?> CameraInfo()
+{
+    try
+    {
+        using var doc = JsonDocument.Parse(await http.GetStringAsync("camera"));
+        return doc.RootElement.Clone();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Isaac Sim] 取不到 perception /camera，模擬相機沿用上次位置：{ex.Message}");
+        return null;
     }
 }
 async Task<ExecutionResult?> Wait(int id)

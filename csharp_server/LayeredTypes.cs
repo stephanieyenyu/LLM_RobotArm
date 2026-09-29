@@ -141,6 +141,16 @@ public class StepEnvelope
 
     [JsonPropertyName("action_sequence")]
     public List<RobotFunctionCall> ActionSequence { get; set; } = new();
+
+    // 只有 3D 疊放批次（BatchEnvelope.LayeredGrasp）才填：來源積木頂面、放好後頂面的真實高度（公尺，
+    // LayeredHeights 依場景結構算出）。0 = 沒填、不寫出欄位，2D 批次的 JSON 不變。
+    [JsonPropertyName("source_top_m")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public double SourceTopM { get; set; }
+
+    [JsonPropertyName("target_top_m")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public double TargetTopM { get; set; }
 }
 
 /// <summary>
@@ -160,6 +170,18 @@ public class BatchEnvelope
 
     [JsonPropertyName("steps")]
     public List<StepEnvelope> Steps { get; set; } = new();
+
+    // 這一批送到哪台手臂："ursim" = 只在 URSim 執行（3D 疊放的 Isaac Sim 驗證用）；
+    // 空字串 / 沒有這個欄位 = 真實手臂（舊版 Unity 讀不到也是實機，行為不變）。
+    [JsonPropertyName("robot_target")]
+    public string RobotTarget { get; set; } = "";
+
+    // 3D 疊放的批次（URSim 驗證與通過後的實機執行）才設 true：Unity 的 descend 改成積木頂面對齊
+    // 2.5 cm 層高、指尖停在頂面下 19 mm。false 時不寫出這個欄位，2D 批次送給 Unity 的 JSON
+    // 跟加欄位前逐字相同；舊版 Unity 讀不到時也是 false，行為不變。
+    [JsonPropertyName("layered_grasp")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool LayeredGrasp { get; set; }
 
     // 這一批是否關閉「模擬結束比對 bitmap」（對照組）。欄位名刻意用 disabled：Unity 讀不到
     // 這個欄位時預設 false，等於驗證開啟，版本不同步時不會默默變成對照組。

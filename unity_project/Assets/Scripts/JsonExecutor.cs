@@ -43,6 +43,10 @@ public class StepEnvelope
     public NamedPosition target_position;
     public string comment;
     public List<RobotFunctionCall> action_sequence;
+    // 只有 layered_grasp 批次才有：來源積木頂面、放好後頂面的真實高度（QR 座標公尺，csharp_server
+    // LayeredHeights 依場景結構算、已對齊 2.5 cm 層高）。2D 批次沒有這兩個欄位，讀成 0、也不會用到。
+    public float source_top_m;
+    public float target_top_m;
 }
 
 [System.Serializable]
@@ -60,6 +64,12 @@ public class BatchEnvelope
     public List<string> bitmap;
     public List<ExpectedCell> expected_cells;
     public float cell_size_m;
+    // "ursim" = 這批只在 URSim 執行（csharp_server 的 3D 疊放 Isaac Sim 驗證），實體手臂不動；
+    // 空字串 = 實體手臂（舊版 server 沒送這個欄位時 JsonUtility 讀成 null，也是實機，行為不變）。
+    public string robot_target;
+    // true = 3D 疊放批次（URSim 驗證與通過後的實機）：descend 改用 LayeredGraspGeometry 的分層夾取深度，
+    // 碰撞模型的手指段只檢查指尖。2D 批次不送這個欄位，JsonUtility 讀成 false，所有計算跟加欄位前相同。
+    public bool layered_grasp;
 }
 
 // bitmap 裡一個應該放積木的物件（cube 佔一格，domino 佔兩格），QR frame 座標
@@ -119,6 +129,8 @@ public class JsonExecutor : MonoBehaviour
     public string currentStepFile = "current_step.json";
     public string stepDoneFile = "step_done.json";
     public string urIP = "192.168.50.204";
+    [Tooltip("URSim（Oracle VirtualBox）的 IP。robot_target = \"ursim\" 的批次（3D 疊放的 Isaac Sim 驗證）只送到這台，實體手臂不動。")]
+    public string ursimIP = "192.168.50.221";
     public float pollIntervalSec = 0.3f;
 
     [Header("Perception Server")]
@@ -272,6 +284,9 @@ public class JsonExecutor : MonoBehaviour
     private const string HOME_MOVEJ_CMD = "movej([-1.5708, -1.5708, 0, -1.5708, 0, 0], a=1.2, v=0.8)";
 
     private URPackageListener urListener;
+    // robot_target = "ursim" 的批次執行期間，urListener 暫時換成 URSim 連線，實機連線先存在這裡，跑完換回
+    private URPackageListener ursimListener;
+    private URPackageListener parkedRealListener;
     private int lastExecutedStepId = -1;
     // C# step IDs restart when dotnet run is restarted while Unity may remain in
     // the same Play Mode. Deduplicate by the complete JSON payload instead of
@@ -300,6 +315,10 @@ public class JsonExecutor : MonoBehaviour
         new Dictionary<int, List<PlannedJointAction>>();
     private readonly List<double[]> sharedFinalTrajectory = new List<double[]>();
     private double[] sharedTrajectoryStartQ;
+    // 只在規劃 layered_grasp 批次的共用軌跡期間為 true（BuildSharedTrajectory 結束一定還原）
+    private bool layeredCollisionModel;
+    // 跟 go_home 的關節目標相同（手臂直立，腕與肘都在奇異點上）
+    static readonly double[] GoHomeJointsRad = { -1.5708, -1.5708, 0.0, -1.5708, 0.0, 0.0 };
 
     // ---- 一鍵開關（實驗組 / 對照組）----
     // 由每一批的 BatchEnvelope.verification_disabled 決定，整批用同一個值。
@@ -405,6 +424,8 @@ public class JsonExecutor : MonoBehaviour
     void OnDestroy()
     {
         urListener?.Close();
+        if (ursimListener != null && ursimListener != urListener) ursimListener.Close();
+        if (parkedRealListener != null && parkedRealListener != urListener) parkedRealListener.Close();
         if (activeInstance == this) activeInstance = null;
     }
 
@@ -519,11 +540,37 @@ public class JsonExecutor : MonoBehaviour
                     continue;
                 }
 
+                // 3D 疊放驗證：整批用同一套執行流程，但連線換成 URSim；跑完一定換回實機連線
+                bool onUrsim = batch.robot_target == "ursim";
+                if (onUrsim)
+                {
+                    if (string.IsNullOrWhiteSpace(ursimIP))
+                    {
+                        WriteStepDone(batch.batch_id, false, "URSim 未設定 IP（Inspector 的 Ursim IP），3D 疊放無法驗證", 0f);
+                        continue;
+                    }
+                    if (ursimListener == null)
+                    {
+                        ursimListener = new URPackageListener();
+                        ursimListener.Connect(ursimIP);
+                        Debug.Log("嘗試連線至 URSim：" + ursimIP);
+                    }
+                    Debug.Log($"[Executor] batch {batch.batch_id} 只在 URSim（{ursimIP}）執行，給 Isaac Sim 做 3D 驗證；實體手臂不動");
+                    parkedRealListener = urListener;
+                    urListener = ursimListener;
+                }
+
                 executionEpoch++;
                 currentStepCoroutine = StartCoroutine(ExecuteBatch(batch));
                 yield return currentStepCoroutine;
                 currentStepCoroutine = null;
                 currentStepId = -1;
+                if (onUrsim)
+                {
+                    urListener = parkedRealListener;
+                    parkedRealListener = null;
+                    Debug.Log($"[Executor] batch {batch.batch_id} URSim 執行結束，連線換回實體手臂（{urIP}）");
+                }
                 continue;
             }
 
@@ -584,6 +631,16 @@ public class JsonExecutor : MonoBehaviour
                 "只預覽模式需要開啟共用關節軌跡", 0f);
             yield break;
         }
+        // 分層夾取深度只實作在共用關節軌跡；關閉時不能默默改用舊深度執行 3D 批次
+        if (batch.layered_grasp && !useSharedMovejTrajectory)
+        {
+            WriteStepDone(batch.batch_id, false,
+                "3D 分層夾取需要開啟共用關節軌跡（Use Shared Movej Trajectory）", 0f);
+            yield break;
+        }
+        if (batch.layered_grasp)
+            Debug.Log($"[Executor] batch {batch.batch_id}：3D 分層夾取（指尖停在積木真實頂面下 " +
+                      $"{LayeredGraspGeometry.GraspDepthBelowTopM * 1000:F0} mm，頂面高度由 csharp_server 依場景結構算）");
 
         verificationEnabled = !batch.verification_disabled;
         ResetSimPlacementTracking();
@@ -1015,6 +1072,21 @@ public class JsonExecutor : MonoBehaviour
     bool BuildSharedTrajectory(BatchEnvelope batch, double[] startQ,
         bool reverseTopLeftCube, out string error)
     {
+        // 3D 分層夾取的批次，規劃期間碰撞模型的手指段改用指尖檢查（見 ValidateApproximateRobotCollision）
+        layeredCollisionModel = batch.layered_grasp;
+        try
+        {
+            return BuildSharedTrajectoryCore(batch, startQ, reverseTopLeftCube, out error);
+        }
+        finally
+        {
+            layeredCollisionModel = false;
+        }
+    }
+
+    bool BuildSharedTrajectoryCore(BatchEnvelope batch, double[] startQ,
+        bool reverseTopLeftCube, out string error)
+    {
         sharedTrajectory.Clear();
         sharedFinalTrajectory.Clear();
         sharedTrajectoryStartQ = (double[])startQ.Clone();
@@ -1028,6 +1100,11 @@ public class JsonExecutor : MonoBehaviour
             if (env.action_sequence == null)
             {
                 error = $"第 {env.step_id} 步沒有 action_sequence";
+                return false;
+            }
+            if (batch.layered_grasp && (env.source_top_m <= 0f || env.target_top_m <= 0f))
+            {
+                error = $"第 {env.step_id} 步是 3D 分層夾取，但缺少積木頂面高度（source_top_m / target_top_m）";
                 return false;
             }
 
@@ -1071,6 +1148,11 @@ public class JsonExecutor : MonoBehaviour
                 }
                 else if (action.function == "descend")
                 {
+                    // 3D 疊放：指尖停在積木真實頂面（csharp_server 算好的層高）下 19 mm，
+                    // 取代「感知頂面 + Z_CORRECTION」；2D 不進這裡
+                    if (batch.layered_grasp)
+                        z = QR1_Z + (source ? env.source_top_m : env.target_top_m)
+                            - (float)LayeredGraspGeometry.GraspDepthBelowTopM;
                     if (!source && holding) z += Mathf.Max(0f, placeDescendExtraZ);
                     if (!PlanValidatedDescent(pa, ref reference, x, y, z, orientation, out error))
                     {
@@ -1112,6 +1194,15 @@ public class JsonExecutor : MonoBehaviour
             return true;
         }
 
+        // 最後一個手臂動作是 go_home：手臂已經在 Home，收尾的 Ready → Home 省略。
+        // 不省略的話，從 Home（腕、肘奇異點）出發的收尾路徑在 0% 處一定被關節檢查擋下，整批退回。
+        if (IsGoHomeJoints(reference))
+        {
+            error = null;
+            Debug.Log($"[Executor-shared] Batch already ends at Home via go_home; final Ready/Home omitted.");
+            return true;
+        }
+
         // The old executor returned through Ready and Home after the batch. Plan
         // and validate that return too so preview and hardware end with the same
         // motions rather than appending unpreviewed commands.
@@ -1146,6 +1237,13 @@ public class JsonExecutor : MonoBehaviour
 
         error = null;
         Debug.Log($"[Executor-shared] Built and collision-checked shared movej trajectory for {sharedTrajectory.Count} steps.");
+        return true;
+    }
+
+    static bool IsGoHomeJoints(double[] q)
+    {
+        for (int i = 0; i < 6; i++)
+            if (System.Math.Abs(q[i] - GoHomeJointsRad[i]) > 1e-9) return false;
         return true;
     }
 
@@ -1238,7 +1336,7 @@ public class JsonExecutor : MonoBehaviour
 
     // 模擬夾取：只夾得到夾爪正下方的方塊。descend 之後 TCP 在方塊頂面上方 contactClearanceM。
     // 夾不到就回傳 null —— 動畫照演，但沒有方塊被搬走，比對時就會出現「少放」。
-    GameObject SimGrasp(float contactClearanceM, string label)
+    GameObject SimGrasp(float contactClearanceM, string label, bool snapTopsToLayers = false)
     {
         if (!CanReadSimTcp())
         {
@@ -1254,9 +1352,11 @@ public class JsonExecutor : MonoBehaviour
         {
             if (block == null || SimBlock(block).held) continue;
             Vector3 qr = BlockQR(block);
+            // 預覽積木的頂面是 perception 量測值（偏低）；分層夾取時跟實機一樣先對齊層高
+            float top = snapTopsToLayers ? (float)LayeredGraspGeometry.SnapTopToLayer(qr.z) : qr.z;
             float d = Vector2.Distance(new Vector2(qr.x, qr.y), new Vector2(tcp.x, tcp.y));
-            if (d > simGraspToleranceM || Mathf.Abs(qr.z - expectedTop) > bitmapZToleranceM) continue;
-            if (d < bestDistance) { bestDistance = d; best = block; bestTop = qr.z; }
+            if (d > simGraspToleranceM || Mathf.Abs(top - expectedTop) > bitmapZToleranceM) continue;
+            if (d < bestDistance) { bestDistance = d; best = block; bestTop = top; }
         }
         if (best == null)
         {
@@ -1795,7 +1895,19 @@ public class JsonExecutor : MonoBehaviour
         // after the upper arm against the tabletop with conservative radii.
         for (int segment = 2; segment < 6; segment++)
         {
-            float minZ = (float)System.Math.Min(p[segment][2], p[segment + 1][2]) - radii[segment];
+            double[] segmentEnd = p[segment + 1];
+            if (layeredCollisionModel && segment == 5)
+            {
+                // 3D 分層夾取：手指段只要求指尖在桌面上方，夾爪本體的圓柱量到手指根部為止
+                double tipZ = p[6][2];
+                if (tipZ < tableZ + LayeredGraspGeometry.FingertipTableClearanceM)
+                {
+                    error = $"指尖低於桌面上方 {LayeredGraspGeometry.FingertipTableClearanceM * 1000:F0} mm（z={tipZ:F3}m）";
+                    return false;
+                }
+                segmentEnd = LayeredGraspGeometry.FingerRoot(p[5], p[6]);
+            }
+            float minZ = (float)System.Math.Min(p[segment][2], segmentEnd[2]) - radii[segment];
             if (minZ < tableZ - 0.005f)
             {
                 error = $"第 {segment} 段連桿撞到桌面（z={minZ:F3}m）";
@@ -2178,7 +2290,7 @@ public class JsonExecutor : MonoBehaviour
                 env.source_position == null || env.target_position == null)
                 continue;
             if (useSharedMovejTrajectory)
-                yield return AnimateSharedTrajectoryStep(env, "preview");
+                yield return AnimateSharedTrajectoryStep(env, "preview", batch.layered_grasp);
             else
                 yield return AnimateOneStep(env, "preview");
         }
@@ -2216,7 +2328,7 @@ public class JsonExecutor : MonoBehaviour
         Debug.Log($"[Executor-preview] 動畫預覽結束，已復原場景。實機開始執行");
     }
 
-    IEnumerator AnimateSharedTrajectoryStep(StepEnvelope env, string tag)
+    IEnumerator AnimateSharedTrajectoryStep(StepEnvelope env, string tag, bool layeredGrasp = false)
     {
         if (!sharedTrajectory.TryGetValue(env.step_id, out var actions)) yield break;
         // 預覽只用相機實際看到的方塊，不補生。source 附近沒有方塊就照演手臂動作，
@@ -2245,7 +2357,11 @@ public class JsonExecutor : MonoBehaviour
             {
                 if (previewGripper != null) previewGripper.SetPreviewGrip(true);
                 // 只夾得到夾爪正下方的方塊；夾不到就什麼都不搬（比對時會變成少放）
-                var grabbed = SimGrasp(Z_CORRECTION, $"{stepLabel} action {i + 1} grasp");
+                // 3D 分層夾取：指尖在頂面下方，積木頂面先對齊層高再比（跟規劃用同一套幾何）
+                var grabbed = layeredGrasp
+                    ? SimGrasp(-(float)LayeredGraspGeometry.GraspDepthBelowTopM, $"{stepLabel} action {i + 1} grasp",
+                        snapTopsToLayers: true)
+                    : SimGrasp(Z_CORRECTION, $"{stepLabel} action {i + 1} grasp");
                 if (grabbed != null)
                 {
                     held = grabbed;

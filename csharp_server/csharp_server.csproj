@@ -16,4 +16,9 @@
     <PackageReference Include="ZXing.Net" Version="0.16.11" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- 3D 分層夾取的層高與夾取深度，Unity 與 server 共用同一份 -->
+    <Compile Include="../unity_project/Assets/Scripts/LayeredGraspGeometry.cs" Link="LayeredGraspGeometry.cs" />
+  </ItemGroup>
+
 </Project>
