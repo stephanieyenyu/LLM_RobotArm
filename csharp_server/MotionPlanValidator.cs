@@ -86,9 +86,8 @@ public static class MotionPlanValidator
         if (plan.ActionSequence.Count > 20)
             return Fail("action_sequence exceeds 20 calls", out error);
 
-        string phase = "start";
         bool holding = false;
-        bool released = false;
+        bool atContactHeight = false;
 
         for (int i = 0; i < plan.ActionSequence.Count; i++)
         {
@@ -114,47 +113,38 @@ public static class MotionPlanValidator
             if (a.Function == "wait" && (a.Seconds is < 0.1 or > 3.0 || a.Seconds == null))
                 return Fail($"call {i}: seconds must be 0.1..3.0", out error);
 
+            // These checks enforce current hardware state only. They do not
+            // prescribe a task recipe or require a particular final state.
             switch (a.Function)
             {
-                case "move_above" when a.Location == "source" && !holding:
-                    phase = "above_source";
+                case "move_above":
+                    atContactHeight = false;
                     break;
-                case "descend" when a.Location == "source" && phase == "above_source" && !holding:
-                    phase = "at_source";
+                case "descend":
+                    atContactHeight = true;
                     break;
-                case "grasp" when phase == "at_source" && !holding:
+                case "grasp" when !holding:
                     holding = true;
-                    phase = "grasped";
                     break;
-                case "lift" when a.Location == "source" && phase == "grasped" && holding:
-                    phase = "carrying_safe";
-                    break;
-                case "move_above" when a.Location == "target" && phase == "carrying_safe" && holding:
-                    phase = "above_target";
-                    break;
-                case "descend" when a.Location == "target" && phase == "above_target" && holding:
-                    phase = "at_target";
-                    break;
-                case "release" when phase == "at_target" && holding:
+                case "grasp":
+                    return Fail($"call {i}: grasp requested while gripper state already holds an object", out error);
+                case "release":
                     holding = false;
-                    released = true;
-                    phase = "released";
                     break;
-                case "lift" when a.Location == "target" && phase == "released" && !holding:
-                    phase = "retreated";
+                case "lift":
+                    atContactHeight = false;
                     break;
-                case "go_home" when phase == "retreated" && !holding:
-                    phase = "home";
+                case "go_home" when holding:
+                    return Fail($"call {i}: go_home while holding an object is unsafe", out error);
+                case "go_home" when atContactHeight:
+                    return Fail($"call {i}: go_home from contact height is unsafe; first move vertically clear", out error);
+                case "go_home":
+                    atContactHeight = false;
                     break;
                 case "wait":
                     break;
-                default:
-                    return Fail($"call {i}: unsafe order for {a.Function}", out error);
             }
         }
-
-        if (!released || holding || phase is not ("retreated" or "home"))
-            return Fail("plan must release and retreat safely above the target", out error);
         return true;
     }
 

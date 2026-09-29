@@ -757,7 +757,7 @@ MonoBehaviour:
   previewOnlySharedTrajectory: 0
   trajectoryCollisionSampleDeg: 2
   sharedMovejAcceleration: 0.4
-  sharedMovejVelocity: 0.5
+  sharedMovejVelocity: 0.55
   allowTopLeftCubeYaw180OnHardware: 1
   pickOffsetX: 0.002
   pickOffsetY: 0.002
