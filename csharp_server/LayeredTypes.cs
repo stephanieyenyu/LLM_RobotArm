@@ -41,9 +41,9 @@ public class WorkspaceBounds
     // LayoutRealizer 會拒絕超出目標擺放半徑 0.16..0.47 m 的目標。
     // 5.2 cm 格距：相鄰積木之間留 2.7 cm 給夾爪手指。
     public double TargetRightX { get; set; } = 0.708;
-    public double TargetBottomY { get; set; } = 0.02;
+    public double TargetBottomY { get; set; } = 0.04;  
     public double TargetOriginX { get; set; } = 0.49; // 3D placement uses its own origin.
-    public double TargetOriginY { get; set; } = 0.04;
+    public double TargetOriginY { get; set; } = 0.06; 
     public double CellSize { get; set; } = 0.052;
     public double SpatialCellSize { get; set; } = 0.052;
     public double DefaultBlockZ { get; set; } = 0.025;
