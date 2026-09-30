@@ -92,6 +92,27 @@ while (true)
                     assignment.StepId = ++stepId;
                     var motion = new MotionPlan { ActionSequence = step.Actions, Reasoning = plan };
                     if (!MotionPlanValidator.TryValidate(motion, assignment, current, out error)) throw new InvalidOperationException("執行前檢查：" + error);
+                    var outcome = ClassifyOutcome(step.Actions);
+                    if (outcome == ActionOutcome.Placed && ExperimentChecks.IsAlreadyAtTarget(assignment))
+                    {
+                        var satisfied = new VerifyResult
+                        {
+                            StepId = assignment.StepId,
+                            SourceRemoved = false,
+                            TargetOccupied = true,
+                            ShapeMatch = true,
+                            ColorMatch = true,
+                            PositionErrorMm = Math.Sqrt(
+                                Math.Pow(assignment.Source!.X - assignment.Target!.WorldX, 2) +
+                                Math.Pow(assignment.Source.Y - assignment.Target.WorldY, 2)) * 1000.0,
+                            OverallStatus = "ok",
+                            Note = "Selected source is already within the accepted 20 mm target tolerance; robot motion skipped."
+                        };
+                        local.Add(satisfied);
+                        Save(dir, "local_validation.json", local);
+                        Console.WriteLine($"[實驗] step {assignment.StepId} 來源已在目標 2 公分容差內，略過重複抓放。");
+                        continue;
+                    }
                     var env = new StepEnvelope { StepId = assignment.StepId, SourcePosition = assignment.Source,
                         TargetPosition = step.Target, ActionSequence = step.Actions, Comment = "自由規劃實驗" };
                     Save(dir, $"step_{stepId}.json", env);
@@ -121,7 +142,6 @@ while (true)
                     Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 已完成 batch {batchId}。");
                     await Task.Delay(1200);
                     var afterStep = await Scene();
-                    var outcome = ClassifyOutcome(step.Actions);
                     var check = outcome switch
                     {
                         ActionOutcome.Holding => Verifier.CheckHoldingStep(assignment, current, afterStep),

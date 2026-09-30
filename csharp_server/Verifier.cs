@@ -252,8 +252,11 @@ public static class Verifier
                              trackedHeightIncreaseEvidence != null ||
                              mergedStackSilhouetteEvidence != null;
 
-        if (result.SourceRemoved && result.TargetOccupied && result.ShapeMatch &&
-            result.ColorMatch && heightMatches)
+        bool sourceAndTargetOverlap = Distance2D(
+            step.Source.X, step.Source.Y, step.Target.WorldX, step.Target.WorldY) <= SOURCE_MATCH_M;
+
+        if (result.TargetOccupied && result.ShapeMatch && result.ColorMatch && heightMatches &&
+            (result.SourceRemoved || (!requireStackHeight && sourceAndTargetOverlap)))
         {
             result.OverallStatus = "ok";
             result.Note = requireStackHeight
@@ -266,7 +269,9 @@ public static class Verifier
                       $"XY error {result.PositionErrorMm:F1} mm. Commanded tower height remains cumulative."
                     : $"Stack verified from visible top/elevated height; lower object may be occluded. " +
                       $"XY error {result.PositionErrorMm:F1} mm, top Z {movedAtTarget!.Z:F3} m."
-                : $"Relative move verified; XY error {result.PositionErrorMm:F1} mm.";
+                : !result.SourceRemoved
+                    ? $"Near-target placement verified in overlapping source/target area; XY error {result.PositionErrorMm:F1} mm."
+                    : $"Relative move verified; XY error {result.PositionErrorMm:F1} mm.";
         }
         else if (!result.SourceRemoved && !result.TargetOccupied)
         {

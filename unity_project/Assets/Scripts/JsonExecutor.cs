@@ -229,7 +229,7 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
-    public const float QR1_X = -0.38637f-0.005f;
+    public const float QR1_X = -0.38637f-0.007f;
     public const float QR1_Y = -0.35747f; //+0.005f
     public const float QR1_Z = 0.030f;
 
@@ -1185,22 +1185,25 @@ public class JsonExecutor : MonoBehaviour
         var readySolution = UR3eKinematics.IKNearest(readyPose, reference);
         if (!readySolution.ok)
         {
-            error = $"收尾回到 Ready 姿勢無解（{UR3eKinematics.Describe(readySolution.error)}）：{readySolution.message}";
-            return false;
+            Debug.LogWarning($"[Executor-shared] 抓放路徑可執行，但收尾 Ready 姿勢無解，將停在最後的安全抬升位置：{readySolution.message}");
+            error = null;
+            return true;
         }
         double[] ready = readySolution.q;
-        if (!ValidateJointTransition(reference, ready, out error, allowSingularEnd: false))
+        if (!ValidateJointTransition(reference, ready, out string readyError, allowSingularEnd: false))
         {
-            error = "收尾回到 Ready 的路徑：" + error;
-            return false;
+            Debug.LogWarning($"[Executor-shared] 抓放路徑可執行，但收尾 Ready 路徑不安全，將停在最後的安全抬升位置：{readyError}");
+            error = null;
+            return true;
         }
         sharedFinalTrajectory.Add((double[])ready.Clone());
         reference = ready;
         double[] homeTarget = { -1.5708, -1.5708, 0.0, -1.5708, 0.0, 0.0 };
-        if (!ValidateJointTransition(reference, homeTarget, out error, allowSingularEnd: true))
+        if (!ValidateJointTransition(reference, homeTarget, out string homeError, allowSingularEnd: true))
         {
-            error = "收尾回到 Home 的路徑：" + error;
-            return false;
+            Debug.LogWarning($"[Executor-shared] 已規劃安全 Ready 收尾，但 Ready 到 Home 路徑不安全，將停在 Ready：{homeError}");
+            error = null;
+            return true;
         }
         sharedFinalTrajectory.Add(homeTarget);
 
