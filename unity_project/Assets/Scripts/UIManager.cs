@@ -128,19 +128,27 @@ public class UIManager : MonoBehaviour
         controlPanel.style.paddingLeft = 6;
         controlPanel.style.paddingRight = 6;
 
-        var openBtn = new Button(() => { if (executor != null) executor.ReleaseGripper(); });
+        var openBtn = new Button(() => {
+            ResolveExecutor();
+            if (executor != null) executor.ReleaseGripper();
+            else ShowMessage("找不到 JsonExecutor，無法控制夾爪。");
+        });
         openBtn.text = "鬆開夾爪";
         openBtn.style.height = 36;
         openBtn.style.width = 120;
         openBtn.style.marginBottom = 4;
 
-        var gripBtn = new Button(() => { if (executor != null) executor.GripGripper(); });
+        var gripBtn = new Button(() => {
+            ResolveExecutor();
+            if (executor != null) executor.GripGripper();
+            else ShowMessage("找不到 JsonExecutor，無法控制夾爪。");
+        });
         gripBtn.text = "夾緊夾爪";
         gripBtn.style.height = 36;
         gripBtn.style.width = 120;
         gripBtn.style.marginBottom = 4;
 
-        var homeBtn = new Button(() => { if (executor != null) executor.GoHome(); });
+        var homeBtn = new Button(OnHomeRequested);
         homeBtn.text = "回 Home";
         homeBtn.style.height = 36;
         homeBtn.style.width = 120;
@@ -150,6 +158,24 @@ public class UIManager : MonoBehaviour
         controlPanel.Add(homeBtn);
         root.Add(controlPanel);
         Debug.Log("[UI] 輸入框、執行按鈕與手動控制已建立。", this);
+    }
+
+    void ResolveExecutor()
+    {
+        if (executor == null) executor = FindObjectOfType<JsonExecutor>();
+    }
+
+    void OnHomeRequested()
+    {
+        Debug.Log("[UI] 已按下回 Home。", this);
+        ResolveExecutor();
+        if (executor == null)
+        {
+            ShowMessage("找不到 JsonExecutor，無法回 Home。");
+            return;
+        }
+        executor.TryGoHome(out string message);
+        ShowMessage(message);
     }
 
     public void ShowMessage(string message)

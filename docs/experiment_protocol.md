@@ -16,15 +16,15 @@
 
 兩個規劃層不要求 JSON、bitmap 或固定任務欄位。轉譯器使用內部 JSON 接上 Unity，但不應補上解題決策、抓放順序或參數。其原文和轉譯結果均保存，可供人工稽核是否擅自補完。轉譯器也是 LLM，忠實性不能只靠 prompt 保證。
 
-轉譯器只填 source_index、target 的 x/y/z（domino 另填 orientation）與動作；target 的名稱與形狀一定等於被搬的來源物件，由程式依 source_index 補上（內部記帳欄位，不是解題決策）。先前交給轉譯器填時，它把「放在哪個物件上」誤填成身分，11 次嘗試全被執行前檢查擋下、手臂未動，該批結果量到的是轉譯錯誤而非推理能力，不應與之後的成功率直接比較。
+轉譯器填 source_index、target 的 x/y/z（domino 另填 orientation）與動作；target 的名稱與形狀一定等於被搬的來源物件，一律由程式依 source_index 覆寫（內部記帳欄位，不是解題決策）。先前交給轉譯器填時，它把「放在哪個物件上」誤填成身分，11 次嘗試全被執行前檢查擋下、手臂未動，該批結果量到的是轉譯錯誤而非推理能力，不應與之後的成功率直接比較。
 
 給規劃與反思的回饋只提供事實與能力邊界，不提供解法：執行前檢查的錯誤訊息寫明違反的欄位、實際值與欄位定義，不寫應填的值；每輪附上系統紀錄的實際流程（走到哪一關、在哪一關停止、實體手臂完整執行了幾個操作）與轉譯結果，反思不可把紀錄以外的步驟寫成觀測事實；設備能力說明包含參數範圍（height_m 0.05～0.15 m、seconds 0.1～3、每個操作最多 20 個函式、同一操作內依序執行且無中途感知或條件分支）。
 
-系統不提供 placed/holding 任務分類，也不規定抓放順序。是否在步驟結束時保持夾持，依模型實際輸出的 grasp/release 狀態推導；若仍夾持，Unity 不執行批次結尾的 Ready/Home；最後一個手臂動作是 go_home 時，手臂已在 Home，也不再執行收尾的 Ready/Home（先前從 Home 規劃收尾路徑必定被奇異點檢查擋下，用了 go_home 的批次全部退回）。安全層只檢查硬體能力、參數範圍、工作區、碰撞間隙及當下危險狀態，結果驗證則直接對照原始目標。
+系統不提供 placed/holding 任務分類，也不規定抓放順序。是否在步驟結束時保持夾持，依模型實際輸出的 grasp/release 狀態推導；若仍夾持，Unity 不執行批次結尾的 Ready/Home。規劃介面不提供 go_home：每一批成功完成後由執行器統一經 Ready 回 Home，規劃與反思的 prompt 都說明不得加入 go_home，轉譯器的函式白名單也不接受 go_home（出現就算轉譯失敗）。Unity 執行器仍認得 go_home，最後一個手臂動作是 go_home 時不再執行收尾的 Ready/Home（從 Home 規劃收尾路徑必定被奇異點檢查擋下）；go_home 後面若還有動作，從 Home 出發的下一段一定規劃失敗。安全層只檢查硬體能力、參數範圍、工作區、碰撞間隙及當下危險狀態，結果驗證則直接對照原始目標。
 
 3D 疊放批次的 descend 高度由執行層依場景結構換算：指尖停在積木真實頂面下 19 mm；真實頂面取「感知 z 對齊 2.5 cm 層高」與「佔地重疊的下層 + 1 層」的較高者，同一批前面步驟放下的積木也算。LLM 的 target.z 只能把放開高度往上調，不會讓夾爪壓進支撐。這是執行器把指令換成實際高度的物理換算，不寫進任何 prompt，也不替 LLM 選來源、XY、方向或動作順序。2D 批次維持原本的「感知頂面 + Z_CORRECTION」。2026-09-29 之前的 3D 結果受舊下降深度影響（指尖停在積木頂面上方，URSim 跑完積木都沒被夾起），量到的是執行層問題，不應與之後的成功率直接比較。
 
-一次嘗試包含一份拆解與操作計畫；轉譯失敗、執行前拒絕、局部不通過、整體不通過都耗用一次，最多十次，不含額外隱藏規劃重試。每次未達標都生成失敗摘要與完整暫定規則，替換下一輪 system prompt 的任務經驗區；可撤回錯誤規則。第十次失敗也保存反思，但不再執行。
+一次嘗試包含一份拆解與操作計畫；轉譯失敗、執行前拒絕、局部不通過、整體不通過都耗用一次，最多十次，不含額外隱藏規劃重試。每次未達標都生成失敗摘要與暫定規則，逐輪累積在下一輪 system prompt 的任務經驗區（標版本、由舊到新）；不衝突的舊規則持續有效，新證據推翻舊規則時由新規則明確指出取代哪一條。反思第一行寫 CONTINUE 或 GIVE_UP，只有明確的物理不可能證據才寫 GIVE_UP，該任務就提早結束。第十次失敗也保存反思，但不再執行。
 
 局部驗證沿用物件來源／目的位置、顏色、形狀及堆疊觀測。整體驗證為獨立模型呼叫，僅看原始目標、初始／目前觀測與相機畫面，不看規劃者的答案或規則。第一行 PASS/FAIL 是評分介面，不是規劃格式限制。沒有影像、沒有物件或局部失敗不能算成功。
 
@@ -32,8 +32,10 @@
 
 ## 紀錄與指標
 
-每個任務的獨立資料夾包含 task、config、initial_scene、每輪所有 system/user prompt、原始文字、轉譯結果、前後場景、相機圖、逐步執行／局部驗證、整體判定、反思、模型 token 用量與 result.json。每次任務結束時更新 outputs/experiments/metrics.json，統計首次／十次內成功率與逐次累積成功率。
+每個任務的獨立資料夾包含 task、config、initial_scene、每輪所有 system/user prompt、原始文字、轉譯結果、前後場景、相機圖、逐步執行／局部驗證、整體判定、反思、每輪的 attempt_result.json、模型 token 用量與 result.json。每次任務結束時更新 outputs/experiments/metrics.json，統計首次／十次內成功率、逐次累積成功率與各失敗類型的次數。
 
-result.status 為 success、failed（十次內未達標）、adapter_error、infrastructure_error 或 execution_unknown。JSON 解析、必要欄位和型別等內部轉譯契約錯誤記為 adapter_error，不消耗任務嘗試、不進入 Reflection，也不計入成功率。API／相機故障記為 infrastructure_error，同樣不進入 Reflection。執行前安全拒絕、已知的 Unity／手臂執行失敗及執行後未達標才屬任務失敗並產生 Reflection。Unity 執行逾時代表狀態未知，停止服務，不會再送重試或 done；必須人工確認手臂停止後重啟。
+result.status 為 success、failed（十次內未達標）、infrastructure_error 或 execution_unknown（2026-09-30 之前的紀錄另有 adapter_error）。轉譯失敗算一輪任務失敗並進入 Reflection，包括轉譯器輸出讀不懂或不符合介面契約（JSON 解析、必要欄位、型別、函式白名單），以及轉譯器回報計畫無法忠實轉譯。API／相機故障記為 infrastructure_error，不進入 Reflection。
+
+每一輪的 attempt_result.json 記錄 failure_kind，result.json 的 attempt_outcomes 依序列出每輪結果（success 或失敗類型），metrics.json 的 attempt_outcome_counts 統計全部任務各類型的次數，分析時可把轉譯失敗與規劃／執行失敗分開：planning（在拆解或規劃階段就停止）、translation_format（轉譯輸出讀不懂或不符合介面契約）、translation_rejected（轉譯器回報計畫缺值、歧義而無法忠實轉譯）、precheck（執行前檢查拒絕）、simulation（3D 的 URSim 執行、Isaac Sim 幾何檢查或模擬畫面判定未通過）、execution（Unity／實體手臂執行失敗）、local_validation（局部驗證未通過）、global_validation（全部執行完成但整體判定未達標）。Unity 執行逾時代表狀態未知，停止服務，不會再送重試或 done；必須人工確認手臂停止後重啟。
 
 主要指標：十次內達標任務數／有效任務數。另報首次成功率、各次累積成功率、成功所需嘗試數、呼叫量和耗時。基礎設施錯誤和執行未知需另外完整報告，不可挑選性刪除。所有判定是模型評分，需經人工稽核再用於正式研究。

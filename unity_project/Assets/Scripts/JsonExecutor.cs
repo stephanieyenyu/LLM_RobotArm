@@ -242,8 +242,8 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
-    public const float QR1_X = -0.38824f-0.005f;
-    public const float QR1_Y = -0.35973f+0.005f;
+    public const float QR1_X = -0.38637f-0.005f;
+    public const float QR1_Y = -0.35747f; //+0.005f
     public const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -274,8 +274,10 @@ public class JsonExecutor : MonoBehaviour
     private const float MOTION_TIMEOUT_SEC = 180f;
     private const float TCP_POSITION_TOLERANCE_M = 0.012f;
     private const float HOME_JOINT_TOLERANCE_RAD = 0.04f;
-    private const float SAFETY_RECOVERY_TIMEOUT_SEC = 300f;
     private const float SAFETY_STABLE_SEC = 1f;
+    // URSim（3D 驗證）安全停止時最多等人工解除這麼久，逾時這批就失敗、csharp_server 把這一輪算失敗；
+    // 實體手臂照舊無限期等待人工解除
+    private const float URSIM_SAFETY_RECOVERY_TIMEOUT_SEC = 300f;
     // Only the emergency return-to-Home command may be sent again after a
     // second manual unlock. The interrupted pick/place motion is never resent.
     private const int MAX_MANUAL_HOME_RETRIES = 1;
@@ -446,10 +448,11 @@ public class JsonExecutor : MonoBehaviour
     // -----------------------------------------------------------
     public void ReleaseGripper()
     {
+        SetLocalGripper(false);
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR 未連線，release 失敗");
+            Debug.Log("[Executor] UR 未連線，已只更新 Unity 夾爪為釋放");
             return;
         }
         urListener.SendCommand("set_standard_digital_out(4, False)");
@@ -458,10 +461,11 @@ public class JsonExecutor : MonoBehaviour
 
     public void GripGripper()
     {
+        SetLocalGripper(true);
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR 未連線，grip 失敗");
+            Debug.Log("[Executor] UR 未連線，已只更新 Unity 夾爪為閉合");
             return;
         }
         urListener.SendCommand("set_standard_digital_out(4, True)");
@@ -470,32 +474,96 @@ public class JsonExecutor : MonoBehaviour
 
     public void GoHome()
     {
+        TryGoHome(out _);
+    }
+
+    public bool TryGoHome(out string message)
+    {
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR 未連線，home 失敗");
-            return;
+            AbortCurrentStepForManualHome();
+            if (ApplyLocalHomePose())
+            {
+                message = "UR 尚未連線，已將 Unity 手臂回到 Home。";
+                Debug.Log("[Executor] UR 未連線，已只更新 Unity 手臂為 Home");
+                return true;
+            }
+            Debug.LogWarning("[Executor] UR 未連線，且找不到 Unity 手臂，home 失敗");
+            message = "UR 尚未連線，且找不到 Unity 手臂，無法回 Home。";
+            return false;
+        }
+        if (IsEmergencyStop())
+        {
+            message = "UR 仍在緊急停止；請先依示教器程序排除，Home 指令尚未送出。";
+            Debug.LogWarning("[Executor] " + message);
+            return false;
+        }
+        if (IsRecoverableSafetyStop())
+        {
+            message = "UR 仍在 protective/safety stop。請先移除障礙並在示教器解除、重新啟用手臂，再按回 Home。";
+            Debug.LogWarning("[Executor] " + message);
+            return false;
         }
 
         // 1. 若正在執行 ExecuteStep，先中止並寫入失敗回報，避免 csharp_server 一直等待。
-        if (currentStepCoroutine != null)
-        {
-            executionEpoch++;
-            int abortedStepId = currentStepId;
-            StopCoroutine(currentStepCoroutine);
-            currentStepCoroutine = null;
-            currentStepId = -1;
-            WriteStepDone(abortedStepId, false, "使用者中止（回 Home）", 0f);
-            Debug.LogWarning($"[Executor] 已中止 step {abortedStepId}，改為返回 Home");
-
-            // 將 perception 切回 idle，讓 SceneSyncer 恢復更新。
-            StartCoroutine(SetPerceptionMode("idle"));
-        }
+        AbortCurrentStepForManualHome();
 
         // 2. 送出 home 指令（使用關節角 movej）。
         string homeCmd = HOME_MOVEJ_CMD;
         urListener.SendCommand(homeCmd);
         Debug.Log("[Executor] 已送出 home：" + homeCmd);
+        message = "已送出回 Home 指令。";
+        return true;
+    }
+
+    bool SetLocalGripper(bool closed)
+    {
+        if (robotArm == null) robotArm = FindObjectOfType<RobotArm>();
+        if (robotArm != null)
+        {
+            if (robotArm.Outputs == null || robotArm.Outputs.Length <= 4)
+                robotArm.Outputs = new bool[18];
+            robotArm.Outputs[4] = closed;
+        }
+
+        var gripper = FindObjectOfType<SyncGripper>();
+        if (gripper != null)
+        {
+            gripper.SetManualGrip(closed);
+            return true;
+        }
+        return robotArm != null;
+    }
+
+    bool ApplyLocalHomePose()
+    {
+        if (robotArm == null) robotArm = FindObjectOfType<RobotArm>();
+        if (robotArm == null || robotArm.Angles == null) return false;
+
+        robotArm.followRealRobotFeedback = false;
+        RobotArm.FreezeVisualFeedback = false;
+        float[] home = BuildHomePose();
+        int n = Mathf.Min(robotArm.Angles.Length, home.Length);
+        for (int i = 0; i < n; i++) robotArm.Angles[i] = home[i];
+        robotArm.ApplyAnglesToTransforms();
+        return true;
+    }
+
+    void AbortCurrentStepForManualHome()
+    {
+        if (currentStepCoroutine == null) return;
+
+        executionEpoch++;
+        int abortedStepId = currentStepId;
+        StopCoroutine(currentStepCoroutine);
+        currentStepCoroutine = null;
+        currentStepId = -1;
+        WriteStepDone(abortedStepId, false, "使用者中止（回 Home）", 0f);
+        Debug.LogWarning($"[Executor] 已中止 step {abortedStepId}，改為返回 Home");
+
+        // 將 perception 切回 idle，讓 SceneSyncer 恢復更新。
+        StartCoroutine(SetPerceptionMode("idle"));
     }
 
     // --- 主 poll loop：監看 current_step.json 的新 step_id ---
@@ -658,16 +726,7 @@ public class JsonExecutor : MonoBehaviour
             ? $"[Verification] batch {batch.batch_id}：模擬結束比對開啟（實驗組）"
             : $"[Verification] batch {batch.batch_id}：模擬結束比對關閉（對照組）— 比對結果只記錄不擋；其他檢查照常生效");
 
-        if (BatchEndsHolding(batch))
-        {
-            // The final LLM action already lifted to a validated safe height.
-            // Returning Ready/Home here would move a held block and contradict
-            // the requested completion state.
-            currentStepId = -1;
-            yield return StartCoroutine(SetPerceptionMode("idle"));
-            yield return new WaitForSeconds(1.5f);
-        }
-        else if (useSharedMovejTrajectory)
+        if (useSharedMovejTrajectory)
         {
             if (!useReadyPose || readyJointsRad == null || readyJointsRad.Length != 6)
             {
@@ -1161,7 +1220,11 @@ public class JsonExecutor : MonoBehaviour
                     if (!PlanMoveAbove(pa, ref reference, current, x, y, z + height,
                             orientation, out error))
                     {
-                        error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作：{error}";
+                        string qrSource = source && env.source_position != null
+                            ? $"；本輪來源 QR 座標=({env.source_position.x:F3}, " +
+                              $"{env.source_position.y:F3}, {env.source_position.z:F3})m"
+                            : "";
+                        error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作：{error}{qrSource}";
                         return false;
                     }
                 }
@@ -1683,8 +1746,13 @@ public class JsonExecutor : MonoBehaviour
                 seconds = action.seconds
             };
 
+            // The first waypoint is a vertical clearance move at the TCP's
+            // current XY.  Its bearing is not the requested object's bearing,
+            // so applying the target-facing heuristic here falsely rejects the
+            // same home/ready posture for every object on the table.  Collision
+            // and joint-transition checks still apply to this waypoint.
             if (PlanJointPose(trial, ref trialReference, current.x, current.y,
-                    travelZ, orientation, out lastError) &&
+                    travelZ, orientation, out lastError, requireBaseFacing: false) &&
                 PlanSharedTravelXY(trial, ref trialReference, current.x, current.y,
                     targetX, targetY, travelZ, orientation, out lastError) &&
                 PlanJointPose(trial, ref trialReference, targetX, targetY,
@@ -1704,8 +1772,9 @@ public class JsonExecutor : MonoBehaviour
             travelZ = System.Math.Max(minimumTravelZ, travelZ - 0.01);
         }
 
-        error = $"找不到到得了又不會碰撞的移動高度（範圍 " +
-                $"{minimumTravelZ:F3}～{firstTravelZ:F3}m）；最後一次失敗原因：{lastError}";
+        error = $"找不到可達且無碰撞的移動軌跡。內部搜尋的 UR TCP 絕對 Z 範圍為 " +
+                $"{minimumTravelZ:F3}～{firstTravelZ:F3}m；這不是 move_above 的 height_m，" +
+                $"不得把此絕對 Z 數值填入 height_m。最後一次失敗原因：{lastError}";
         return false;
     }
 
@@ -1809,7 +1878,8 @@ public class JsonExecutor : MonoBehaviour
     }
 
     bool PlanJointPose(PlannedJointAction action, ref double[] reference,
-        double x, double y, double z, string orientation, out string error)
+        double x, double y, double z, string orientation, out string error,
+        bool requireBaseFacing = true)
     {
         var pose = SharedTargetPose(x, y, z, orientation);
         var solution = UR3eKinematics.IKNearest(pose, reference);
@@ -1818,7 +1888,7 @@ public class JsonExecutor : MonoBehaviour
             error = $"IK 無解（{UR3eKinematics.Describe(solution.error)}）：{solution.message}，目標 {pose}";
             return false;
         }
-        if (!ValidateBaseFacing(solution.q, x, y, out error) ||
+        if ((requireBaseFacing && !ValidateBaseFacing(solution.q, x, y, out error)) ||
             !ValidateJointTransition(reference, solution.q, out error, allowSingularEnd: false))
         {
             string firstTransitionError = error;
@@ -1826,7 +1896,7 @@ public class JsonExecutor : MonoBehaviour
             var alternatives = UR3eKinematics.IKAlternatives(pose, reference);
             foreach (var alternative in alternatives)
             {
-                if (!ValidateBaseFacing(alternative.q, x, y, out error)) continue;
+                if (requireBaseFacing && !ValidateBaseFacing(alternative.q, x, y, out error)) continue;
                 if (!ValidateJointTransition(reference, alternative.q, out error,
                         allowSingularEnd: false)) continue;
                 solution = alternative;
@@ -2553,11 +2623,20 @@ public class JsonExecutor : MonoBehaviour
                 Debug.LogWarning($"[Executor] Stale step {env.step_id} cancelled before action {i + 1}.");
                 yield break;
             }
-            if (IsEmergencyStop() || IsRecoverableSafetyStop())
+            if (IsEmergencyStop())
             {
-                string error = IsEmergencyStop()
-                    ? $"第 {i + 1} 個動作前 UR 緊急停止，整批停止"
-                    : $"第 {i + 1} 個動作前 UR 安全停止，整批停止";
+                string error = $"第 {i + 1} 個動作前 UR 緊急停止，整批停止";
+                WriteStepDone(env.step_id, false, error, Time.realtimeSinceStartup - t0);
+                if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
+                yield break;
+            }
+            if (IsRecoverableSafetyStop())
+            {
+                string context = $"第 {i + 1} 個動作前";
+                yield return WaitForManualSafetyRecovery(context, stepEpoch, env.step_id);
+                string error = safetyRecoverySucceeded
+                    ? $"UR 安全停止已由人工解除；為避免沿用碰撞前軌跡，本批中止並由下一輪重新觀測規劃"
+                    : lastMotionError ?? $"等待人工排除安全停止失敗（{context}）";
                 WriteStepDone(env.step_id, false, error, Time.realtimeSinceStartup - t0);
                 if (managePerceptionMode) yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
@@ -2714,9 +2793,16 @@ public class JsonExecutor : MonoBehaviour
                 lastMotionError = $"UR 在「{tag}」途中斷線";
                 yield break;
             }
-            if (IsEmergencyStop() || IsRecoverableSafetyStop())
+            if (IsEmergencyStop())
             {
-                lastMotionError = $"UR 在「{tag}」途中安全停止，共用軌跡中止";
+                lastMotionError = $"UR 在「{tag}」途中緊急停止，不會自動恢復";
+                yield break;
+            }
+            if (IsRecoverableSafetyStop())
+            {
+                yield return WaitForManualSafetyRecovery(tag, stepEpoch, stepId);
+                if (safetyRecoverySucceeded)
+                    lastMotionError = $"UR 在「{tag}」途中安全停止，人工已解除；本批中止並由下一輪重新觀測規劃";
                 yield break;
             }
 
@@ -3091,13 +3177,21 @@ public class JsonExecutor : MonoBehaviour
             $"[Executor] Protective Stop at {context}. No more commands will be sent. " +
             "Clear the obstruction, unlock the protective stop, and enable the robot on the teach pendant.");
 
-        float startedAt = Time.realtimeSinceStartup;
         float stableSince = -1f;
-        while (Time.realtimeSinceStartup - startedAt < SAFETY_RECOVERY_TIMEOUT_SEC)
+        float startedAt = Time.realtimeSinceStartup;
+        float lastReportAt = startedAt;
+        // robot_target = "ursim" 的批次執行期間 urListener 換成 URSim 連線
+        bool onUrsim = ursimListener != null && urListener == ursimListener;
+        while (true)
         {
             if (!IsExecutionCurrent(stepEpoch, stepId))
             {
                 lastMotionError = $"第 {stepId} 步已過期，在等待（{context}）時取消";
+                yield break;
+            }
+            if (onUrsim && Time.realtimeSinceStartup - startedAt >= URSIM_SAFETY_RECOVERY_TIMEOUT_SEC)
+            {
+                lastMotionError = $"URSim 安全停止 {URSIM_SAFETY_RECOVERY_TIMEOUT_SEC:F0} 秒內沒有解除（{context}）";
                 yield break;
             }
             if (!urListener.Connected)
@@ -3131,10 +3225,13 @@ public class JsonExecutor : MonoBehaviour
             {
                 stableSince = -1f;
             }
+            if (Time.realtimeSinceStartup - lastReportAt >= 15f)
+            {
+                lastReportAt = Time.realtimeSinceStartup;
+                Debug.LogWarning($"[Executor] 仍在等待人工解除安全停止（{context}）：{RobotStatusText()}");
+            }
             yield return new WaitForSeconds(0.1f);
         }
-
-        lastMotionError = $"等待人工排除安全停止逾時（{context}）";
     }
 
     bool IsExecutionCurrent(long stepEpoch, int stepId)

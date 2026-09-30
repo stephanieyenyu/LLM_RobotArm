@@ -4,6 +4,8 @@ public static class ExperimentMetrics
     public static void Write(string root)
     {
         var outcomes = new List<(bool success, string status, int attempts)>();
+        // 每一輪的結果（success 或失敗類型）；舊版 result.json 沒有 attempt_outcomes，不計入
+        var attemptOutcomes = new Dictionary<string, int>();
         foreach (var directory in Directory.GetDirectories(root))
         {
             var path = Path.Combine(directory, "result.json");
@@ -11,6 +13,9 @@ public static class ExperimentMetrics
             using var doc = JsonDocument.Parse(File.ReadAllText(path));
             var r = doc.RootElement;
             outcomes.Add((r.GetProperty("success").GetBoolean(), r.GetProperty("status").GetString() ?? "", r.GetProperty("attempts").GetInt32()));
+            if (r.TryGetProperty("attempt_outcomes", out var perAttempt) && perAttempt.ValueKind == JsonValueKind.Array)
+                foreach (var outcome in perAttempt.EnumerateArray().Select(o => o.GetString() ?? ""))
+                    attemptOutcomes[outcome] = attemptOutcomes.GetValueOrDefault(outcome) + 1;
         }
         var valid = outcomes.Where(r => r.status is "success" or "failed").ToList();
         var successes = valid.Where(r => r.success).ToList();
@@ -22,6 +27,7 @@ public static class ExperimentMetrics
             success_rate_within_10 = Rate(10), first_attempt_success_rate = Rate(1),
             mean_attempts_among_successes = successes.Count == 0 ? (double?)null : successes.Average(r => r.attempts),
             cumulative_success_rates = Enumerable.Range(1, 10).Select(i => new { attempt = i, success_rate = Rate(i) }),
+            attempt_outcome_counts = attemptOutcomes.OrderBy(p => p.Key).ToDictionary(p => p.Key, p => p.Value),
             evaluation = "independent_visual_model; requires human calibration" };
         File.WriteAllText(Path.Combine(root, "metrics.json"), JsonSerializer.Serialize(summary, new JsonSerializerOptions { WriteIndented = true }));
     }

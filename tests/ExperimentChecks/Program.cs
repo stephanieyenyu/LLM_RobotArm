@@ -96,17 +96,26 @@ var fingerRoot = LayeredGraspGeometry.FingerRoot(new[] { 0.1, 0.2, 0.3 }, new[] 
 Check(Near(fingerRoot[0], 0.1) && Near(fingerRoot[1], 0.2) && Near(fingerRoot[2], 0.036), "finger root is 30 mm up the tool axis from the fingertip");
 var root = Path.Combine(Path.GetTempPath(), "robot_metrics_" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
-void Outcome(string id, bool success, string status, int attempts) {
+void Outcome(string id, bool success, string status, int attempts, string[]? outcomes = null) {
     var dir = Path.Combine(root, id); Directory.CreateDirectory(dir);
-    File.WriteAllText(Path.Combine(dir, "result.json"), JsonSerializer.Serialize(new { success, status, attempts }));
+    File.WriteAllText(Path.Combine(dir, "result.json"), outcomes == null
+        ? JsonSerializer.Serialize(new { success, status, attempts })
+        : JsonSerializer.Serialize(new { success, status, attempts, attempt_outcomes = outcomes }));
 }
-Outcome("a", true, "success", 2); Outcome("b", false, "failed", 10); Outcome("c", false, "infrastructure_error", 1); Outcome("d", false, "adapter_error", 0);
+Outcome("a", true, "success", 2, new[] { "translation_format", "success" });
+Outcome("b", false, "failed", 10, Enumerable.Repeat("execution", 9).Append("translation_rejected").ToArray());
+Outcome("c", false, "infrastructure_error", 1); Outcome("d", false, "adapter_error", 0);
 ExperimentMetrics.Write(root);
 using var metrics = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "metrics.json")));
 Check(metrics.RootElement.GetProperty("success_rate_within_10").GetDouble() == 0.5, "failure remains in success denominator");
 Check(metrics.RootElement.GetProperty("infrastructure_errors").GetInt32() == 1, "infrastructure error separately counted");
 Check(metrics.RootElement.GetProperty("adapter_errors").GetInt32() == 1, "adapter error separately counted");
 Check(metrics.RootElement.GetProperty("first_attempt_success_rate").GetDouble() == 0, "first-attempt success measured independently");
+var kinds = metrics.RootElement.GetProperty("attempt_outcome_counts");
+Check(kinds.GetProperty("success").GetInt32() == 1 && kinds.GetProperty("translation_format").GetInt32() == 1 &&
+      kinds.GetProperty("translation_rejected").GetInt32() == 1 && kinds.GetProperty("execution").GetInt32() == 9 &&
+      kinds.EnumerateObject().Count() == 4,
+      "per-attempt outcomes are counted by kind; results without attempt_outcomes are skipped");
 Console.WriteLine($"{passed} checks passed; metrics fixture: {root}");
 public sealed class TranslatedStep
 {

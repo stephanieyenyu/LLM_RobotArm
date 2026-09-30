@@ -92,6 +92,8 @@ dotnet run
      再由 LLM 看模擬畫面；都通過才逐步送實體手臂。不通過就算這次嘗試失敗、進 Reflection。
 
 Isaac Sim 不連實體手臂。URSim / Isaac 無法使用時記為 `infrastructure_error`（不計成功率）。
+URSim 驗證途中觸發安全停止時，Unity 最多等 300 秒讓人在 URSim 解除，逾時這一輪算失敗（`simulation`）並進 Reflection；
+實體手臂的安全停止則無限期等待人工在 Teach Pendant 解除。
 
 **3D 分層夾取（只有 3D 批次）**：3D 的每一批（URSim 與通過後的實機）帶 `layered_grasp`，每一步帶
 `source_top_m` / `target_top_m`。descend 時指尖停在積木真實頂面下 19 mm（離下層 6 mm），取代 2D 用的
@@ -160,7 +162,15 @@ QR1_X, QR1_Y, QR1_Z   // Teach Pendant 手動 jog TCP 到 QR1 上方 5cm 讀值�
 Z_CORRECTION = 0.02f  // 2D：descend 時 TCP 停在感知頂面上方這個距離（3D 改用分層夾取，見上）
 SAFE_Z_OFFSET = 0.08f // 抓取前後在物件上方留 8cm 安全空間
 ```
-換場地或重貼 QRCode 一定要重新量測。
+換場地或重貼 QRCode 一定要重新量測。QR1_X/Y 改了之後，`isaac_sim/isaac_sim_server.py` 的 `--qr1` 預設、
+`isaac_sim/touch_calibrate.py` 的 QR1_X/Y，以及 MainScene 裡 SceneSyncer 的 `Arm Base At Qr X/Y`（= -QR1_X / -QR1_Y，
+只影響 Unity 畫面上工作區的位置）要一起改。
+
+用實體指尖量 QR 座標系的偏移與轉角（只讀手臂關節角，不送指令；手臂用 Teach Pendant 低速移動）：
+```powershell
+python isaac_sim\touch_calibrate.py --robot_ip 192.168.50.204
+```
+依序用指尖輕碰 QR 標記中心與黃色方塊頂面，輸出 QR1 在基座座標的位置、QR 座標軸的轉角與桌面高度。
 
 ## 常見問題
 

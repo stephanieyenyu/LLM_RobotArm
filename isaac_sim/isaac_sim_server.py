@@ -65,7 +65,7 @@ def parse_args():
     ap.add_argument("--robot_usd", default=r"D:\isaacsim\ur3_gripper_scene\ur3_gripper_scene\gripper_separate\ur3e_with_gripper_for_isaac_sim\ur3e_with_gripper_for_isaac_sim.usd",
                     help="UR3e+夾爪 USD 資產完整路徑")
     # 下面三個必須跟 Unity 一致（JsonExecutor.cs、LayeredGraspGeometry.cs）
-    ap.add_argument("--qr1", type=float, nargs=3, default=[-0.38824, -0.35973 + 0.005, 0.030 - 0.030],
+    ap.add_argument("--qr1", type=float, nargs=3, default=[-0.38637 - 0.005, -0.35747, 0.030 - 0.030],
                     metavar=("X", "Y", "Z"),
                     help="QR1 在 UR 基座座標的位置：X/Y = JsonExecutor.cs QR1_X/Y；Z = 3D 批次的實測桌面高度 "
                          "= QR1_Z + LayeredGraspGeometry.TableZCorrectionM（2026-09-29 實測桌面比 QR1_Z 低 30 mm）")

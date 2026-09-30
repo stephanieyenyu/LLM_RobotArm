@@ -42,6 +42,8 @@ while (true)
     bool executionPending = false;
     string status = "failed";
     int attempts = 0;
+    // 每一輪的結果：success 或失敗類型（見下方 stageKind），寫進 result.json 供分開統計轉譯與規劃／執行失敗
+    var attemptOutcomes = new List<string>();
     var rules = new List<string>();
     var feedback = "無前次結果。";
     try
@@ -89,13 +91,18 @@ while (true)
             var dir = Path.Combine(run, $"attempt_{attempt:00}");
             Directory.CreateDirectory(dir);
             Console.WriteLine($"[實驗] 第 {attempt}/10 次規劃，保留目前場景。");
-            string failure = "", plan = "", translationText = "（沒有產生轉譯結果）";
+            attempts = attempt;
+            string failure = "", failureKind = "", plan = "", translationText = "（沒有產生轉譯結果）";
             var local = new List<VerifyResult>();
             var isaacDir = Path.Combine(dir, "isaac_sim");
             JsonElement? camera = null;
             // 系統實際走過的流程，給下一輪規劃與反思當觀測事實；沒有記在這裡的步驟都沒有發生。
             var trace = new List<string>();
             string stage = "觀測場景";
+            // 在這個階段停止時記錄的失敗類型：planning（拆解或規劃階段）、translation_format（轉譯輸出讀不懂）、
+            // translation_rejected（轉譯器回報計畫無法忠實轉譯）、precheck、simulation（URSim / Isaac Sim）、execution、
+            // local_validation；流程跑完但整體判定未達標則是 global_validation
+            string stageKind = "planning";
             int robotOperations = 0;
             try
             {
@@ -112,16 +119,21 @@ while (true)
                 stage = "操作規劃";
                 plan = await llm.Plan(goal, before, hierarchy, rules, feedback, image, dir);
                 stage = "轉譯成執行資料";
+                stageKind = "translation_format";
                 var translated = await llm.Translate(plan, before, dir);
                 Save(dir, "translated_plan.json", translated);
                 translationText = JsonSerializer.Serialize(translated,
                     new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
-                // A task attempt starts only after the internal adapter has
-                // produced a readable contract. Adapter failures are not task
-                // reasoning failures and never enter reflection.
-                attempts = attempt;
-                if (!string.IsNullOrWhiteSpace(translated.Error)) throw new InvalidOperationException("轉譯失敗：" + translated.Error);
-                if (translated.Steps == null || translated.Steps.Count > 50) throw new InvalidOperationException("執行資料無效或超過單次 50 步上限。");
+                // 轉譯失敗也算一輪，照常進 Reflection
+                if (!string.IsNullOrWhiteSpace(translated.Error))
+                {
+                    stageKind = "translation_rejected";
+                    throw new TranslationContractException("轉譯失敗：" + translated.Error,
+                        new InvalidOperationException(translated.Error));
+                }
+                if (translated.Steps == null || translated.Steps.Count > 50)
+                    throw new TranslationContractException("執行資料無效或超過單次 50 步上限。",
+                        new InvalidOperationException("Invalid translated step count."));
                 trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
                 // 3D 疊放：整輪步驟先交給 Unity 在 URSim 執行（robot_target = "ursim"），Isaac Sim 的手臂
                 // 即時跟隨 URSim、積木用物理模擬；URSim 跑完由 Isaac 做幾何檢查，再讓 LLM 看模擬畫面，
@@ -140,6 +152,7 @@ while (true)
                     {
                         var step = translated.Steps[k];
                         stage = $"送 URSim 前第 {k + 1} 個操作的執行前檢查";
+                        stageKind = "precheck";
                         if (!ExperimentChecks.Resolve(step, before, before, out var planned, out var error))
                             throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
                         planned.StepId = ++stepId;
@@ -151,13 +164,14 @@ while (true)
                     }
                     Console.WriteLine($"[Isaac Sim] 3D 疊放：{ursimSteps.Count} 步先在 URSim 執行，Isaac Sim 跟隨驗證。");
                     stage = "URSim 執行";
+                    stageKind = "simulation";
                     await IsaacSimExecutor.BeginVerifyAsync(before, translated.Steps, camera, image, isaacDir);
                     int ursimBatchId = ++stepId;
                     var ursimBatch = new BatchEnvelope { BatchId = ursimBatchId, Steps = ursimSteps,
                         Comment = "3D 疊放 URSim 驗證", RobotTarget = "ursim", LayeredGrasp = true };
                     Save(isaacDir, "ursim_batch.json", ursimBatch);
                     AtomicWrite(Path.Combine(assets, "current_step.json"), ursimBatch);
-                    var ursimExecution = await Wait(ursimBatchId);
+                    var ursimExecution = await Wait(attempt, ursimBatchId);
                     Save(isaacDir, "ursim_execution.json", ursimExecution);
                     if (ursimExecution == null || !ursimExecution.Completed)
                     {
@@ -182,6 +196,7 @@ while (true)
                 {
                     var step = translated.Steps[k];
                     stage = $"第 {k + 1} 個操作的執行前檢查";
+                    stageKind = "precheck";
                     var current = await Scene();
                     if (!ExperimentChecks.Resolve(step, before, current, out var assignment, out var error))
                         throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
@@ -190,6 +205,7 @@ while (true)
                     if (!MotionPlanValidator.TryValidate(motion, assignment, current, out error))
                         throw new InvalidOperationException($"第 {k + 1} 個操作執行前檢查：{error}");
                     stage = $"第 {k + 1} 個操作在實體手臂執行";
+                    stageKind = "execution";
                     var env = new StepEnvelope { StepId = assignment.StepId, SourcePosition = assignment.Source,
                         TargetPosition = step.Target, ActionSequence = step.Actions, Comment = "自由規劃實驗" };
                     if (stacked3d)
@@ -207,15 +223,28 @@ while (true)
                         BatchId = batchId, Steps = new List<StepEnvelope> { env }, Comment = env.Comment,
                         LayeredGrasp = stacked3d
                     });
+                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 Unity/UR3：step {assignment.StepId}、batch {batchId}。");
                     executionPending = true;
-                    var execution = await Wait(batchId);
+                    var execution = await Wait(attempt, batchId);
                     if (execution != null) executionPending = false;
                     Save(dir, $"execution_{stepId}.json", execution);
                     if (execution == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
-                    if (!execution.Completed) throw new InvalidOperationException($"第 {k + 1} 個操作執行失敗：{execution.Error ?? "沒有回報原因"}");
+                    if (!execution.Completed)
+                    {
+                        string sourceContext = assignment.Source == null
+                            ? ""
+                            : $"\n失敗步驟來源（當輪 QR 座標）：{assignment.Source.Name} " +
+                              $"x={assignment.Source.X:F3}, y={assignment.Source.Y:F3}, " +
+                              $"z={assignment.Source.Z:F3} m；source_index={step.SourceIndex} 只適用本輪觀測。";
+                        var executionError = $"第 {k + 1} 個操作執行失敗：{execution.Error ?? "沒有回報原因"}" + sourceContext;
+                        Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 退回：{executionError}");
+                        throw new InvalidOperationException(executionError);
+                    }
+                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 已完成 batch {batchId}。");
                     robotOperations++;
                     trace.Add($"第 {k + 1} 個操作實體手臂執行完成");
                     stage = $"第 {k + 1} 個操作的局部驗證";
+                    stageKind = "local_validation";
                     await Task.Delay(1200);
                     var afterStep = await Scene();
                     var outcome = ClassifyOutcome(step.Actions);
@@ -234,7 +263,14 @@ while (true)
                 }
             }
             catch (ExecutionUnknownException) { throw; }
-            catch (InvalidOperationException ex) { failure = ex.Message; trace.Add($"在「{stage}」停止"); }
+            catch (TranslationContractException ex)
+            {
+                failure = ex.Message;
+                failureKind = stageKind;
+                trace.Add($"在「{stage}」停止");
+                Console.WriteLine($"[實驗] 第 {attempt}/10 輪轉譯失敗，將進入 Reflection：{failure}");
+            }
+            catch (InvalidOperationException ex) { failure = ex.Message; failureKind = stageKind; trace.Add($"在「{stage}」停止"); }
             trace.Add($"實體手臂完整執行了 {robotOperations} 個操作");
             var after = await Scene();
             Save(dir, "after_scene.json", after);
@@ -245,15 +281,21 @@ while (true)
             feedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n執行／局部觀察：{failure}\n整體觀察：{verdict}";
             File.WriteAllText(Path.Combine(dir, "feedback.txt"), feedback);
             success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
+            if (!success && string.IsNullOrEmpty(failureKind)) failureKind = "global_validation";
+            attemptOutcomes.Add(success ? "success" : failureKind);
+            Save(dir, "attempt_result.json", new { attempt, success, failure_kind = success ? null : failureKind,
+                failure_stage = string.IsNullOrEmpty(failure) ? null : stage, failure = string.IsNullOrEmpty(failure) ? null : failure });
             if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
-            var reflection = await llm.Reflect(goal, plan, translationText, feedback, rules, dir);
+            var reflection = await llm.Reflect(goal, plan, translationText, feedback, rules, after, dir);
             File.WriteAllText(Path.Combine(dir, "rules_for_next_attempt.txt"), reflection);
-            if (reflection.Split('\n')[0].Trim() == "GIVE_UP")
+            var reflectionLines = reflection.Split('\n');
+            if (reflectionLines[0].Trim() == "GIVE_UP")
             {
                 Console.WriteLine($"[實驗] LLM 判斷本任務無法達成，第 {attempt} 次後結束嘗試。");
                 break;
             }
-            rules = new List<string> { reflection };
+            // 規則逐輪累積（由舊到新）；第一行的 CONTINUE 是判定，不是規則內容
+            rules.Add(reflectionLines[0].Trim() == "CONTINUE" ? string.Join('\n', reflectionLines.Skip(1)).Trim() : reflection);
         }
     }
     catch (Exception ex)
@@ -264,7 +306,7 @@ while (true)
         File.WriteAllText(Path.Combine(run, "error.txt"), ex.ToString());
         Console.WriteLine("[實驗] " + ex.Message);
     }
-    Save(run, "result.json", new { success, status, attempts,
+    Save(run, "result.json", new { success, status, attempts, attempt_outcomes = attemptOutcomes,
         counts_toward_success_rate = status is "success" or "failed",
         final_rules = rules, finished_utc = DateTime.UtcNow });
     ExperimentMetrics.Write(output);
@@ -319,7 +361,7 @@ async Task<JsonElement?> CameraInfo()
         return null;
     }
 }
-async Task<ExecutionResult?> Wait(int id)
+async Task<ExecutionResult?> Wait(int attempt, int id)
 {
     var path = Path.Combine(assets, "step_done.json");
     var started = DateTime.UtcNow;
@@ -339,7 +381,7 @@ async Task<ExecutionResult?> Wait(int id)
         if (elapsedSeconds >= lastReportedSeconds + 15)
         {
             lastReportedSeconds = elapsedSeconds;
-            Console.WriteLine($"[Unity/UR3] batch {id} 仍在執行，已等待 {elapsedSeconds} 秒（無逾時限制）...");
+            Console.WriteLine($"[Unity/UR3] 第 {attempt}/10 輪，batch {id} 仍在執行，已等待 {elapsedSeconds} 秒（無逾時限制）...");
         }
         await Task.Delay(200);
     }
