@@ -229,8 +229,8 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
-    public const float QR1_X = -0.38824f;
-    public const float QR1_Y = -0.35973f+0.005f;
+    public const float QR1_X = -0.38637f-0.005f;
+    public const float QR1_Y = -0.35747f; //+0.005f
     public const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -419,10 +419,11 @@ public class JsonExecutor : MonoBehaviour
     // -----------------------------------------------------------
     public void ReleaseGripper()
     {
+        SetLocalGripper(false);
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR 未連線，release 失敗");
+            Debug.Log("[Executor] UR 未連線，已只更新 Unity 夾爪為釋放");
             return;
         }
         urListener.SendCommand("set_standard_digital_out(4, False)");
@@ -431,10 +432,11 @@ public class JsonExecutor : MonoBehaviour
 
     public void GripGripper()
     {
+        SetLocalGripper(true);
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR 未連線，grip 失敗");
+            Debug.Log("[Executor] UR 未連線，已只更新 Unity 夾爪為閉合");
             return;
         }
         urListener.SendCommand("set_standard_digital_out(4, True)");
@@ -451,8 +453,15 @@ public class JsonExecutor : MonoBehaviour
         EnsureUrConnectionStarted();
         if (urListener == null || !urListener.Connected)
         {
-            Debug.LogWarning("[Executor] UR 未連線，home 失敗");
-            message = "UR 尚未連線，無法回 Home。";
+            AbortCurrentStepForManualHome();
+            if (ApplyLocalHomePose())
+            {
+                message = "UR 尚未連線，已將 Unity 手臂回到 Home。";
+                Debug.Log("[Executor] UR 未連線，已只更新 Unity 手臂為 Home");
+                return true;
+            }
+            Debug.LogWarning("[Executor] UR 未連線，且找不到 Unity 手臂，home 失敗");
+            message = "UR 尚未連線，且找不到 Unity 手臂，無法回 Home。";
             return false;
         }
         if (IsEmergencyStop())
@@ -469,19 +478,7 @@ public class JsonExecutor : MonoBehaviour
         }
 
         // 1. 若正在執行 ExecuteStep，先中止並寫入失敗回報，避免 csharp_server 一直等待。
-        if (currentStepCoroutine != null)
-        {
-            executionEpoch++;
-            int abortedStepId = currentStepId;
-            StopCoroutine(currentStepCoroutine);
-            currentStepCoroutine = null;
-            currentStepId = -1;
-            WriteStepDone(abortedStepId, false, "使用者中止（回 Home）", 0f);
-            Debug.LogWarning($"[Executor] 已中止 step {abortedStepId}，改為返回 Home");
-
-            // 將 perception 切回 idle，讓 SceneSyncer 恢復更新。
-            StartCoroutine(SetPerceptionMode("idle"));
-        }
+        AbortCurrentStepForManualHome();
 
         // 2. 送出 home 指令（使用關節角 movej）。
         string homeCmd = HOME_MOVEJ_CMD;
@@ -489,6 +486,55 @@ public class JsonExecutor : MonoBehaviour
         Debug.Log("[Executor] 已送出 home：" + homeCmd);
         message = "已送出回 Home 指令。";
         return true;
+    }
+
+    bool SetLocalGripper(bool closed)
+    {
+        if (robotArm == null) robotArm = FindObjectOfType<RobotArm>();
+        if (robotArm != null)
+        {
+            if (robotArm.Outputs == null || robotArm.Outputs.Length <= 4)
+                robotArm.Outputs = new bool[18];
+            robotArm.Outputs[4] = closed;
+        }
+
+        var gripper = FindObjectOfType<SyncGripper>();
+        if (gripper != null)
+        {
+            gripper.SetManualGrip(closed);
+            return true;
+        }
+        return robotArm != null;
+    }
+
+    bool ApplyLocalHomePose()
+    {
+        if (robotArm == null) robotArm = FindObjectOfType<RobotArm>();
+        if (robotArm == null || robotArm.Angles == null) return false;
+
+        robotArm.followRealRobotFeedback = false;
+        RobotArm.FreezeVisualFeedback = false;
+        float[] home = BuildHomePose();
+        int n = Mathf.Min(robotArm.Angles.Length, home.Length);
+        for (int i = 0; i < n; i++) robotArm.Angles[i] = home[i];
+        robotArm.ApplyAnglesToTransforms();
+        return true;
+    }
+
+    void AbortCurrentStepForManualHome()
+    {
+        if (currentStepCoroutine == null) return;
+
+        executionEpoch++;
+        int abortedStepId = currentStepId;
+        StopCoroutine(currentStepCoroutine);
+        currentStepCoroutine = null;
+        currentStepId = -1;
+        WriteStepDone(abortedStepId, false, "使用者中止（回 Home）", 0f);
+        Debug.LogWarning($"[Executor] 已中止 step {abortedStepId}，改為返回 Home");
+
+        // 將 perception 切回 idle，讓 SceneSyncer 恢復更新。
+        StartCoroutine(SetPerceptionMode("idle"));
     }
 
     // --- 主 poll loop：監看 current_step.json 的新 step_id ---
