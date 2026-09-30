@@ -10,10 +10,21 @@ var json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true, Write
 var model = Environment.GetEnvironmentVariable("ROBOT_MODEL") ?? "gpt-5";
 var llm = new ExperimentLlm(model);
 var baselinePath = Path.Combine(output, "initial_scene.json");
-var baseline = File.Exists(baselinePath) ? JsonSerializer.Deserialize<List<SceneObject>>(File.ReadAllText(baselinePath), json) : null;
+// 預設每個任務以收到指令時的桌面為起點；FIXED_BASELINE=1 才要求每個任務先恢復成同一個固定配置
+bool fixedBaseline = Environment.GetEnvironmentVariable("FIXED_BASELINE") == "1";
+var baseline = fixedBaseline && File.Exists(baselinePath)
+    ? JsonSerializer.Deserialize<List<SceneObject>>(File.ReadAllText(baselinePath), json) : null;
 int stepId = checked((int)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-Console.WriteLine("自由規劃實驗：每任務最多 10 次；任務間恢復初始桌面，任務內不重置。");
-Console.WriteLine($"初始配置：{baselinePath}；第一次任務建立。更換配置需停止服務後移除此檔。");
+if (fixedBaseline)
+{
+    Console.WriteLine("自由規劃實驗：每任務最多 10 次；任務間恢復初始桌面，任務內不重置。");
+    Console.WriteLine($"初始配置：{baselinePath}；第一次任務建立。更換配置需停止服務後移除此檔。");
+}
+else
+{
+    Console.WriteLine("自由規劃實驗：每任務最多 10 次；每個任務以收到指令時的桌面為起點，任務內不重置。");
+    Console.WriteLine("（要求每個任務先恢復同一個固定配置：setx FIXED_BASELINE 1 後重開 terminal）");
+}
 while (true)
 {
     var input = Path.Combine(assets, "user_input.txt");
@@ -23,7 +34,8 @@ while (true)
     var run = Path.Combine(output, $"{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}");
     Directory.CreateDirectory(run);
     File.WriteAllText(Path.Combine(run, "task.txt"), goal);
-    Save(run, "config.json", new { model, max_attempts = 10, reset_between_tasks = true,
+    Save(run, "config.json", new { model, max_attempts = 10, reset_between_tasks = fixedBaseline,
+        initial_scene_source = fixedBaseline ? "fixed_baseline" : "table_at_command",
         reset_within_task = false, reset_xy_m = ExperimentChecks.ResetXYToleranceM, reset_z_m = ExperimentChecks.ResetZToleranceM,
         rule_scope = "task", evaluation = "independent_visual_model", started_utc = DateTime.UtcNow });
     bool success = false;
@@ -38,7 +50,9 @@ while (true)
         int stable = 0;
         List<SceneObject>? previous = null;
         int resetWaitSeconds = 0;
-        Console.WriteLine("[任務重置] 將實體積木恢復初始配置後，相機確認桌面即開始；不會自動搬回積木。");
+        Console.WriteLine(fixedBaseline
+            ? "[任務重置] 將實體積木恢復初始配置後，相機確認桌面即開始；不會自動搬回積木。"
+            : "[任務開始] 以目前桌面為起點，相機連續 3 次看到桌面穩定就開始。");
         while (true)
         {
             initial = await Scene();
@@ -51,23 +65,25 @@ while (true)
             resetWaitSeconds++;
             if (resetWaitSeconds % 15 == 0)
             {
-                Console.WriteLine($"[任務重置] 仍在等待初始桌面，已等待 {resetWaitSeconds} 秒（無逾時限制）。");
+                Console.WriteLine(fixedBaseline
+                    ? $"[任務重置] 仍在等待初始桌面，已等待 {resetWaitSeconds} 秒（無逾時限制）。"
+                    : $"[任務開始] 桌面還沒穩定（可能有東西在動或偵測不穩），已等待 {resetWaitSeconds} 秒。");
                 if (expected == null || initial.Count == 0)
                 {
                     Console.WriteLine($"             目前：{SceneInventory(initial)}");
                     continue;
                 }
-                // 還沒有基準時是在等連續幾幀穩定，比的是上一幀
+                // 還沒有基準（或不用固定基準）時是在等連續幾幀穩定，比的是上一幀
                 Console.WriteLine(baseline != null
                     ? $"             基準：{SceneInventory(baseline)}；目前：{SceneInventory(initial)}"
-                    : "             建立基準中，跟上一幀比：");
+                    : "             等待桌面穩定，跟上一幀比：");
                 foreach (var line in ExperimentChecks.DescribeMismatch(expected, initial))
                     Console.WriteLine($"             {line}");
             }
         }
-        if (baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
+        if (fixedBaseline && baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
         Save(run, "initial_scene.json", initial);
-        Console.WriteLine("[任務重置] 初始桌面已確認；本任務內不再重置。");
+        Console.WriteLine($"[任務開始] 初始桌面已確認（{SceneInventory(initial)}）；本任務內不再重置。");
         for (int attempt = 1; attempt <= 10; attempt++)
         {
             var dir = Path.Combine(run, $"attempt_{attempt:00}");
@@ -254,7 +270,8 @@ while (true)
     ExperimentMetrics.Write(output);
     if (status == "execution_unknown") { Console.WriteLine("執行狀態未知，服務停止。確認手臂停止後再重新啟動。"); break; }
     AtomicWrite(Path.Combine(assets, "current_step.json"), new StepEnvelope { StepId = ++stepId, Done = true });
-    Console.WriteLine($"[實驗] {status}；紀錄：{run}。下個任務需恢復初始桌面。");
+    Console.WriteLine($"[實驗] {status}；紀錄：{run}。" +
+        (fixedBaseline ? "下個任務需恢復初始桌面。" : "下個任務以當時的桌面為起點。"));
 }
 void Save(string dir, string name, object? value) => File.WriteAllText(Path.Combine(dir, name), JsonSerializer.Serialize(value, json));
 void AtomicWrite(string path, object value)

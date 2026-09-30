@@ -24,8 +24,9 @@ public class RobotArm : MonoBehaviour
     public float[] startupAnglesDeg = new float[] { 0f, -90f, 0f, -90f, 0f, 0f };
 
     [Header("工具（夾爪）")]
-    // 必須等於實機 Teach Pendant 安裝設定裡 TCP 的 Z 偏移（公尺）；程式沒送 set_tcp，實機 movel 用的就是 pendant 上的 TCP。
-    // 不是夾爪 mesh 的指尖長度：夾方塊時手指要往下包住方塊，TCP 通常設在指尖上方的夾持點。
+    // 2D 批次算關節角用的工具長度（公尺；場景設 0.123，維持原本 2D 的行為）。共用關節軌跡（movej）不看
+    // Teach Pendant 的 TCP。注意實體指尖在法蘭下 179 mm（2026-09-29 實測），比這個值長 56 mm；
+    // 3D 批次改用 LayeredGraspGeometry.FingertipLengthM（179 mm），URSim、Isaac 與實機的指尖才一致。
     public float toolOffsetZ = 0f;
 
     [Header("基準姿態")]

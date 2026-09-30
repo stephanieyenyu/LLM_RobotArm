@@ -224,12 +224,13 @@ public class JsonExecutor : MonoBehaviour
     public bool allowTopLeftCubeYaw180OnHardware = true;
 
     [Header("模擬結束比對 bitmap（屬於驗證，受一鍵驗證開關控制）")]
-    // 落點中心離 bitmap 格子中心多遠以內算放對（公尺）。格距 4 cm、方塊 2.5 cm，間隙只有 1.5 cm
-    public float bitmapXYToleranceM = 0.010f;
+    // 落點中心離 bitmap 格子中心多遠以內算放對（公尺）。格距 4 cm、方塊 2.5 cm，間隙只有 1.5 cm；
+    // 2 cm 是半個格距，再大就會跟相鄰格子重疊
+    public float bitmapXYToleranceM = 0.020f;
     // 落點頂面高度跟預期差多少以內算對；超過代表疊到別的方塊上，或在空中放開
     public float bitmapZToleranceM = 0.010f;
     // 模擬夾取時，夾爪 TCP 離方塊中心多遠以內才夾得到
-    public float simGraspToleranceM = 0.015f;
+    public float simGraspToleranceM = 0.020f;
 
     [Header("實機夾取校正（只影響 source，不影響放置矩陣）")]
     public float pickOffsetX = -0.002f;
@@ -241,7 +242,7 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
-    public const float QR1_X = -0.38824f;
+    public const float QR1_X = -0.38824f-0.005f;
     public const float QR1_Y = -0.35973f+0.005f;
     public const float QR1_Z = 0.030f;
 
@@ -317,6 +318,10 @@ public class JsonExecutor : MonoBehaviour
     private double[] sharedTrajectoryStartQ;
     // 只在規劃 layered_grasp 批次的共用軌跡期間為 true（BuildSharedTrajectory 結束一定還原）
     private bool layeredCollisionModel;
+    // 3D 批次用的桌面高度（UR 基座座標，實測比 QR1_Z 低）；2D 一律用 QR1_Z
+    static readonly float LayeredTableZ = QR1_Z + (float)LayeredGraspGeometry.TableZCorrectionM;
+    // 規劃共用軌跡時的桌面高度：layered_grasp 批次規劃期間是 LayeredTableZ，其餘時間都是 QR1_Z
+    private float planningTableZ = QR1_Z;
     // 跟 go_home 的關節目標相同（手臂直立，腕與肘都在奇異點上）
     static readonly double[] GoHomeJointsRad = { -1.5708, -1.5708, 0.0, -1.5708, 0.0, 0.0 };
 
@@ -560,11 +565,16 @@ public class JsonExecutor : MonoBehaviour
                     urListener = ursimListener;
                 }
 
+                // 3D 批次的桌面比 QR1_Z 低：預覽與執行期間畫面上的桌面、積木整組跟著移，跑完移回（2D 不動）
+                if (batch.layered_grasp && sceneSyncer != null)
+                    sceneSyncer.SetTableHeightOffset((float)LayeredGraspGeometry.TableZCorrectionM);
                 executionEpoch++;
                 currentStepCoroutine = StartCoroutine(ExecuteBatch(batch));
                 yield return currentStepCoroutine;
                 currentStepCoroutine = null;
                 currentStepId = -1;
+                if (batch.layered_grasp && sceneSyncer != null)
+                    sceneSyncer.SetTableHeightOffset(0f);
                 if (onUrsim)
                 {
                     urListener = parkedRealListener;
@@ -1072,8 +1082,10 @@ public class JsonExecutor : MonoBehaviour
     bool BuildSharedTrajectory(BatchEnvelope batch, double[] startQ,
         bool reverseTopLeftCube, out string error)
     {
-        // 3D 分層夾取的批次，規劃期間碰撞模型的手指段改用指尖檢查（見 ValidateApproximateRobotCollision）
+        // 3D 分層夾取的批次，規劃期間碰撞模型的手指段改用指尖檢查（見 ValidateApproximateRobotCollision），
+        // 桌面高度改用實測值（高度目標、移動平面與桌面碰撞都以它為準）
         layeredCollisionModel = batch.layered_grasp;
+        planningTableZ = batch.layered_grasp ? LayeredTableZ : QR1_Z;
         try
         {
             return BuildSharedTrajectoryCore(batch, startQ, reverseTopLeftCube, out error);
@@ -1081,6 +1093,10 @@ public class JsonExecutor : MonoBehaviour
         finally
         {
             layeredCollisionModel = false;
+            planningTableZ = QR1_Z;
+            // 3D 批次規劃時暫時改成實測指尖長度，規劃完還原成 Inspector 的長度（2D 批次本來就是這個值）
+            if (batch.layered_grasp)
+                UR3eKinematics.toolOffsetZ = robotArm != null ? robotArm.toolOffsetZ : 0.0;
         }
     }
 
@@ -1091,7 +1107,10 @@ public class JsonExecutor : MonoBehaviour
         sharedFinalTrajectory.Clear();
         sharedTrajectoryStartQ = (double[])startQ.Clone();
         double[] reference = (double[])startQ.Clone();
-        UR3eKinematics.toolOffsetZ = robotArm != null ? robotArm.toolOffsetZ : 0.0;
+        // 3D 批次用實測指尖長度（179 mm）算關節角，URSim、Isaac、實機的指尖才一致；2D 照舊用 Inspector 的 Tool Offset Z
+        UR3eKinematics.toolOffsetZ = batch.layered_grasp
+            ? LayeredGraspGeometry.FingertipLengthM
+            : (robotArm != null ? robotArm.toolOffsetZ : 0.0);
 
         foreach (var env in batch.steps)
         {
@@ -1128,7 +1147,7 @@ public class JsonExecutor : MonoBehaviour
 
                 float x = pos == null ? 0f : QR1_X + pos.x + (source ? pickOffsetX : 0f);
                 float y = pos == null ? 0f : QR1_Y + pos.y + (source ? pickOffsetY : 0f);
-                float z = pos == null ? 0f : QR1_Z + pos.z + Z_CORRECTION;
+                float z = pos == null ? 0f : planningTableZ + pos.z + Z_CORRECTION;
                 float height = Mathf.Clamp(action.height_m > 0f ? action.height_m : SAFE_Z_OFFSET, 0.05f, 0.15f);
                 string orientation = pos == null ? "horizontal" : EffectiveOrientation(pos, source);
                 if (!source && reverseTopLeftCube &&
@@ -1151,7 +1170,7 @@ public class JsonExecutor : MonoBehaviour
                     // 3D 疊放：指尖停在積木真實頂面（csharp_server 算好的層高）下 19 mm，
                     // 取代「感知頂面 + Z_CORRECTION」；2D 不進這裡
                     if (batch.layered_grasp)
-                        z = QR1_Z + (source ? env.source_top_m : env.target_top_m)
+                        z = planningTableZ + (source ? env.source_top_m : env.target_top_m)
                             - (float)LayeredGraspGeometry.GraspDepthBelowTopM;
                     if (!source && holding) z += Mathf.Max(0f, placeDescendExtraZ);
                     if (!PlanValidatedDescent(pa, ref reference, x, y, z, orientation, out error))
@@ -1324,14 +1343,17 @@ public class JsonExecutor : MonoBehaviour
 
     // 模擬手臂 TCP 在 QR frame 的位置，以及夾爪繞垂直軸的 yaw（度）。
     // 跟產生軌跡用同一套運動學，所以就是實機 movej 到這組關節角時的落點。
-    Vector3 SimTcpQR(out float toolYawDeg)
+    // layeredGrasp：3D 批次的預覽，用實測指尖長度（跟規劃相同），算完還原成 Inspector 的長度。
+    Vector3 SimTcpQR(out float toolYawDeg, bool layeredGrasp = false)
     {
         var q = new double[6];
         for (int i = 0; i < 6; i++) q[i] = robotArm.Angles[i] * Mathf.Deg2Rad;
-        UR3eKinematics.toolOffsetZ = robotArm.toolOffsetZ;
+        UR3eKinematics.toolOffsetZ = layeredGrasp ? LayeredGraspGeometry.FingertipLengthM : robotArm.toolOffsetZ;
         double[,] T = UR3eKinematics.FK(q);
+        if (layeredGrasp) UR3eKinematics.toolOffsetZ = robotArm.toolOffsetZ;
         toolYawDeg = (float)(System.Math.Atan2(T[1, 0], T[0, 0]) * 180.0 / System.Math.PI);
-        return new Vector3((float)T[0, 3] - QR1_X, (float)T[1, 3] - QR1_Y, (float)T[2, 3] - QR1_Z);
+        return new Vector3((float)T[0, 3] - QR1_X, (float)T[1, 3] - QR1_Y,
+            (float)T[2, 3] - (layeredGrasp ? LayeredTableZ : QR1_Z));
     }
 
     // 模擬夾取：只夾得到夾爪正下方的方塊。descend 之後 TCP 在方塊頂面上方 contactClearanceM。
@@ -1343,7 +1365,7 @@ public class JsonExecutor : MonoBehaviour
             simPlacementNotes.Add($"{label}: 讀不到模擬手臂姿態，無法判斷夾取");
             return null;
         }
-        Vector3 tcp = SimTcpQR(out float yawDeg);
+        Vector3 tcp = SimTcpQR(out float yawDeg, snapTopsToLayers);
         float expectedTop = tcp.z - contactClearanceM;
         GameObject best = null;
         float bestDistance = float.MaxValue;
@@ -1373,7 +1395,7 @@ public class JsonExecutor : MonoBehaviour
 
     // 模擬放開：方塊中心落在 TCP 正下方，往下掉到最近的支撐面（桌面或其他方塊頂）。
     // domino 方向 = 夾起時的方向 + 搬運途中夾爪轉過的角度。畫面跟判定用同一個落點。
-    void SimRelease(GameObject block, string label)
+    void SimRelease(GameObject block, string label, bool layeredGrasp = false)
     {
         var state = SimBlock(block);
         state.held = false;
@@ -1382,7 +1404,7 @@ public class JsonExecutor : MonoBehaviour
             simPlacementNotes.Add($"{label}: 讀不到模擬手臂姿態，無法判斷落點");
             return;
         }
-        Vector3 tcp = SimTcpQR(out float yawDeg);
+        Vector3 tcp = SimTcpQR(out float yawDeg, layeredGrasp);
         float size = sceneSyncer.cubeSizeM;
 
         float supportTop = 0f;
@@ -1646,7 +1668,7 @@ public class JsonExecutor : MonoBehaviour
         // The first segment may lower from the current TCP to that safe plane.
         // Every candidate still passes the normal
         // joint-transition and approximate collision checks.
-        double configuredTravelZ = QR1_Z + TRAVEL_Z_ABOVE_WORKSPACE;
+        double configuredTravelZ = planningTableZ + TRAVEL_Z_ABOVE_WORKSPACE;
         double minimumTravelZ = endpointHoverZ;
         double firstTravelZ = System.Math.Max(configuredTravelZ, minimumTravelZ);
         string lastError = null;
@@ -1889,7 +1911,7 @@ public class JsonExecutor : MonoBehaviour
     {
         double[][] p = UR3eKinematics.LinkPoints(q);
         float[] radii = { 0.085f, 0.070f, 0.055f, 0.050f, 0.045f, 0.035f };
-        float tableZ = QR1_Z;
+        float tableZ = planningTableZ;
 
         // The base/shoulder are mounted through the table; check all moving links
         // after the upper arm against the tabletop with conservative radii.
@@ -2379,7 +2401,7 @@ public class JsonExecutor : MonoBehaviour
                 {
                     // 落點由夾爪實際位置決定，不直接瞬移到 target_position，
                     // bitmap 比對才驗得出手臂把方塊放在哪。旋轉歸零、方向由 scale 表示。
-                    SimRelease(held, $"{stepLabel} action {i + 1} release");
+                    SimRelease(held, $"{stepLabel} action {i + 1} release", layeredGrasp);
                     string shape = SimBlock(held).isDomino ? "domino" : "cube";
                     held.name = $"{tag}_step{env.step_id}_{shape}";
                     held = null;

@@ -161,6 +161,14 @@ public class SceneSyncer : MonoBehaviour
 
     }
 
+    // 桌面高度微調（公尺，負值 = 桌面往下）：JsonExecutor 在 3D 批次（layered_grasp）預覽與執行期間
+    // 把桌面、QR 標記與積木整組移到實測的高度，跑完傳 0 回到原位。只改畫面位置，積木的 QR 座標不變。
+    public void SetTableHeightOffset(float offsetM)
+    {
+        if (workspaceRoot == null) return;
+        workspaceRoot.localPosition = -QRToUnity(armBaseAtQrX, armBaseAtQrY, armBaseAtQrZ - offsetM);
+    }
+
     // 讓外部（JsonExecutor 模擬預覽）依 QR frame 座標找最近的 cube
     // qrPos: 感知/csharp_server 用的 QR frame (x=水平寬, y=水平深, z=高)
     public GameObject FindNearestCube(float qrX, float qrY, float qrZ, float maxDistM = 0.10f)

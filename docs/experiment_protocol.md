@@ -6,7 +6,9 @@
 
 先啟動 perception_server 與 Unity，在 csharp_server 目錄執行 `dotnet run`。需要 OPENAI_API_KEY；ROBOT_MODEL 可指定模型，預設 gpt-5。Unity 仍使用既有輸入與執行檔案介面。
 
-第一次任務在相機連續三次確認桌面穩定後，建立 `outputs/experiments/initial_scene.json`。之後每個新任務，必須將實體積木放回該配置。程式用一對一物件比對檢查名稱、形狀、XY（15mm）、Z（10mm），domino 也檢查方向與角度。未符合就等待；不會用虛擬積木重置冒充實體桌面重置，也不會自動操控手臂搬回積木。更换基準需停止服務，移除 initial_scene.json，再建立新基準。
+預設每個任務以收到指令時的桌面為起點：相機連續三次看到桌面穩定（跟上一幀一對一比對名稱、形狀、XY 15mm、Z 10mm，domino 另比方向與角度）就開始，當下的場景存成該任務的 `initial_scene.json`。各任務的起點因此可能不同，跨任務比較成功率時要一併報告起點配置（每個任務的 config.json 記 `initial_scene_source = table_at_command`）。
+
+需要每個任務都從同一個配置開始時（正式比較用），設定環境變數 `FIXED_BASELINE=1` 後重啟服務：第一次任務建立 `outputs/experiments/initial_scene.json`，之後每個新任務都必須將實體積木放回該配置，未符合就等待並逐物件列出差距（config.json 記 `fixed_baseline`）。兩種模式都不會用虛擬積木重置冒充實體桌面重置，也不會自動操控手臂搬回積木。更換固定基準需停止服務，移除 initial_scene.json，再建立新基準。
 
 同一任務內不重置積木；下一次嘗試接續上次結果，重新觀測並規劃。規則只在本任務內存在，下一個任務清空。Unity 的執行前動畫預覽仍會還原預覽前的畫面；這是撤銷虛擬預演，不是撤銷實體操作。實機仍沿用既有 Ready/Home、碰撞與關節檢查，並未要求 LLM 學習低階關節控制。
 

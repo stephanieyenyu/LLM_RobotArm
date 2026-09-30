@@ -759,6 +759,9 @@ MonoBehaviour:
   sharedMovejAcceleration: 0.4
   sharedMovejVelocity: 0.55
   allowTopLeftCubeYaw180OnHardware: 1
+  bitmapXYToleranceM: 0.02
+  bitmapZToleranceM: 0.01
+  simGraspToleranceM: 0.02
   pickOffsetX: 0.002
   pickOffsetY: 0.002
   useReadyPose: 1

@@ -2,7 +2,7 @@
 
 以中文自然語言指令控制 UR3e 機械手臂的框架。RealSense D435i 即時偵測工作台物件 → OpenAI gpt-5 解析指令 → Unity 送 URScript 到手臂。
 
-目前採自由規劃與失敗反思實驗流程；任務間恢復初始桌面，任務內不重置，最多嘗試十次。操作方式、重置基準與評分限制見 [實驗協定](docs/experiment_protocol.md)。
+目前採自由規劃與失敗反思實驗流程；每個任務以收到指令時的桌面為起點（設 `FIXED_BASELINE=1` 則要求每個任務先恢復同一個固定配置），任務內不重置，最多嘗試十次。操作方式、重置基準與評分限制見 [實驗協定](docs/experiment_protocol.md)。
 
 ## 系統流程
 
@@ -33,7 +33,7 @@ UR3e
 **csharp_server/**
 - `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP（`/camera` 提供相機內參與位姿給 Isaac Sim）
 - `IsaacSimExecutor.cs` — 疊放規劃先送 Isaac Sim 模擬，存模擬 / 疊合截圖
-- `Program.cs` — 任務間初始配置檢查、任務內保留現況、十次嘗試與逐操作執行
+- `Program.cs` — 任務起點確認（目前桌面穩定，或固定配置比對）、任務內保留現況、十次嘗試與逐操作執行
 - `ExperimentLlm.cs` — 自由拆解、自然語言規劃、轉譯、獨立結果驗證及反思
 - `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
 - `ExperimentMetrics.cs` — 首次／十次內成功率及各次累積成功率
@@ -113,12 +113,18 @@ D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 -
 Unity Inspector 的 JsonExecutor 多一個 `Ursim IP`（預設 192.168.50.221）。Isaac Sim 在別台電腦時，
 csharp_server 那邊 `setx ISAAC_SIM_URL "http://<IP>:6000/"`。
 
-必須跟 Unity 一致的參數：`--qr1`（JsonExecutor.cs QR1_X/Y/Z）、`--gripper_do`（夾爪 DO 編號）、
+必須跟 Unity 一致的參數：`--qr1`（X/Y = JsonExecutor.cs QR1_X/Y；Z = 3D 用的實測桌面高度
+`QR1_Z + LayeredGraspGeometry.TableZCorrectionM`，預設 0.000）、`--gripper_do`（夾爪 DO 編號）、
 `--ready_q`（Inspector 的 Ready Joints Rad；URSim 到 Ready 之後才開始記錄指尖最低點，之前 URSim 從上一次停留的
 姿勢移過來的過程不算）、`--layer_snap_offset`（LayeredGraspGeometry.cs LayerSnapOffsetM）。
 驗證報告的物件 z 維持 perception 慣例：每塊積木加回投影時自己的量測偏差，沒動過的積木回報值跟輸入相同。
-`--fingertip_m`（預設 0.123）是實體夾爪法蘭面 → 指尖的實測距離；夾爪 3D 模型是 179 mm，啟動時整支夾爪
-（手指 + 本體）往法蘭移到這個長度。換夾爪或手指時要重新量。
+`--fingertip_m`（預設 0.179）是實體夾爪法蘭面 → 指尖的實測距離（2026-09-29 實測 179 mm）；Isaac 啟動時量資產的
+指尖位置，不同就把整支夾爪（手指 + 本體）沿工具軸移到這個長度。3D 批次在 Unity 也用同一個長度算關節角
+（`LayeredGraspGeometry.FingertipLengthM`），URSim、Isaac 與實機的指尖才會一致；2D 照舊用 UR3 物件 RobotArm 的
+`Tool Offset Z`（0.123）。換夾爪或手指時要重新量，兩邊一起改。
+桌面高度同理：2026-09-29 實測同一組關節角下實機比模型高約 30 mm（法蘭與指尖一起高），代表桌面比 QR1_Z 低，
+3D 批次改用 `QR1_Z + TableZCorrectionM`（-0.030）規劃，Unity 在 3D 批次預覽與執行期間把畫面上的桌面整組下移同樣距離，
+Isaac 的 `--qr1` Z 也用這個值；2D 照舊用 QR1_Z。
 UR 基座 → Isaac 世界在啟動時用 FK 自動校正（本資產實測差 180°）；`GET /status` 看是否跟上 URSim。
 
 每次 3D 驗證的紀錄在 `attempt_XX/isaac_sim/`：`ursim_batch.json`、`ursim_execution.json`、

@@ -6,6 +6,14 @@ using System;
 // 三邊用同一份數字。isaac_sim/block_layers.py 是同一套層高規則的 Python 版，改這裡要一起改。
 public static class LayeredGraspGeometry
 {
+    // 法蘭面 → 實體指尖（2026-09-29 實測 179 mm，跟 Unity / Isaac 的夾爪模型相同）。3D 批次算關節角、
+    // 碰撞檢查與預覽都用這個長度，URSim、Isaac 與實機的指尖才會在同一個位置；
+    // 2D 照舊用 RobotArm.toolOffsetZ。isaac_sim_server.py --fingertip_m 的預設值要跟這裡一樣。
+    public const double FingertipLengthM = 0.179;
+    // 3D 批次的桌面高度 = JsonExecutor.QR1_Z + 這個值（UR 基座座標）。2026-09-29 實測：同一組關節角下實機
+    // 比模型高約 30 mm，法蘭與指尖一起高，代表桌面比 QR1_Z 低，不是夾爪長度的問題。2D 照舊用 QR1_Z；
+    // isaac_sim_server.py --qr1 的 Z 預設要等於 QR1_Z + 這個值。
+    public const double TableZCorrectionM = -0.030;
     // cube 與平放 domino 的高度都是 2.5 cm：積木頂面只可能落在 2.5 cm 的整數倍。
     public const double BlockLayerM = 0.025;
     // perception 頂面系統性偏低，對齊層高前先補這段。桌面上的積木一律是第 1 層（下限），所以這個值只影響

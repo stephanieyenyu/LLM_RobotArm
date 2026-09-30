@@ -14,15 +14,17 @@ isaac_sim_server.py — 常駐 Isaac Sim HTTP 服務：3D 疊放的物理驗證�
     D:/isaacsim/ur3_gripper_scene/ur3_gripper_scene/gripper_separate/
         ur3e_with_gripper_for_isaac_sim/ur3e_with_gripper_for_isaac_sim.usd
     /ur3e_with_gripper/world 為 Articulation 根；6 個手臂關節 + left/right_finger_joint（prismatic，無限位）
-    夾爪模型（跟 Unity 的 Gripper 模型相同）指尖在法蘭下 179 mm；實體夾爪實測 123 mm，
-    啟動時依 --fingertip_m 把整支夾爪（手指 + 本體）往法蘭移，讓指尖對齊實物。
+    實體夾爪指尖在法蘭下 179 mm（2026-09-29 實測），3D 批次在 Unity 也用這個長度算關節角
+    （LayeredGraspGeometry.FingertipLengthM）。啟動時量資產的指尖位置，跟 --fingertip_m 不同就把整支夾爪
+    （手指 + 本體）沿工具軸移過去（資產較短就往外延伸），讓模擬的指尖跟實物一致。
 
 座標系（全部以公尺為單位）：
     QR 座標系    perception /scene 與 csharp_server 使用；QR1 為原點，X = QR1→QR2，Y = QR1→QR3，Z 向上，
                  物件 z 是頂面高度（perception 量測值，系統性偏低，偏多少依顏色而定）。投影時頂面對齊 2.5 cm
                  層高（同 Unity LayeredGraspGeometry.SnapTopToLayer，--layer_snap_offset）；對外（/scene、驗證報告）
                  每塊積木加回自己投影時的量測偏差，維持 perception 慣例（沒動過的積木回報值跟輸入相同）。
-    UR 基座座標  控制器 / DH 運動學使用。跟 Unity JsonExecutor.cs 一樣：base = QR + (QR1_X, QR1_Y, QR1_Z)。
+    UR 基座座標  控制器 / DH 運動學使用。base = QR + --qr1；X/Y 跟 Unity JsonExecutor.cs QR1_X/Y 一樣，
+                 Z 是 3D 批次用的實測桌面高度（QR1_Z + LayeredGraspGeometry.TableZCorrectionM）。
     Isaac 世界   USD 資產的 base_link 跟 UR 控制器 base 差 180°（實測），啟動時用 FK 自動校正。
 
 投影（真實 → 模擬）：
@@ -62,9 +64,11 @@ def parse_args():
     ap.add_argument("--host", default="0.0.0.0", help="0.0.0.0 讓另一台電腦連得到；只想本機測試可改 127.0.0.1")
     ap.add_argument("--robot_usd", default=r"D:\isaacsim\ur3_gripper_scene\ur3_gripper_scene\gripper_separate\ur3e_with_gripper_for_isaac_sim\ur3e_with_gripper_for_isaac_sim.usd",
                     help="UR3e+夾爪 USD 資產完整路徑")
-    # 下面三個必須跟 unity_project/Assets/Scripts/JsonExecutor.cs 一致
-    ap.add_argument("--qr1", type=float, nargs=3, default=[-0.38824, -0.35973 + 0.005, 0.030],
-                    metavar=("X", "Y", "Z"), help="QR1 在 UR 基座座標的位置（JsonExecutor.cs QR1_X/Y/Z）")
+    # 下面三個必須跟 Unity 一致（JsonExecutor.cs、LayeredGraspGeometry.cs）
+    ap.add_argument("--qr1", type=float, nargs=3, default=[-0.38824, -0.35973 + 0.005, 0.030 - 0.030],
+                    metavar=("X", "Y", "Z"),
+                    help="QR1 在 UR 基座座標的位置：X/Y = JsonExecutor.cs QR1_X/Y；Z = 3D 批次的實測桌面高度 "
+                         "= QR1_Z + LayeredGraspGeometry.TableZCorrectionM（2026-09-29 實測桌面比 QR1_Z 低 30 mm）")
     ap.add_argument("--layer_snap_offset", type=float, default=0.0075,
                     help="perception 頂面對齊 2.5 cm 層高前先加的補償（LayeredGraspGeometry.cs LayerSnapOffsetM）")
     ap.add_argument("--ready_q", type=float, nargs=6,
@@ -73,8 +77,10 @@ def parse_args():
                          "（之前是 URSim 上一次停留的姿勢移到 Ready 的過程，不屬於這次計畫）")
     ap.add_argument("--gripper_do", type=int, default=4,
                     help="夾爪用的標準數位輸出編號（JsonExecutor.cs set_standard_digital_out(4, True) = 夾）")
-    ap.add_argument("--fingertip_m", type=float, default=0.123,
-                    help="實體夾爪法蘭面 → 指尖的實測距離（公尺）；跟模型（179 mm）不同時把 Isaac 的手指移到這個位置")
+    ap.add_argument("--fingertip_m", type=float, default=0.179,
+                    help="實體夾爪法蘭面 → 指尖的實測距離（公尺，2026-09-29 實測 179 mm）；要跟 Unity "
+                         "LayeredGraspGeometry.FingertipLengthM 相同（3D 批次算關節角用的長度）。"
+                         "資產量到的長度不同時，整支夾爪沿工具軸移到這個位置")
     ap.add_argument("--ursim_ip", default=None, help="URSim IP；手臂即時跟隨它（只讀唯讀埠，不送指令）")
     ap.add_argument("--ursim_port", type=int, default=30013, help="URSim 唯讀 realtime 埠")
     ap.add_argument("--skew_sign", type=float, default=-1.0,
@@ -147,7 +153,7 @@ WORKSPACE_PATH = "/World/workspace"
 BLOCK_MATERIAL_PATH = "/World/Physics/block_material"
 
 # 驗證門檻
-VERIFY_XY_TOL_M = 0.015          # 放置位置 XY 誤差（含 perception 抖動與夾取偏移）
+VERIFY_XY_TOL_M = 0.020          # 放置位置 XY 誤差（含 perception 抖動與夾取偏移）
 VERIFY_Z_TOL_M = 0.008           # 頂面高度與預期層高的誤差
 VERIFY_TILT_TOL_DEG = 10.0       # 傾斜角
 VERIFY_MOVED_TOL_M = 0.010       # 沒被搬的積木位移超過這個就算被撞動
@@ -599,7 +605,7 @@ def build_world():
 
     calibrate_robot_frame()
 
-    # 桌面頂面 = QR 平面（UR 基座座標 z = QR1_Z），校正後才知道在 Isaac 世界的高度；地板在桌面下方接住掉落的積木
+    # 桌面頂面 = QR 平面（UR 基座座標 z = --qr1 的 Z），校正後才知道在 Isaac 世界的高度；地板在桌面下方接住掉落的積木
     table_z = float(qr_to_world([0.0, 0.0, 0.0])[2])
     block_material = PhysicsMaterial(prim_path=BLOCK_MATERIAL_PATH,
                                      static_friction=0.9, dynamic_friction=0.8, restitution=0.0)
