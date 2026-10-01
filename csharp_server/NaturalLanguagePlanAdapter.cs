@@ -81,6 +81,10 @@ public static class NaturalLanguagePlanAdapter
     {
         var groups = new List<List<Match>> { new() };
         bool completedPlacement = false;
+        // LLM 常在整段執行路徑最前面先加一個不帶任何動作的 release()，當作「確保夾爪
+        // 一開始是打開的」保險動作；這種 release() 前面沒有真的 grasp() 過，不算完成
+        // 一次放置，不應該被當成一組抓放的結尾（否則會把這個保險動作誤算成多出一組）。
+        bool graspedInGroup = false;
         foreach (Match match in matches)
         {
             string function = match.Groups[1].Value.ToLowerInvariant();
@@ -92,9 +96,11 @@ public static class NaturalLanguagePlanAdapter
             {
                 groups.Add(new List<Match>());
                 completedPlacement = false;
+                graspedInGroup = false;
             }
             groups[^1].Add(match);
-            if (function == "release") completedPlacement = true;
+            if (function == "grasp") graspedInGroup = true;
+            if (function == "release" && graspedInGroup) completedPlacement = true;
         }
         return groups;
     }
