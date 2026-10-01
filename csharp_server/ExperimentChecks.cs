@@ -135,5 +135,15 @@ public static class ExperimentChecks
             ExpectedColor = source.Name.Split('_')[0], ExpectedOrientation = target.Orientation };
         return true;
     }
+    public static bool IsAlreadyAtTarget(Assignment assignment, double toleranceM = 0.020)
+    {
+        if (assignment.Source == null || assignment.Target == null) return false;
+        double dx = assignment.Source.X - assignment.Target.WorldX;
+        double dy = assignment.Source.Y - assignment.Target.WorldY;
+        return Math.Sqrt(dx * dx + dy * dy) <= toleranceM &&
+               assignment.Source.Shape == assignment.Target.ExpectedShape &&
+               assignment.Source.Name.Contains(assignment.Target.ExpectedColor,
+                   StringComparison.OrdinalIgnoreCase);
+    }
     static double Distance(SceneObject a, SceneObject b) => Math.Sqrt(Math.Pow(a.X - b.X, 2) + Math.Pow(a.Y - b.Y, 2));
 }

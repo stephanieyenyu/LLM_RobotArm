@@ -15,6 +15,8 @@ public class UIManager : MonoBehaviour
 
     private TextField inputField;
     private Button sendButton;
+    private Button simModeButton;
+    private Button simSceneButton;
     private Label statusLabel;
     private Coroutine uiMonitor;
     private string fallbackCommand = "";
@@ -153,9 +155,22 @@ public class UIManager : MonoBehaviour
         homeBtn.style.height = 36;
         homeBtn.style.width = 120;
 
+        // 純模擬 / 實機切換：寫 StreamingAssets/run_mode.json，csharp_server 下一個指令開始時讀
+        simModeButton = new Button(OnToggleSimMode);
+        simModeButton.style.height = 36;
+        simModeButton.style.width = 120;
+        simModeButton.style.marginTop = 10;
+        simSceneButton = new Button(OnCycleScene);
+        simSceneButton.style.height = 36;
+        simSceneButton.style.width = 120;
+        simSceneButton.style.marginTop = 4;
+        UpdateModeButtons();
+
         controlPanel.Add(openBtn);
         controlPanel.Add(gripBtn);
         controlPanel.Add(homeBtn);
+        controlPanel.Add(simModeButton);
+        controlPanel.Add(simSceneButton);
         root.Add(controlPanel);
         Debug.Log("[UI] 輸入框、執行按鈕與手動控制已建立。", this);
     }
@@ -178,6 +193,72 @@ public class UIManager : MonoBehaviour
         ShowMessage(message);
     }
 
+    string ModeButtonText() => RunMode.IsSim ? "模式：純模擬" : "模式：實機";
+    string SceneButtonText() => "場景：" + Path.GetFileNameWithoutExtension(RunMode.Scene);
+
+    void OnToggleSimMode()
+    {
+        ResolveExecutor();
+        if (executor != null && executor.IsBusy)
+        {
+            ShowMessage("手臂正在執行，執行完再切換模式。");
+            return;
+        }
+        try
+        {
+            RunMode.SetSim(!RunMode.IsSim);
+        }
+        catch (System.Exception ex)
+        {
+            ShowMessage("切換模式失敗（寫不了 run_mode.json）：" + ex.Message);
+            return;
+        }
+        UpdateModeButtons();
+        ShowMessage(RunMode.IsSim
+            ? $"已切成純模擬：正在把 {RunMode.Scene} 載入 Isaac Sim，畫面會顯示模擬的積木；下一個指令起動作只送 URSim。" +
+              "要先開 isaac_sim_server（--ursim_ip）與 URSim。"
+            : "已切成實機：畫面改顯示相機看到的積木，下一個指令起動作送實體手臂。要先開 perception_server。");
+    }
+
+    // 輪流切換 repo 根目錄 sim_scenes/ 裡的虛擬場景檔（SceneSyncer 會馬上重建 Isaac 世界，執行中不能換）
+    void OnCycleScene()
+    {
+        ResolveExecutor();
+        if (executor != null && executor.IsBusy)
+        {
+            ShowMessage("手臂正在執行，執行完再換場景。");
+            return;
+        }
+        var scenes = RunMode.AvailableScenes();
+        if (scenes.Length == 0)
+        {
+            ShowMessage("找不到虛擬場景檔（repo 根目錄 sim_scenes/*.json）。");
+            return;
+        }
+        string next = scenes[(System.Array.IndexOf(scenes, RunMode.Scene) + 1) % scenes.Length];
+        try
+        {
+            RunMode.SetScene(next);
+        }
+        catch (System.Exception ex)
+        {
+            ShowMessage("換場景失敗（寫不了 run_mode.json）：" + ex.Message);
+            return;
+        }
+        UpdateModeButtons();
+        ShowMessage($"虛擬場景：{next}，正在載入 Isaac Sim…");
+    }
+
+    void UpdateModeButtons()
+    {
+        if (simModeButton != null) simModeButton.text = ModeButtonText();
+        if (simSceneButton != null)
+        {
+            simSceneButton.text = SceneButtonText();
+            simSceneButton.style.display = RunMode.IsSim ? DisplayStyle.Flex : DisplayStyle.None;
+        }
+    }
+
     public void ShowMessage(string message)
     {
         if (statusLabel == null) return;
@@ -193,15 +274,28 @@ public class UIManager : MonoBehaviour
         // experiment can still be started without editing the scene.
         const float margin = 10f;
         const float buttonWidth = 90f;
+        const float modeWidth = 120f;
+        const float sceneWidth = 150f;
         const float height = 38f;
         float y = Mathf.Max(margin, Screen.height - height - margin);
         GUI.Box(new Rect(0, y - 6f, Screen.width, height + 12f), GUIContent.none);
+        // 由右往左：執行、模式切換、（純模擬時）換場景，剩下的寬度給輸入框
+        float x = Screen.width - margin - buttonWidth;
+        if (GUI.Button(new Rect(x, y, buttonWidth, height), "執行"))
+            SubmitCommand(fallbackCommand);
+        x -= margin + modeWidth;
+        if (GUI.Button(new Rect(x, y, modeWidth, height), ModeButtonText()))
+            OnToggleSimMode();
+        if (RunMode.IsSim)
+        {
+            x -= margin + sceneWidth;
+            if (GUI.Button(new Rect(x, y, sceneWidth, height), SceneButtonText()))
+                OnCycleScene();
+        }
         GUI.SetNextControlName("RobotCommandFallback");
         fallbackCommand = GUI.TextField(
-            new Rect(margin, y, Mathf.Max(100f, Screen.width - buttonWidth - margin * 3f), height),
+            new Rect(margin, y, Mathf.Max(100f, x - margin * 2f), height),
             fallbackCommand ?? "");
-        if (GUI.Button(new Rect(Screen.width - buttonWidth - margin, y, buttonWidth, height), "執行"))
-            SubmitCommand(fallbackCommand);
     }
 
     void OnSendCommand()

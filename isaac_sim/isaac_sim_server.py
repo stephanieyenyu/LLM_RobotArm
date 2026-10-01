@@ -17,6 +17,8 @@ isaac_sim_server.py — 常駐 Isaac Sim HTTP 服務：3D 疊放的物理驗證�
     實體夾爪指尖在法蘭下 179 mm（2026-09-29 實測），3D 批次在 Unity 也用這個長度算關節角
     （LayeredGraspGeometry.FingertipLengthM）。啟動時量資產的指尖位置，跟 --fingertip_m 不同就把整支夾爪
     （手指 + 本體）沿工具軸移過去（資產較短就往外延伸），讓模擬的指尖跟實物一致。
+    資產手指（指尖單指厚 21 mm、寬 20 mm、末端外張）也在啟動時換成實測大小的直方塊（--finger_thickness_m /
+    --finger_width_m，預設各 15 mm），張開寬度（--gripper_open_m）與指尖位置不變。
 
 座標系（全部以公尺為單位）：
     QR 座標系    perception /scene 與 csharp_server 使用；QR1 為原點，X = QR1→QR2，Y = QR1→QR3，Z 向上，
@@ -33,15 +35,24 @@ isaac_sim_server.py — 常駐 Isaac Sim HTTP 服務：3D 疊放的物理驗證�
     - 桌面：QR1-4 標記、QR1→QR2→QR4→QR3 藍色框線，桌面比標記外緣再大 --table_margin。
     - 手臂：跟隨 URSim（--ursim_ip）；沒給時停在 Unity 的 Home（直立）。
 
+純模擬（Unity「模擬模式」按鈕；不接相機與實體手臂）：
+    本服務就是世界：csharp_server 每個任務開始時用虛擬場景檔（repo 的 sim_scenes/*.json）重建積木
+    （/sim/load），之後只靠物理改變；/perception/* 跟 perception_server 同格式，csharp_server 與 Unity
+    從這裡拿場景和相機畫面。所有動作都送 URSim，手臂跟隨 URSim。3D 驗證不重新投影（/verify/begin 帶
+    use_current_world），驗證前 /sim/snapshot、驗證後 /sim/restore，正式執行從驗證前的狀態開始。
+
 用法（在 Isaac Sim 電腦上）：
   D:\\isaacsim\\python.bat isaac_sim_server.py --ursim_ip 192.168.50.221 [--gui]
 
 Endpoint：
-  POST /verify/begin   {"scene": [SceneObject...], "camera": {...}?, "steps": [{source_index, target, actions}]}
+  POST /verify/begin   {"scene": [SceneObject...], "camera": {...}?, "steps": [{source_index, target, actions}],
+                        "use_current_world": bool?}
   POST /verify/end     → {"pass": bool, "reasons": [...], "checks": [...], "objects": [...], ...}
   POST /reset          {"scene": [...], "camera": {...}?, "joints": [6 rad]?}（只投影，不驗證）
   POST /overlay?alpha=0.5   body = 真實相機 JPEG → 疊合 JPEG
   GET  /scene  /frame  /calibration  /camera  /status
+  純模擬：POST /sim/load {"scene": [...], "camera": {...}?, "if_idle": true?}、POST /sim/snapshot、POST /sim/restore
+          GET /perception/scene、GET|POST /perception/scene/mode、GET /perception/debug/frame、GET /perception/camera
 """
 
 import argparse
@@ -65,7 +76,7 @@ def parse_args():
     ap.add_argument("--robot_usd", default=r"D:\isaacsim\ur3_gripper_scene\ur3_gripper_scene\gripper_separate\ur3e_with_gripper_for_isaac_sim\ur3e_with_gripper_for_isaac_sim.usd",
                     help="UR3e+夾爪 USD 資產完整路徑")
     # 下面三個必須跟 Unity 一致（JsonExecutor.cs、LayeredGraspGeometry.cs）
-    ap.add_argument("--qr1", type=float, nargs=3, default=[-0.38637 - 0.005, -0.35747, 0.030 - 0.030],
+    ap.add_argument("--qr1", type=float, nargs=3, default=[-0.38637 - 0.007, -0.35747, 0.030 - 0.030],
                     metavar=("X", "Y", "Z"),
                     help="QR1 在 UR 基座座標的位置：X/Y = JsonExecutor.cs QR1_X/Y；Z = 3D 批次的實測桌面高度 "
                          "= QR1_Z + LayeredGraspGeometry.TableZCorrectionM（2026-09-29 實測桌面比 QR1_Z 低 30 mm）")
@@ -81,6 +92,14 @@ def parse_args():
                     help="實體夾爪法蘭面 → 指尖的實測距離（公尺，2026-09-29 實測 179 mm）；要跟 Unity "
                          "LayeredGraspGeometry.FingertipLengthM 相同（3D 批次算關節角用的長度）。"
                          "資產量到的長度不同時，整支夾爪沿工具軸移到這個位置")
+    ap.add_argument("--gripper_open_m", type=float, default=0.035,
+                    help="夾爪張開時兩指內側間距（公尺，2026-09-30 實測實體夾爪 3.5 cm）；Isaac 的手指張到同樣寬，"
+                         "旁邊積木會不會被手指碰到才跟實物一致")
+    ap.add_argument("--finger_thickness_m", type=float, default=0.015,
+                    help="實體夾爪單根手指沿閉合方向的厚度（公尺，2026-09-30 實測約 1.5 cm）；啟動時把資產手指"
+                         "（指尖厚 21 mm、寬 20 mm）換成這個大小的直方塊。0 = 用資產原本的手指")
+    ap.add_argument("--finger_width_m", type=float, default=0.015,
+                    help="實體夾爪單根手指垂直閉合方向的寬度（公尺，2026-09-30 實測約 1.5 cm）")
     ap.add_argument("--ursim_ip", default=None, help="URSim IP；手臂即時跟隨它（只讀唯讀埠，不送指令）")
     ap.add_argument("--ursim_port", type=int, default=30013, help="URSim 唯讀 realtime 埠")
     ap.add_argument("--skew_sign", type=float, default=-1.0,
@@ -132,9 +151,16 @@ FINGER_LINKS = ["left_finger", "right_finger"]
 
 CUBE_SIZE_M = 0.025
 BLOCK_MASS_KG = 0.015
-# 實測資產：手指關節 0 時內側間距 4 cm，關節值每 +1 mm 兩指各往外 1 mm（開）。
-# 開 = 間距 7 cm（夾得下 5 cm domino 長邊）；合的目標設在間距 0，靠接觸力夾住。
-GRIPPER_OPEN_POS = 0.015
+# 實測資產（量手指 Mesh 頂點）：手指末端往外張，指尖（最低 15 mm）在關節 0 時內側間距 57.5 mm，
+# 上半段最靠內處才 40 mm；指尖單指厚 21 mm、寬 20 mm。關節值每 +1 mm 兩指各往外 1 mm（開）。
+# 開 = 指尖內側間距 --gripper_open_m（預設 3.5 cm：2026-09-30 實測實體夾爪張開只有 3.5 cm，只跨得住 2.5 cm 的邊，
+# 跨不住 domino 長邊）→ 關節 −11.25 mm；合的目標設在關節 −20 mm（指尖間距 17.5 mm），靠接觸力夾住。
+# 實體手指是單指厚、寬各約 15 mm 的直條（2026-09-30 實測），啟動時把資產手指換成這個大小的直方塊（replace_fingers）：
+# 內側面整條放在資產指尖最靠內處（關節 0 時間距仍是 57.5 mm），下緣 = 資產指尖，張開寬度與 flange → 指尖距離都不變。
+GRIPPER_ZERO_SPACING_M = 0.0575
+FINGERTIP_WINDOW_M = 0.015       # 上面說的「指尖」= 手指最低的這一段
+FINGER_BOX_NAME = "measured_finger"
+GRIPPER_OPEN_POS = (args.gripper_open_m - GRIPPER_ZERO_SPACING_M) / 2
 GRIPPER_CLOSE_POS = -0.020
 GRIPPER_STIFFNESS = 2000.0
 GRIPPER_DAMPING = 20.0
@@ -189,12 +215,16 @@ blocks = []           # [{"index": int, "source": dict, "cuboid": DynamicCuboid 
 block_material = None
 calibration = {}
 camera_state = {"source": "default"}
+camera_pose_world = None   # (位置, ROS 慣例旋轉) 最後一次設定的模擬相機位姿，出圖前放回去
 qr_markers = dict(DEFAULT_QR_MARKERS)
 qr_size_m = DEFAULT_QR_SIZE_M
 workspace_signature = None
 follower = None
 verify_state = {"active": False}
 follow_tick_count = 0
+# 純模擬：Unity 透過 /perception/scene/mode 通知執行中 / 閒置（跟 perception_server 相同）；驗證前的積木位姿快照
+perception_mode = "idle"
+world_snapshot = None
 
 # UR 基座 → Isaac 世界（啟動時由 FK 校正覆寫）
 R_WORLD_FROM_BASE = np.eye(3)
@@ -563,6 +593,67 @@ def shift_gripper(delta_m):
     return body_bottom
 
 
+def finger_box_specs(thickness_m, width_m):
+    """量資產手指（Mesh 頂點，工具朝下時 physics 的連桿位姿），算出換成實測直方塊的位置（手指自身座標）：
+    內側面 = 資產指尖（最低 FINGERTIP_WINDOW_M）最靠內處，下緣 = 資產指尖，上緣 = 資產手指頂端，
+    垂直閉合方向置中，厚度往外長。張開寬度與 flange → 指尖距離因此跟資產相同。模擬執行中才量得到。"""
+    teleport(TOOL_DOWN_Q, settle_steps=10)
+    links = link_positions()
+    stage = omni.usd.get_context().get_stage()
+    down = R_WORLD_FROM_BASE @ fk(TOOL_DOWN_Q)[:3, 2]
+    local, world_pts, rot = {}, {}, {}
+    for name in FINGER_LINKS:
+        root = stage.GetPrimAtPath(f"{ROBOT_MOUNT_PATH}/{name}")
+        root_inv = UsdGeom.Xformable(root).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+        pts = []
+        for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):   # 手指 Mesh 在 instance 底下
+            raw = UsdGeom.Mesh(prim).GetPointsAttr().Get() if prim.IsA(UsdGeom.Mesh) else None
+            if raw is not None and len(raw):
+                rel = np.array(UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default()) * root_inv)
+                pts.append((np.c_[np.asarray(raw, dtype=np.float64), np.ones(len(raw))] @ rel)[:, :3])
+        pose = links[name].astype(np.float64)
+        rot[name] = matrix_from_quat_wxyz([pose[6], pose[3], pose[4], pose[5]])   # physics 是 xyzw
+        local[name] = np.vstack(pts)
+        world_pts[name] = local[name] @ rot[name].T + pose[:3]
+    specs = {}
+    for name, other in zip(FINGER_LINKS, reversed(FINGER_LINKS)):
+        inward = world_pts[other].mean(axis=0) - world_pts[name].mean(axis=0)
+        inward -= down * (inward @ down)
+        u = rot[name].T @ (inward / np.linalg.norm(inward))   # 往另一根手指（閉合方向）
+        d = rot[name].T @ down                                 # 往指尖
+        p = np.cross(u, d)                                     # 手指寬度方向
+        su, sd, sp = local[name] @ u, local[name] @ d, local[name] @ p
+        tip = sd > sd.max() - FINGERTIP_WINDOW_M
+        across = (sp[tip].min() + sp[tip].max()) / 2
+        specs[name] = {
+            "center": u * (su[tip].max() - thickness_m / 2) + d * (sd.max() + sd.min()) / 2 + p * across,
+            "axes": np.column_stack([u, d, p]),
+            "size": (thickness_m, float(sd.max() - sd.min()), width_m),
+        }
+    return specs
+
+
+def replace_fingers(specs):
+    """停用資產手指的 visuals / collisions，在手指 link 底下放 finger_box_specs 算好的直方塊（Cube，看得到也有碰撞）。
+    跟資產手指一樣不綁物理材質；質量由 PhysX 依碰撞體積重算。要在模擬停止時改，下一次 world.reset() 生效。"""
+    stage = omni.usd.get_context().get_stage()
+    for name, spec in specs.items():
+        root = f"{ROBOT_MOUNT_PATH}/{name}"
+        for sub in ("visuals", "collisions"):
+            holder = stage.GetPrimAtPath(f"{root}/{sub}")
+            if holder:
+                holder.SetActive(False)
+        cube = UsdGeom.Cube.Define(stage, f"{root}/{FINGER_BOX_NAME}")
+        cube.CreateSizeAttr(1.0)
+        cube.CreateDisplayColorAttr([Gf.Vec3f(0.25, 0.25, 0.27)])
+        xf = UsdGeom.Xformable(cube.GetPrim())
+        xf.AddTranslateOp().Set(Gf.Vec3d(*[float(v) for v in spec["center"]]))
+        q = quat_wxyz_from_matrix(spec["axes"])
+        xf.AddOrientOp().Set(Gf.Quatf(float(q[0]), float(q[1]), float(q[2]), float(q[3])))
+        xf.AddScaleOp().Set(Gf.Vec3f(*[float(v) for v in spec["size"]]))
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+
+
 # ============================================================
 # 場景 / 機器人建置
 # ============================================================
@@ -604,6 +695,9 @@ def build_world():
     gripper_indices = [dof_names.index(n) for n in GRIPPER_JOINT_NAMES]
 
     calibrate_robot_frame()
+    finger_boxes = None
+    if args.finger_thickness_m > 0 and args.finger_width_m > 0:
+        finger_boxes = finger_box_specs(args.finger_thickness_m, args.finger_width_m)
 
     # 桌面頂面 = QR 平面（UR 基座座標 z = --qr1 的 Z），校正後才知道在 Isaac 世界的高度；地板在桌面下方接住掉落的積木
     table_z = float(qr_to_world([0.0, 0.0, 0.0])[2])
@@ -616,9 +710,18 @@ def build_world():
     body_bottom = None
     if args.fingertip_m and abs(args.fingertip_m - asset_tip) > 0.001:
         body_bottom = shift_gripper(args.fingertip_m - asset_tip)
+    if finger_boxes:
+        replace_fingers(finger_boxes)
     build_workspace()
     world.reset()
     apply_gripper_gains()
+    if finger_boxes:
+        length = finger_boxes[FINGER_LINKS[0]]["size"][1]
+        calibration["finger_box_m"] = {"thickness": args.finger_thickness_m, "width": args.finger_width_m,
+                                       "length": round(length, 4)}
+        log(f"[isaac_sim_server] 手指換成實測直方塊：單指厚 {args.finger_thickness_m * 1000:.1f} mm、"
+            f"寬 {args.finger_width_m * 1000:.1f} mm、長 {length * 1000:.1f} mm；張開時內側間距 "
+            f"{args.gripper_open_m * 1000:.1f} mm、外側 {(args.gripper_open_m + 2 * args.finger_thickness_m) * 1000:.1f} mm")
     if args.fingertip_m and abs(args.fingertip_m - asset_tip) > 0.001:
         TCP_OFFSET_M = measure_fingertip() or TCP_OFFSET_M
         calibration["flange_to_fingertip_m"] = round(TCP_OFFSET_M, 4)
@@ -718,8 +821,10 @@ def look_at_rotation_ros(eye, target):
 
 
 def set_camera_pose_world(position, rotation_ros):
-    camera.set_world_pose(position=np.asarray(position, dtype=np.float64),
-                          orientation=quat_wxyz_from_matrix(rotation_ros), camera_axes="ros")
+    global camera_pose_world
+    camera_pose_world = (np.asarray(position, dtype=np.float64), np.asarray(rotation_ros, dtype=np.float64))
+    camera.set_world_pose(position=camera_pose_world[0],
+                          orientation=quat_wxyz_from_matrix(camera_pose_world[1]), camera_axes="ros")
 
 
 def set_view_camera():
@@ -780,7 +885,12 @@ def apply_camera(cam):
 
 def render_frame(min_renders=2, max_renders=10):
     """回傳模擬相機 BGR 影像。world.render() 的 annotator 資料會落後好幾幀（實測拿到上一次請求的畫面），
-    改用 replicator 同步 render（delta_time=0 不推進物理）；改過解析度後前幾次可能還是舊尺寸。"""
+    改用 replicator 同步 render（delta_time=0 不推進物理）；改過解析度後前幾次可能還是舊尺寸。
+    GUI 模式下主視窗綁著這台相機，在視窗裡轉視角會連相機一起移動；出圖前一律放回設定的位姿，
+    LLM 看到的畫面才不會因為有人操作視窗而改變。"""
+    if camera_pose_world is not None:
+        camera.set_world_pose(position=camera_pose_world[0],
+                              orientation=quat_wxyz_from_matrix(camera_pose_world[1]), camera_axes="ros")
     want = tuple(camera.get_resolution())
     for i in range(max_renders):
         rep.orchestrator.step(delta_time=0.0, pause_timeline=False, wait_for_render=True)
@@ -968,12 +1078,18 @@ def snapshot_blocks():
     return snap
 
 
-def do_verify_begin(scene, cam, steps):
+def do_verify_begin(scene, cam, steps, use_current_world=False):
     if follower is None:
         raise RuntimeError("isaac_sim_server 沒有用 --ursim_ip 啟動，無法跟隨 URSim 驗證")
     if follower.latest()[0] is None:
         raise RuntimeError(f"讀不到 URSim 關節角（{follower.status()['error']}）")
-    reply = do_reset(scene, cam)
+    if use_current_world:
+        # 純模擬：這裡就是世界，從目前的物理狀態開始（重新投影會把歪掉的積木擺正，等於改了世界）。
+        # steps 的 source_index 對應 /perception/scene 的順序，也就是 blocks 的順序。
+        reply = {"ok": True, "count": len(blocks), "simulated": sum(1 for b in blocks if b["cuboid"] is not None),
+                 "use_current_world": True, "warnings": []}
+    else:
+        reply = do_reset(scene, cam)
     verify_state.clear()
     verify_state.update({
         "active": True,
@@ -1135,12 +1251,76 @@ def overlay(real_jpeg, alpha):
     return blended
 
 
+# ============================================================
+# 純模擬：這個服務就是世界（虛擬場景檔建立積木，之後只靠物理改變）
+# ============================================================
+
+def do_sim_load(scene, cam, if_idle=False):
+    """用虛擬場景檔重建世界：中止還沒結束的驗證、丟掉舊快照，再照一般投影建立積木。
+    if_idle（Unity 切換純模擬 / 換場景時用）：3D 驗證進行中就不重建，免得打斷任務。Unity 自己正在執行一批時
+    按鈕不給切換，所以這裡只擋 Unity 看不到的情況：csharp_server 已開始驗證、批次還沒送到 Unity。"""
+    global world_snapshot
+    if if_idle and verify_state["active"]:
+        raise RuntimeError("Isaac Sim 正在驗證 3D 批次（任務進行中），沒有重建世界")
+    verify_state["active"] = False
+    world_snapshot = None
+    return do_reset(scene, cam)
+
+
+def do_sim_snapshot():
+    """記下每塊積木的世界位姿（位置 + 四元數），給驗證後還原。"""
+    global world_snapshot
+    world_snapshot = {}
+    for b in blocks:
+        if b["cuboid"] is not None:
+            pos, quat = b["cuboid"].get_world_pose()
+            world_snapshot[b["index"]] = (np.array(pos, dtype=np.float64), np.array(quat, dtype=np.float64))
+    return {"ok": True, "blocks": len(world_snapshot)}
+
+
+def do_sim_restore():
+    """把積木放回快照的位姿並停住。驗證跑過的 URSim 動作在模擬世界裡真的移動了積木，
+    正式執行要從驗證前的狀態開始（實機模式下驗證不會動到真實積木）。還沒結束的驗證一併中止。"""
+    verify_state["active"] = False
+    if world_snapshot is None:
+        raise RuntimeError("沒有快照（先呼叫 /sim/snapshot）")
+    restored = 0
+    for b in blocks:
+        pose = world_snapshot.get(b["index"]) if b["cuboid"] is not None else None
+        if pose is None:
+            continue
+        b["cuboid"].set_world_pose(position=pose[0], orientation=pose[1])
+        b["cuboid"].set_linear_velocity(np.zeros(3))
+        b["cuboid"].set_angular_velocity(np.zeros(3))
+        restored += 1
+    for _ in range(10):
+        follow_step(render=False)
+    return {"ok": True, "restored": restored}
+
+
+def perception_scene():
+    """跟 perception_server /scene 同格式（物件 position 是 QR 座標、z 是頂面），給純模擬的 csharp_server / Unity。"""
+    width, height = (int(v) for v in camera.get_resolution())
+    objects = [{
+        "name": o.get("name"),
+        "confidence": 1.0,
+        "source": "isaac_sim",
+        "shape": o.get("shape") or "cube",
+        "orientation": o.get("orientation"),
+        "skew_deg": float(o.get("skew_deg") or 0.0),
+        "position": {"x": float(o["x"]), "y": float(o["y"]), "z": float(o["z"]), "source": "isaac_sim"},
+    } for o in scene_objects()]
+    return {"timestamp": time.time(), "image_width": width, "image_height": height, "objects": objects}
+
+
 def status():
     return {
         "following": follower.status() if follower else None,
         "verifying": bool(verify_state.get("active")),
         "blocks": sum(1 for b in blocks if b["cuboid"] is not None),
         "camera": camera_state.get("source"),
+        "perception_mode": perception_mode,
+        "snapshot_blocks": None if world_snapshot is None else len(world_snapshot),
     }
 
 
@@ -1178,7 +1358,8 @@ def json_error(ex, status_code=500):
 def endpoint_verify_begin():
     data = request.get_json(force=True)
     try:
-        return jsonify(run_on_main(do_verify_begin, data.get("scene", []), data.get("camera"), data.get("steps") or []))
+        return jsonify(run_on_main(do_verify_begin, data.get("scene", []), data.get("camera"), data.get("steps") or [],
+                                   bool(data.get("use_current_world"))))
     except Exception as ex:
         return json_error(ex, 409)
 
@@ -1250,6 +1431,62 @@ def endpoint_status():
     return jsonify(status())
 
 
+# ---- 純模擬 ----
+
+@app.route("/sim/load", methods=["POST"])
+def endpoint_sim_load():
+    data = request.get_json(force=True)
+    try:
+        return jsonify(run_on_main(do_sim_load, data.get("scene", []), data.get("camera"), bool(data.get("if_idle", False))))
+    except Exception as ex:
+        return json_error(ex, 409)
+
+
+@app.route("/sim/snapshot", methods=["POST"])
+def endpoint_sim_snapshot():
+    try:
+        return jsonify(run_on_main(do_sim_snapshot))
+    except Exception as ex:
+        return json_error(ex, 409)
+
+
+@app.route("/sim/restore", methods=["POST"])
+def endpoint_sim_restore():
+    try:
+        return jsonify(run_on_main(do_sim_restore))
+    except Exception as ex:
+        return json_error(ex, 409)
+
+
+@app.route("/perception/scene", methods=["GET"])
+def endpoint_perception_scene():
+    try:
+        return jsonify(run_on_main(perception_scene))
+    except Exception as ex:
+        return json_error(ex)
+
+
+@app.route("/perception/scene/mode", methods=["GET", "POST"])
+def endpoint_perception_mode():
+    # 不經過主執行緒：Unity 每 0.3 秒輪詢一次
+    global perception_mode
+    if request.method == "POST":
+        mode = (request.get_json(force=True, silent=True) or {}).get("mode")
+        if mode in ("idle", "executing"):
+            perception_mode = mode
+    return jsonify({"mode": perception_mode})
+
+
+@app.route("/perception/debug/frame", methods=["GET"])
+def endpoint_perception_frame():
+    return endpoint_frame()
+
+
+@app.route("/perception/camera", methods=["GET"])
+def endpoint_perception_camera():
+    return jsonify(camera_state)
+
+
 def main():
     global follower, follow_tick_count
     build_world()
@@ -1266,6 +1503,7 @@ def main():
     print("  POST /reset         {'scene': [...], 'camera': {...}?, 'joints': [...]?}")
     print("  POST /overlay       body = 真實相機 JPEG")
     print("  GET  /scene  /frame  /calibration  /camera  /status")
+    print("  純模擬：POST /sim/load /sim/snapshot /sim/restore；GET /perception/scene /perception/debug/frame")
     physics_dt = world.get_physics_dt()
     while simulation_app.is_running():
         try:

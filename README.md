@@ -17,7 +17,7 @@ perception_server (Python + Flask)
    └─ 每 200ms 更新場景，回傳 3D 世界座標
    ↓
 LLM 自由拆解子任務 → 自然語言操作計畫
-   ↓  忠實轉譯（內部執行資料）
+   ↓  本地確定性轉譯（NaturalLanguagePlanAdapter，不呼叫 LLM）→ 內部執行資料
 MotionPlanValidator → Unity 逐操作執行
    ↓
 局部觀測檢查 + 獨立視覺模型整體驗證
@@ -34,7 +34,8 @@ UR3e
 - `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP（`/camera` 提供相機內參與位姿給 Isaac Sim）
 - `IsaacSimExecutor.cs` — 疊放規劃先送 Isaac Sim 模擬，存模擬 / 疊合截圖
 - `Program.cs` — 任務起點確認（目前桌面穩定，或固定配置比對）、任務內保留現況、十次嘗試與逐操作執行
-- `ExperimentLlm.cs` — 自由拆解、自然語言規劃、轉譯、獨立結果驗證及反思
+- `ExperimentLlm.cs` — 自由拆解、自然語言規劃、獨立結果驗證及反思
+- `NaturalLanguagePlanAdapter.cs` — 把規劃文字裡明確寫出的「source index N → target (x, y, z)」與「執行路徑開始／結束」之間的函式呼叫轉成內部執行資料（不呼叫 LLM；domino 方向沿用來源，白名單以外的函式會被略過）
 - `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
 - `ExperimentMetrics.cs` — 首次／十次內成功率及各次累積成功率
 - `MotionPlanValidator.cs` — 執行前安全狀態機驗證
@@ -89,7 +90,21 @@ dotnet run
   2. 整輪步驟以 `robot_target = "ursim"` 交給 Unity，Unity 用同一套關節軌跡只在 **URSim** 執行，實體手臂不動。
   3. Isaac Sim 的手臂即時跟隨 URSim（唯讀埠 30013 的關節角 + DO4 夾爪），積木用物理模擬被夾起、放下。
   4. URSim 跑完，Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定度、指尖是否低於桌面），
-     再由 LLM 看模擬畫面；都通過才逐步送實體手臂。不通過就算這次嘗試失敗、進 Reflection。
+     再由 LLM 看模擬畫面；都通過才把同一批（同樣的步驟、來源位置與積木高度）整批送實體手臂，
+     實機跑的就是 Isaac 驗證過的同一條關節軌跡。不通過就算這次嘗試失敗、進 Reflection。
+     整批送出前會確認來源積木在驗證後沒被移動（超過 1 cm 就不執行）；步驟之間不重新觀測、不做局部驗證，
+     由最後的整體驗證判定。逐步送會讓每一步結束都回 Ready，那些收尾路徑驗證時沒有，擺放區靠手臂的格點常回不去。
+
+**夾爪**：實體夾爪張開時兩指內側只有約 3.5 cm，每根手指厚、寬各約 1.5 cm（2026-09-30 實測），只跨得住 2.5 cm 的邊。
+手指沿工具 X 開合：夾 cube 時在 ±X 兩側；domino 一律跨短邊夾，橫放（長邊沿 X）的夾爪轉 90°、直放的用 0°
+（`JsonExecutor.EffectiveOrientation`）。張開時手指外側離夾爪中心 32.5 mm，垂直閉合方向佔中心線兩側各 7.5 mm：
+閉合方向上，旁邊 2.5 cm 寬的積木中心離開不到約 45 mm 就會被手指碰到（規劃與反思的 prompt 有寫這些尺寸）。
+
+Isaac 啟動時把資產手指換成實測大小的直方塊（`--finger_thickness_m` / `--finger_width_m`，預設各 0.015；
+設 0 用資產原本的手指）：內側面整條放在資產指尖內側、下緣放在資產指尖，所以張開時內側 3.5 cm
+（`--gripper_open_m`）與 flange → 指尖 179 mm 都不變。資產手指（跟 Unity 的夾爪模型相同）末端外張，PhysX 用的
+是凸包：在積木頂面高度（指尖上方 19 mm）內側間距只有 28.5 mm、外側離中心 38.5 mm，比實物更容易碰到旁邊的積木。
+Unity 的夾爪模型沒有改，只用來顯示；Unity 的碰撞檢查只看手臂連桿對桌面與連桿之間，不看手指跟旁邊積木。
 
 Isaac Sim 不連實體手臂。URSim / Isaac 無法使用時記為 `infrastructure_error`（不計成功率）。
 URSim 驗證途中觸發安全停止時，Unity 最多等 300 秒讓人在 URSim 解除，逾時這一輪算失敗（`simulation`）並進 Reflection；
@@ -131,6 +146,54 @@ UR 基座 → Isaac 世界在啟動時用 FK 自動校正（本資產實測差 1
 
 每次 3D 驗證的紀錄在 `attempt_XX/isaac_sim/`：`ursim_batch.json`、`ursim_execution.json`、
 `isaac_verify.json`（每項檢查的結果）、`isaac_before.jpg`、`isaac_after.jpg`、`isaac_overlay_before.jpg`。
+
+## 純模擬：不接相機與實體手臂
+
+Unity 右上角的「模式」按鈕一鍵切換實機 / 純模擬（寫 `unity_project/Assets/StreamingAssets/run_mode.json`），
+csharp_server 每個任務開始時讀一次，整個任務都用同一個模式。LLM 的 prompt 與整個規劃、驗證流程兩種模式完全相同。
+
+| | 實機 | 純模擬 |
+|---|---|---|
+| 場景與照片 | perception_server（相機） | Isaac Sim 的 `/perception/*`（同格式） |
+| 初始桌面 | 收到指令時的真實桌面 | 虛擬場景檔 `sim_scenes/*.json`：切換的當下載入並顯示，每個任務開始時再重建 Isaac 世界 |
+| 動作 | 實體 UR3e（3D 先在 URSim + Isaac 驗證） | 全部送 URSim，Isaac 跟隨 URSim 讓積木依物理移動 |
+| 紀錄 | `csharp_server/outputs/experiments/` | `csharp_server/outputs/experiments_sim/`（成功率另算） |
+
+啟動（純模擬不用開 perception_server）：
+1. URSim 虛擬機開機、切 Remote Control。
+2. `D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui`
+3. `cd csharp_server` 後 `dotnet run`
+4. Unity Play → 右上角「模式」切成純模擬 →「場景」按鈕輪流切換 `sim_scenes/` 裡的檔案 → 輸入指令。
+
+切到純模擬或按「場景」換檔的當下，Unity 先畫出場景檔的積木，同時呼叫 Isaac 的 `/sim/load` 重建模擬世界，
+載入完改顯示 Isaac 回報的位置（物理落定後）；結果顯示在狀態列。Isaac 還沒開時畫面先顯示場景檔，等 Isaac 開好、
+世界裡還沒有積木時自動載入。手臂執行中兩個按鈕都不給按；Isaac 正在 3D 驗證時也不重建（`if_idle`）。
+但任務在 LLM 規劃階段時切換或換場景仍會重設模擬世界，任務進行中不要按。切回實機時畫面先清空，等相機的場景。
+
+3D 疊放在純模擬裡照樣先驗證：驗證前 Isaac 記下積木位姿（`/sim/snapshot`），驗證跑完不論結果都放回去
+（`/sim/restore`），正式執行從驗證前的狀態開始，跟實機模式「驗證不會動到真實積木」一致。
+URSim 在純模擬途中安全停止時，Unity 最多等 300 秒，逾時這一輪算失敗。
+
+虛擬場景檔格式（座標跟相機場景相同：QR 座標、公尺，z 是頂面高度，桌上一層 0.025、第二層 0.05）：
+```json
+{
+  "description": "說明",
+  "objects": [
+    { "name": "yellow_cube", "shape": "cube", "x": 0.30, "y": 0.10, "z": 0.025, "orientation": null },
+    { "name": "black_domino", "shape": "domino", "x": 0.20, "y": 0.10, "z": 0.025, "orientation": "horizontal" }
+  ],
+  "camera": null
+}
+```
+- name 要是 `顏色_cube` 或 `顏色_domino`；domino 要給 orientation（horizontal = 長邊沿 X）。
+- camera 省略時用 `sim_scenes/camera/default.json`（實機相機的內參與位姿，模擬畫面跟實拍同一個視角；
+  目前是從 2026-09-30 實拍畫面的 QR1-4 估計的）。相機或 QR 貼紙移動過，接上相機後執行
+  `python isaac_sim/save_sim_camera.py` 換成 RealSense 的真實參數。
+- `run_mode.json` 的 `reset_each_task` 改成 false，之後的任務就接續目前的模擬世界，不重建。
+- 內建三個：`two_cubes`（黑、黃方塊各一）、`letter_blocks`（8 塊方塊，排字母或疊結構用）、`domino_cubes`。
+
+限制：模擬回報的是 Isaac 的精確位置，沒有相機的偵測誤差、遮擋與高度偏差，結果會比實機樂觀；
+適合測 LLM 的規劃能力，不能取代實機成功率。
 
 **對位檢查**（perception 與 Isaac Sim 都啟動後）：
 ```powershell

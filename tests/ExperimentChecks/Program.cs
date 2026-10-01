@@ -43,6 +43,26 @@ var ambiguous = new[] { Piece(0.090), Piece(0.111) };
 Check(!ExperimentChecks.Resolve(step, baseline, ambiguous, out _, out _),
       "source tracking refuses an ambiguous nearest neighbour");
 Check(!ExperimentChecks.Resolve(step, baseline, new[] { Piece(0.4), Piece(0.15) }, out _, out _), "moved source is not silently reassigned");
+var nearTargetAssignment = new Assignment
+{
+    StepId = 99,
+    Source = new SceneObject { Name = "yellow_cube", Shape = "cube", X = 0.495, Y = 0.121, Z = 0.018 },
+    Target = new TargetCell { WorldX = 0.500, WorldY = 0.124, WorldZ = 0.010,
+        ExpectedShape = "cube", ExpectedColor = "yellow" }
+};
+Check(ExperimentChecks.IsAlreadyAtTarget(nearTargetAssignment),
+      "source within 20 mm of target is already satisfied");
+nearTargetAssignment.Target.WorldX = 0.530;
+Check(!ExperimentChecks.IsAlreadyAtTarget(nearTargetAssignment),
+      "source beyond 20 mm still requires motion");
+nearTargetAssignment.Target.WorldX = 0.500;
+var nearTargetAfter = new List<SceneObject>
+{
+    new() { Name = "yellow_cube", Shape = "cube", X = 0.496, Y = 0.123, Z = 0.019 }
+};
+Check(Verifier.CheckSingleObjectStep(nearTargetAssignment,
+          new List<SceneObject> { nearTargetAssignment.Source }, nearTargetAfter, false).OverallStatus == "ok",
+      "overlapping source and target regions do not report unexpected scene change");
 Check(MotionPlanValidator.TryValidate(new MotionPlan { ActionSequence = actions }, assignment, baseline, out _), "explicit safe plan accepted");
 var direct = new List<RobotFunctionCall> { new() { Function = "grasp" } };
 Check(MotionPlanValidator.TryValidate(new MotionPlan { ActionSequence = direct }, assignment, baseline, out _), "validator does not prescribe a grasp recipe");
@@ -94,6 +114,138 @@ Check(Near(overlapping.Values.Max(), 0.050) && Near(overlapping.Values.Min(), 0.
       "two overlapping blocks are stacked (never interpenetrating) even when the upper one reads lower");
 var fingerRoot = LayeredGraspGeometry.FingerRoot(new[] { 0.1, 0.2, 0.3 }, new[] { 0.1, 0.2, 0.006 });
 Check(Near(fingerRoot[0], 0.1) && Near(fingerRoot[1], 0.2) && Near(fingerRoot[2], 0.036), "finger root is 30 mm up the tool axis from the fingertip");
+// 一鍵切換純模擬 / 實機（Unity 寫 run_mode.json，csharp_server 每個任務讀一次）
+var modeDir = Path.Combine(Path.GetTempPath(), "robot_mode_" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(modeDir);
+Check(!RunModeConfig.Load(modeDir).IsSim, "no run_mode.json means real hardware, exactly as before");
+File.WriteAllText(Path.Combine(modeDir, RunModeConfig.FileName),
+    "{\"mode\": \"sim\", \"scene\": \"sim_scenes/letter_blocks.json\", \"reset_each_task\": false, \"sim_perception_url\": \"http://localhost:6000/perception/\"}");
+var simMode = RunModeConfig.Load(modeDir);
+Check(simMode.IsSim && simMode.Scene == "sim_scenes/letter_blocks.json" && !simMode.ResetEachTask,
+      "the file Unity writes (including its extra url field) selects simulation and the scene");
+File.WriteAllText(Path.Combine(modeDir, RunModeConfig.FileName), "{\"mode\": \"simulation\"}");
+bool rejected = false;
+try { RunModeConfig.Load(modeDir); } catch (InvalidDataException) { rejected = true; }
+Check(rejected, "an unknown mode is refused instead of guessed (a wrong guess could move the real arm)");
+var repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../.."));
+var streamingAssets = Path.Combine(repoRoot, "unity_project", "Assets", "StreamingAssets");
+foreach (var sceneFile in new[] { "two_cubes", "letter_blocks", "domino_cubes" })
+{
+    var config = new RunModeConfig { Mode = "sim", Scene = $"sim_scenes/{sceneFile}.json" };
+    var simScene = SimScene.Load(config.ScenePath(streamingAssets));
+    Check(simScene.Objects.Count > 0 && simScene.Objects.All(LayeredHeights.IsBlock),
+          $"virtual scene {sceneFile}.json resolves from StreamingAssets to the repo and loads as blocks");
+    Check(simScene.Camera is { ValueKind: JsonValueKind.Object } cameraJson &&
+          cameraJson.TryGetProperty("intrinsics", out _) && cameraJson.TryGetProperty("pose_in_qr", out _),
+          $"{sceneFile}.json without a camera gets the lab camera from sim_scenes/camera/default.json");
+}
+var badScene = new List<SceneObject> {
+    new() { Name = "cup", Shape = "cube", X = 0.2, Y = 0.1, Z = 0.025 },
+    new() { Name = "yellow_cube", Shape = "cube", X = 0.2, Y = 0.1, Z = 0 },
+    new() { Name = "black_domino", Shape = "domino", X = 0.3, Y = 0.1, Z = 0.025 } };
+Check(SimScene.Validate(badScene).Count == 3, "virtual scene validation names a non-block, a non-positive top and a domino without orientation");
+var naturalScene = new List<SceneObject> { new() {
+    Name = "yellow_cube", Shape = "cube", X = 0.146329, Y = 0.117252, Z = 0.019623
+} };
+var naturalPlan = """
+來源：index 0
+目標位置：(0.246329, 0.117252)
+執行路徑開始
+- move_above(source, 0.12)
+- descend(source)
+- grasp()
+- lift(source, 0.12)
+- move_above(target, 0.12)
+- descend(target)
+- release()
+執行路徑結束
+""";
+var natural = NaturalLanguagePlanAdapter.Translate(naturalPlan, naturalScene);
+Check(string.IsNullOrEmpty(natural.Error) && natural.Steps.Count == 1 &&
+      Math.Abs(natural.Steps[0].Target!.X - 0.246329) < 0.000001 &&
+      Math.Abs(natural.Steps[0].Target!.Z - 0.019623) < 0.000001,
+      "natural language adapter preserves source z for tabletop target");
+Check(natural.Steps[0].Actions.Select(a => a.Function).SequenceEqual(
+      new[] { "move_above", "descend", "grasp", "lift", "move_above", "descend", "release" }),
+      "natural language adapter preserves explicit action order");
+var prosePlan = """
+目標物：yellow_cube（source）= (0.146329, 0.117252, 0.019623) m
+目標位置 target = (0.246329, 0.117252) m；安全高度 z=0.12 m
+操作序列
+- move_above(source, 0.12)
+- descend(source)
+- grasp()
+- lift(source, 0.12)
+- move_above(target, 0.12)
+- descend(target)
+- release()
+""";
+var prose = NaturalLanguagePlanAdapter.Translate(prosePlan,
+    new List<SceneObject> { naturalScene[0], new() { Name = "black_domino", Shape = "domino", X = 0.15, Y = 0.03, Z = 0.02 } });
+Check(string.IsNullOrEmpty(prose.Error) &&
+      Math.Abs(prose.Steps[0].Target!.Z - naturalScene[0].Z) < 0.000001,
+      "natural language adapter does not confuse safe height with target z");
+var labeledTargetPlan = """
+來源 index: 0（名稱：yellow_cube）
+目標 Ptgt: x=0.246515, y=0.118027, z=0.022079
+執行路徑開始
+move_above(source, 0.10)
+descend(source)
+grasp()
+lift(source, 0.10)
+move_above(target, 0.10)
+descend(target)
+release()
+執行路徑結束
+""";
+var labeledTarget = NaturalLanguagePlanAdapter.Translate(labeledTargetPlan, naturalScene);
+Check(string.IsNullOrEmpty(labeledTarget.Error) &&
+      Math.Abs(labeledTarget.Steps[0].Target!.X - 0.246515) < 0.000001 &&
+      Math.Abs(labeledTarget.Steps[0].Target!.Y - 0.118027) < 0.000001 &&
+      Math.Abs(labeledTarget.Steps[0].Target!.Z - 0.022079) < 0.000001,
+      "natural language adapter accepts labeled target coordinates");
+var missingTarget = NaturalLanguagePlanAdapter.Translate(
+    "來源：index 0\n執行路徑開始\nmove_above(target, 0.12)\n執行路徑結束", naturalScene);
+Check(!string.IsNullOrEmpty(missingTarget.Error), "natural language adapter refuses missing target coordinates");
+var ambiguousScene = new List<SceneObject> { Piece(0.1), Piece(0.2) };
+var ambiguousPlan = NaturalLanguagePlanAdapter.Translate(
+    "yellow_cube\n執行路徑開始\ngrasp()\n執行路徑結束", ambiguousScene);
+Check(!string.IsNullOrEmpty(ambiguousPlan.Error), "natural language adapter refuses ambiguous source");
+var multiScene = new List<SceneObject> { Piece(0.10), Piece(0.20), Piece(0.30) };
+var multiPlan = """
+第 1 顆：source index 1 → target (0.604, 0.154, 0.025)
+第 2 顆：source index 2 → target (0.604, 0.184, 0.025)
+執行路徑開始
+move_above(source, 0.08)
+descend(source)
+grasp()
+lift(source, 0.08)
+move_above(target, 0.08)
+descend(target)
+release()
+lift(target, 0.08)
+move_above(source, 0.08)
+descend(source)
+grasp()
+lift(source, 0.08)
+move_above(target, 0.08)
+descend(target)
+release()
+lift(target, 0.08)
+執行路徑結束
+""";
+var multi = NaturalLanguagePlanAdapter.Translate(multiPlan, multiScene);
+Check(string.IsNullOrEmpty(multi.Error) && multi.Steps.Count == 2 &&
+      multi.Steps[0].SourceIndex == 1 && multi.Steps[1].SourceIndex == 2 &&
+      Math.Abs(multi.Steps[0].Target!.Y - 0.154) < 0.000001 &&
+      Math.Abs(multi.Steps[1].Target!.Y - 0.184) < 0.000001 &&
+      multi.Steps.All(x => x.Actions.Count == 8),
+      "natural language adapter preserves multiple source-target pairs");
+var missingPair = NaturalLanguagePlanAdapter.Translate(
+    // 只刪這一行的文字、留下空行：raw string 的換行跟原始檔一樣，Windows checkout 成 CRLF 時結尾的 \n 會對不到
+    multiPlan.Replace("第 2 顆：source index 2 → target (0.604, 0.184, 0.025)", ""), multiScene);
+Check(!string.IsNullOrEmpty(missingPair.Error),
+      "natural language adapter refuses unmatched multi-step actions");
 var root = Path.Combine(Path.GetTempPath(), "robot_metrics_" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
 void Outcome(string id, bool success, string status, int attempts, string[]? outcomes = null) {
@@ -122,4 +274,9 @@ public sealed class TranslatedStep
     public int SourceIndex { get; set; }
     public SceneObject? Target { get; set; }
     public List<RobotFunctionCall> Actions { get; set; } = new();
+}
+public sealed class TranslatedPlan
+{
+    public string Error { get; set; } = "";
+    public List<TranslatedStep> Steps { get; set; } = new();
 }

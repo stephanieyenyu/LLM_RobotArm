@@ -1,0 +1,9 @@
+{
+  "description": "一塊橫放的黑 domino（長邊沿 X）和兩塊黃方塊，測 domino 的夾取方向與疊放。",
+  "objects": [
+    { "name": "black_domino", "shape": "domino", "x": 0.200, "y": 0.100, "z": 0.025, "orientation": "horizontal" },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.120, "y": 0.200, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.190, "y": 0.200, "z": 0.025, "orientation": null }
+  ],
+  "camera": null
+}

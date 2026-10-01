@@ -6,6 +6,14 @@ Directory.CreateDirectory(assets);
 var output = Path.GetFullPath("outputs/experiments");
 Directory.CreateDirectory(output);
 using var http = new HttpClient { BaseAddress = new Uri("http://localhost:5000/"), Timeout = TimeSpan.FromSeconds(5) };
+// 純模擬（Unity「模擬模式」按鈕）：場景與照片改由 Isaac Sim 提供，格式同 perception_server；紀錄另存，不跟實機成功率混在一起
+using var simPerception = new HttpClient { BaseAddress = IsaacSimExecutor.PerceptionBaseUri, Timeout = TimeSpan.FromSeconds(30) };
+var simOutput = Path.GetFullPath("outputs/experiments_sim");
+var perception = http;
+bool sim = false;
+string? loadedSimScene = null;
+// 3D 正式執行沿用驗證過的整批軌跡；驗證後來源積木位置變動超過這個距離（相機抖動以外）就不執行
+const double VerifiedSourceDriftM = 0.010;
 var json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true, WriteIndented = true };
 var model = Environment.GetEnvironmentVariable("ROBOT_MODEL") ?? "gpt-5";
 var llm = new ExperimentLlm(model);
@@ -25,17 +33,32 @@ else
     Console.WriteLine("自由規劃實驗：每任務最多 10 次；每個任務以收到指令時的桌面為起點，任務內不重置。");
     Console.WriteLine("（要求每個任務先恢復同一個固定配置：setx FIXED_BASELINE 1 後重開 terminal）");
 }
+Console.WriteLine("純模擬 / 實機用 Unity 的「模擬模式」按鈕切換（StreamingAssets/run_mode.json），每個任務開始時讀一次。");
 while (true)
 {
     var input = Path.Combine(assets, "user_input.txt");
     if (!File.Exists(input) || string.IsNullOrWhiteSpace(File.ReadAllText(input))) { await Task.Delay(500); continue; }
     var goal = File.ReadAllText(input).Trim();
     File.WriteAllText(input, "");
-    var run = Path.Combine(output, $"{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}");
+    RunModeConfig mode;
+    try { mode = RunModeConfig.Load(assets); }
+    catch (InvalidDataException ex)
+    {
+        Console.WriteLine($"[模式] {ex.Message}；不確定是模擬還是實機，這個指令不執行。");
+        continue;
+    }
+    sim = mode.IsSim;
+    perception = sim ? simPerception : http;
+    var root = sim ? simOutput : output;
+    Directory.CreateDirectory(root);
+    var run = Path.Combine(root, $"{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}");
     Directory.CreateDirectory(run);
     File.WriteAllText(Path.Combine(run, "task.txt"), goal);
-    Save(run, "config.json", new { model, max_attempts = 10, reset_between_tasks = fixedBaseline,
-        initial_scene_source = fixedBaseline ? "fixed_baseline" : "table_at_command",
+    if (sim) Console.WriteLine($"[純模擬] 場景與畫面來自 Isaac Sim，動作只送 URSim；紀錄在 {simOutput}。");
+    Save(run, "config.json", new { model, max_attempts = 10, reset_between_tasks = !sim && fixedBaseline,
+        initial_scene_source = sim ? (mode.ResetEachTask ? "sim_scene_file" : "sim_continued")
+            : fixedBaseline ? "fixed_baseline" : "table_at_command",
+        run_mode = sim ? "sim" : "real", sim_scene = sim ? mode.Scene : null,
         reset_within_task = false, reset_xy_m = ExperimentChecks.ResetXYToleranceM, reset_z_m = ExperimentChecks.ResetZToleranceM,
         rule_scope = "task", evaluation = "independent_visual_model", started_utc = DateTime.UtcNow });
     bool success = false;
@@ -48,17 +71,33 @@ while (true)
     var feedback = "無前次結果。";
     try
     {
+        if (sim)
+        {
+            var scenePath = mode.ScenePath(assets);
+            if (mode.ResetEachTask || loadedSimScene != scenePath)
+            {
+                var simScene = SimScene.Load(scenePath);
+                Console.WriteLine($"[純模擬] 用虛擬場景 {mode.Scene} 重建 Isaac Sim 世界（{SceneInventory(simScene.Objects)}）。");
+                await IsaacSimExecutor.LoadSimSceneAsync(simScene.Objects, simScene.Camera);
+                loadedSimScene = scenePath;
+                File.Copy(scenePath, Path.Combine(run, "sim_scene.json"), true);
+            }
+            else Console.WriteLine("[純模擬] 接續目前的模擬世界（reset_each_task = false）。");
+        }
+        // 固定基準只用在實機；純模擬的起點是虛擬場景檔（或接續的模擬結果）
+        var fixedStart = !sim ? baseline : null;
+        bool waitForBaseline = fixedBaseline && !sim;
         List<SceneObject> initial;
         int stable = 0;
         List<SceneObject>? previous = null;
         int resetWaitSeconds = 0;
-        Console.WriteLine(fixedBaseline
+        Console.WriteLine(waitForBaseline
             ? "[任務重置] 將實體積木恢復初始配置後，相機確認桌面即開始；不會自動搬回積木。"
             : "[任務開始] 以目前桌面為起點，相機連續 3 次看到桌面穩定就開始。");
         while (true)
         {
             initial = await Scene();
-            var expected = baseline ?? previous;
+            var expected = fixedStart ?? previous;
             if (initial.Count > 0 && expected != null && ExperimentChecks.Matches(expected, initial)) stable++;
             else stable = 0;
             previous = initial;
@@ -67,7 +106,7 @@ while (true)
             resetWaitSeconds++;
             if (resetWaitSeconds % 15 == 0)
             {
-                Console.WriteLine(fixedBaseline
+                Console.WriteLine(waitForBaseline
                     ? $"[任務重置] 仍在等待初始桌面，已等待 {resetWaitSeconds} 秒（無逾時限制）。"
                     : $"[任務開始] 桌面還沒穩定（可能有東西在動或偵測不穩），已等待 {resetWaitSeconds} 秒。");
                 if (expected == null || initial.Count == 0)
@@ -76,14 +115,14 @@ while (true)
                     continue;
                 }
                 // 還沒有基準（或不用固定基準）時是在等連續幾幀穩定，比的是上一幀
-                Console.WriteLine(baseline != null
-                    ? $"             基準：{SceneInventory(baseline)}；目前：{SceneInventory(initial)}"
+                Console.WriteLine(fixedStart != null
+                    ? $"             基準：{SceneInventory(fixedStart)}；目前：{SceneInventory(initial)}"
                     : "             等待桌面穩定，跟上一幀比：");
                 foreach (var line in ExperimentChecks.DescribeMismatch(expected, initial))
                     Console.WriteLine($"             {line}");
             }
         }
-        if (fixedBaseline && baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
+        if (waitForBaseline && baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
         Save(run, "initial_scene.json", initial);
         Console.WriteLine($"[任務開始] 初始桌面已確認（{SceneInventory(initial)}）；本任務內不再重置。");
         for (int attempt = 1; attempt <= 10; attempt++)
@@ -112,7 +151,8 @@ while (true)
                 var image = await Frame(dir, "before.jpg");
                 camera = await CameraInfo();
                 // 收到指令就先把目前真實場景投影到 Isaac Sim（背景），不必等 LLM 規劃完才看得到積木。
-                IsaacSimExecutor.SyncRealScene(before, camera);
+                // 純模擬時 Isaac 本身就是世界，重新投影會把歪掉的積木擺正，不投影。
+                if (!sim) IsaacSimExecutor.SyncRealScene(before, camera);
                 trace.Add($"觀測到 {before.Count} 個物件");
                 stage = "拆解子任務";
                 var hierarchy = await llm.Decompose(goal, before, rules, feedback, image, dir);
@@ -137,16 +177,16 @@ while (true)
                 trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
                 // 3D 疊放：整輪步驟先交給 Unity 在 URSim 執行（robot_target = "ursim"），Isaac Sim 的手臂
                 // 即時跟隨 URSim、積木用物理模擬；URSim 跑完由 Isaac 做幾何檢查，再讓 LLM 看模擬畫面，
-                // 都通過才進下面的逐步實機執行。不通過就算這次 attempt 失敗、實機完全不動，照常進 Reflect。
-                // 2D 平面移動不經過這裡，照舊由 Unity 的模擬預覽驗證。存檔另開子資料夾，避免跟實機結果撞名。
+                // 都通過才把同一批整批送實體手臂。不通過就算這次 attempt 失敗、實機完全不動，照常進 Reflect。
+                // 2D 平面移動不經過這裡，照舊由 Unity 的模擬預覽驗證後逐步執行。存檔另開子資料夾，避免跟實機結果撞名。
                 // 3D 的每一批（URSim 與之後的實機）都帶 layered_grasp：Unity 用分層夾取深度，實機執行的就是
                 // Isaac 驗證過的同一套深度；2D 批次不帶這個欄位，Unity 照舊。
                 bool stacked3d = IsaacSimExecutor.RequiresCheck(translated.Steps, before);
+                var ursimSteps = new List<StepEnvelope>();
                 if (stacked3d)
                 {
                     trace.Add("判定為 3D 疊放，先在 URSim 執行並由 Isaac Sim 驗證");
                     Directory.CreateDirectory(isaacDir);
-                    var ursimSteps = new List<StepEnvelope>();
                     var heights = LayeredHeights.ForSteps(translated.Steps, before);
                     for (int k = 0; k < translated.Steps.Count; k++)
                     {
@@ -165,34 +205,90 @@ while (true)
                     Console.WriteLine($"[Isaac Sim] 3D 疊放：{ursimSteps.Count} 步先在 URSim 執行，Isaac Sim 跟隨驗證。");
                     stage = "URSim 執行";
                     stageKind = "simulation";
-                    await IsaacSimExecutor.BeginVerifyAsync(before, translated.Steps, camera, image, isaacDir);
-                    int ursimBatchId = ++stepId;
-                    var ursimBatch = new BatchEnvelope { BatchId = ursimBatchId, Steps = ursimSteps,
-                        Comment = "3D 疊放 URSim 驗證", RobotTarget = "ursim", LayeredGrasp = true };
-                    Save(isaacDir, "ursim_batch.json", ursimBatch);
-                    AtomicWrite(Path.Combine(assets, "current_step.json"), ursimBatch);
-                    var ursimExecution = await Wait(attempt, ursimBatchId);
-                    Save(isaacDir, "ursim_execution.json", ursimExecution);
-                    if (ursimExecution == null || !ursimExecution.Completed)
+                    // 純模擬：Isaac 就是世界，驗證會真的移動積木。先記下位姿，驗證結束（不論通過與否）放回去，
+                    // 正式執行才從驗證前的狀態開始，跟實機模式「驗證不動到真實積木」一致。
+                    if (sim) await IsaacSimExecutor.SnapshotWorldAsync();
+                    try
                     {
-                        string reason = ursimExecution?.Error ?? "沒有回報原因";
-                        if (reason.Contains("未連線") || reason.Contains("未設定")) throw new SimulationUnavailableException("URSim 無法使用：" + reason, null);
-                        throw new InvalidOperationException("URSim 執行失敗（實機未動）：" + reason);
+                        await IsaacSimExecutor.BeginVerifyAsync(before, translated.Steps, camera, image, isaacDir, useCurrentWorld: sim);
+                        int ursimBatchId = ++stepId;
+                        var ursimBatch = new BatchEnvelope { BatchId = ursimBatchId, Steps = ursimSteps,
+                            Comment = "3D 疊放 URSim 驗證", RobotTarget = "ursim", LayeredGrasp = true };
+                        Save(isaacDir, "ursim_batch.json", ursimBatch);
+                        AtomicWrite(Path.Combine(assets, "current_step.json"), ursimBatch);
+                        var ursimExecution = await Wait(attempt, ursimBatchId);
+                        Save(isaacDir, "ursim_execution.json", ursimExecution);
+                        if (ursimExecution == null || !ursimExecution.Completed)
+                        {
+                            string reason = ursimExecution?.Error ?? "沒有回報原因";
+                            if (reason.Contains("未連線") || reason.Contains("未設定")) throw new SimulationUnavailableException("URSim 無法使用：" + reason, null);
+                            throw new InvalidOperationException("URSim 執行失敗（實機未動）：" + reason);
+                        }
+                        trace.Add("URSim 執行完成");
+                        stage = "Isaac Sim 幾何驗證";
+                        var report = await IsaacSimExecutor.EndVerifyAsync(isaacDir);
+                        if (!report.Pass)
+                            throw new InvalidOperationException("Isaac Sim 驗證未通過（實機未動）：" + string.Join("；", report.Reasons));
+                        trace.Add("Isaac Sim 幾何驗證通過");
+                        stage = "Isaac Sim 模擬畫面判定";
+                        var isaacVerdict = await llm.Validate(goal, before, report.Scene, report.Frame, isaacDir);
+                        if (isaacVerdict.Split('\n')[0].Trim() != "PASS")
+                            throw new InvalidOperationException("Isaac Sim 模擬畫面判定未通過（實機未動）：" + isaacVerdict);
+                        trace.Add("Isaac Sim 模擬畫面判定通過");
                     }
-                    trace.Add("URSim 執行完成");
-                    stage = "Isaac Sim 幾何驗證";
-                    var report = await IsaacSimExecutor.EndVerifyAsync(isaacDir);
-                    if (!report.Pass)
-                        throw new InvalidOperationException("Isaac Sim 驗證未通過（實機未動）：" + string.Join("；", report.Reasons));
-                    trace.Add("Isaac Sim 幾何驗證通過");
-                    stage = "Isaac Sim 模擬畫面判定";
-                    var isaacVerdict = await llm.Validate(goal, before, report.Scene, report.Frame, isaacDir);
-                    if (isaacVerdict.Split('\n')[0].Trim() != "PASS")
-                        throw new InvalidOperationException("Isaac Sim 模擬畫面判定未通過（實機未動）：" + isaacVerdict);
-                    trace.Add("Isaac Sim 模擬畫面判定通過");
-                    Console.WriteLine("[Isaac Sim] 3D 驗證通過，開始送實體手臂。");
+                    finally
+                    {
+                        // 還原失敗就不能從正確的狀態繼續，例外往外丟，這個任務記為基礎設施錯誤
+                        if (sim) await IsaacSimExecutor.RestoreWorldAsync();
+                    }
+                    Console.WriteLine(sim ? "[Isaac Sim] 3D 驗證通過，模擬世界已還原，開始正式執行（URSim）。"
+                                          : "[Isaac Sim] 3D 驗證通過，開始送實體手臂。");
+
+                    // 正式執行整批一次送：步驟、來源位置、積木高度都跟 URSim 驗證的那一批相同，實機跑的就是
+                    // Isaac 驗證過的同一條關節軌跡。逐步送的話每一步結束都要回 Ready，那些收尾路徑驗證時沒有，
+                    // 有些位置回不去（肘關節奇異點）。步驟之間不再重新觀測與局部驗證，最後由整體驗證判定。
+                    stage = "3D 疊放整批執行前檢查";
+                    stageKind = "precheck";
+                    var current = await Scene();
+                    for (int k = 0; k < translated.Steps.Count; k++)
+                    {
+                        if (!ExperimentChecks.Resolve(translated.Steps[k], before, current, out var now, out var error))
+                            throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
+                        var verified = ursimSteps[k].SourcePosition!;
+                        double driftM = Math.Sqrt(Math.Pow(now.Source!.X - verified.X, 2) + Math.Pow(now.Source.Y - verified.Y, 2));
+                        if (driftM > VerifiedSourceDriftM)
+                            throw new InvalidOperationException(
+                                $"第 {k + 1} 個操作的來源 {now.Source.Name} 在驗證後移動了 {driftM * 1000:F0} mm，不能沿用驗證過的軌跡。");
+                    }
+                    stage = "3D 疊放整批在實體手臂執行";
+                    stageKind = "execution";
+                    var executionSteps = ursimSteps.Select(s => new StepEnvelope { StepId = ++stepId, SourcePosition = s.SourcePosition,
+                        TargetPosition = s.TargetPosition, ActionSequence = s.ActionSequence, Comment = "自由規劃實驗",
+                        SourceTopM = s.SourceTopM, TargetTopM = s.TargetTopM }).ToList();
+                    int batchId3d = ++stepId;
+                    // 純模擬時「實機」就是 URSim：標 robot_target = "ursim"，Unity 不會連實體手臂
+                    var batch3d = new BatchEnvelope { BatchId = batchId3d, Steps = executionSteps,
+                        Comment = "3D 疊放正式執行（整批，同驗證軌跡）", LayeredGrasp = true, RobotTarget = sim ? "ursim" : "" };
+                    Save(dir, $"batch_{batchId3d}.json", batch3d);
+                    AtomicWrite(Path.Combine(assets, "current_step.json"), batch3d);
+                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 3D 整批（{executionSteps.Count} 個操作）：batch {batchId3d}。");
+                    executionPending = true;
+                    var execution3d = await Wait(attempt, batchId3d);
+                    if (execution3d != null) executionPending = false;
+                    Save(dir, $"execution_{batchId3d}.json", execution3d);
+                    if (execution3d == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
+                    if (!execution3d.Completed)
+                    {
+                        var executionError = $"3D 疊放整批執行失敗：{execution3d.Error ?? "沒有回報原因"}";
+                        Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 退回：{executionError}");
+                        throw new InvalidOperationException(executionError);
+                    }
+                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 已完成 3D 整批 batch {batchId3d}。");
+                    robotOperations = executionSteps.Count;
+                    trace.Add($"3D 疊放 {executionSteps.Count} 個操作整批由實體手臂執行完成");
                 }
-                for (int k = 0; k < translated.Steps.Count; k++)
+                // 2D：逐步執行，每一步前重新觀測、執行後局部驗證
+                if (!stacked3d) for (int k = 0; k < translated.Steps.Count; k++)
                 {
                     var step = translated.Steps[k];
                     stage = $"第 {k + 1} 個操作的執行前檢查";
@@ -204,24 +300,40 @@ while (true)
                     var motion = new MotionPlan { ActionSequence = step.Actions, Reasoning = plan };
                     if (!MotionPlanValidator.TryValidate(motion, assignment, current, out error))
                         throw new InvalidOperationException($"第 {k + 1} 個操作執行前檢查：{error}");
+                    var outcome = ClassifyOutcome(step.Actions);
+                    if (outcome == ActionOutcome.Placed && ExperimentChecks.IsAlreadyAtTarget(assignment))
+                    {
+                        var satisfied = new VerifyResult
+                        {
+                            StepId = assignment.StepId,
+                            SourceRemoved = false,
+                            TargetOccupied = true,
+                            ShapeMatch = true,
+                            ColorMatch = true,
+                            PositionErrorMm = Math.Sqrt(
+                                Math.Pow(assignment.Source!.X - assignment.Target!.WorldX, 2) +
+                                Math.Pow(assignment.Source.Y - assignment.Target.WorldY, 2)) * 1000.0,
+                            OverallStatus = "ok",
+                            Note = "Selected source is already within the accepted 20 mm target tolerance; robot motion skipped."
+                        };
+                        local.Add(satisfied);
+                        Save(dir, "local_validation.json", local);
+                        Console.WriteLine($"[實驗] step {assignment.StepId} 來源已在目標 2 公分容差內，略過重複抓放。");
+                        trace.Add($"第 {k + 1} 個操作的來源已在目標 2 公分內，略過抓放（手臂未動）");
+                        continue;
+                    }
                     stage = $"第 {k + 1} 個操作在實體手臂執行";
                     stageKind = "execution";
                     var env = new StepEnvelope { StepId = assignment.StepId, SourcePosition = assignment.Source,
                         TargetPosition = step.Target, ActionSequence = step.Actions, Comment = "自由規劃實驗" };
-                    if (stacked3d)
-                    {
-                        // 用這一步開始前重新觀測的場景算高度（前面的實機步驟已經改變了場景）
-                        var observed = new TranslatedStep { SourceIndex = current.IndexOf(assignment.Source!),
-                            Target = step.Target, Actions = step.Actions };
-                        (env.SourceTopM, env.TargetTopM) = LayeredHeights.ForSteps(new[] { observed }, current)[0];
-                    }
                     Save(dir, $"step_{stepId}.json", env);
                     int batchId = ++stepId;
                     // Use the existing batch entry point even for one operation:
                     // it prepares shared trajectories and honors preview-only.
+                    // 純模擬時「實機」就是 URSim：每一批都標 robot_target = "ursim"，Unity 不會連實體手臂
                     AtomicWrite(Path.Combine(assets, "current_step.json"), new BatchEnvelope {
                         BatchId = batchId, Steps = new List<StepEnvelope> { env }, Comment = env.Comment,
-                        LayeredGrasp = stacked3d
+                        RobotTarget = sim ? "ursim" : ""
                     });
                     Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 Unity/UR3：step {assignment.StepId}、batch {batchId}。");
                     executionPending = true;
@@ -247,7 +359,6 @@ while (true)
                     stageKind = "local_validation";
                     await Task.Delay(1200);
                     var afterStep = await Scene();
-                    var outcome = ClassifyOutcome(step.Actions);
                     var check = outcome switch
                     {
                         ActionOutcome.Holding => Verifier.CheckHoldingStep(assignment, current, afterStep),
@@ -274,8 +385,8 @@ while (true)
             trace.Add($"實體手臂完整執行了 {robotOperations} 個操作");
             var after = await Scene();
             Save(dir, "after_scene.json", after);
-            // 跟 Unity SceneSyncer 執行後刷新場景對應：把這次嘗試的真實結果投影回 Isaac Sim（背景）。
-            IsaacSimExecutor.SyncRealScene(after, camera);
+            // 跟 Unity SceneSyncer 執行後刷新場景對應：把這次嘗試的真實結果投影回 Isaac Sim（背景）。純模擬不投影。
+            if (!sim) IsaacSimExecutor.SyncRealScene(after, camera);
             var afterImage = await Frame(dir, "after.jpg");
             var verdict = await llm.Validate(goal, initial, after, afterImage, dir);
             feedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n執行／局部觀察：{failure}\n整體觀察：{verdict}";
@@ -309,11 +420,12 @@ while (true)
     Save(run, "result.json", new { success, status, attempts, attempt_outcomes = attemptOutcomes,
         counts_toward_success_rate = status is "success" or "failed",
         final_rules = rules, finished_utc = DateTime.UtcNow });
-    ExperimentMetrics.Write(output);
+    ExperimentMetrics.Write(root);
     if (status == "execution_unknown") { Console.WriteLine("執行狀態未知，服務停止。確認手臂停止後再重新啟動。"); break; }
     AtomicWrite(Path.Combine(assets, "current_step.json"), new StepEnvelope { StepId = ++stepId, Done = true });
     Console.WriteLine($"[實驗] {status}；紀錄：{run}。" +
-        (fixedBaseline ? "下個任務需恢復初始桌面。" : "下個任務以當時的桌面為起點。"));
+        (sim ? (mode.ResetEachTask ? "下個純模擬任務會重建虛擬場景。" : "下個純模擬任務接續目前的模擬世界。")
+             : fixedBaseline ? "下個任務需恢復初始桌面。" : "下個任務以當時的桌面為起點。"));
 }
 void Save(string dir, string name, object? value) => File.WriteAllText(Path.Combine(dir, name), JsonSerializer.Serialize(value, json));
 void AtomicWrite(string path, object value)
@@ -321,9 +433,10 @@ void AtomicWrite(string path, object value)
     File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(value, json));
     File.Move(path + ".tmp", path, true);
 }
+// 場景、照片：實機來自相機（perception_server），純模擬來自 Isaac Sim（同格式）
 async Task<List<SceneObject>> Scene()
 {
-    using var doc = JsonDocument.Parse(await http.GetStringAsync("scene"));
+    using var doc = JsonDocument.Parse(await perception.GetStringAsync("scene"));
     if (!doc.RootElement.TryGetProperty("timestamp", out var ts) || ts.ValueKind != JsonValueKind.Number ||
         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 - ts.GetDouble() > 5)
         throw new HttpRequestException("相機觀測未更新或已超過 5 秒，不能使用舊場景。");
@@ -340,7 +453,7 @@ async Task<List<SceneObject>> Scene()
 }
 async Task<byte[]?> Frame(string dir, string name)
 {
-    try { var bytes = await http.GetByteArrayAsync("debug/frame"); File.WriteAllBytes(Path.Combine(dir, name), bytes); return bytes; }
+    try { var bytes = await perception.GetByteArrayAsync("debug/frame"); File.WriteAllBytes(Path.Combine(dir, name), bytes); return bytes; }
     catch (Exception ex)
     {
         File.WriteAllText(Path.Combine(dir, name + ".error.txt"), ex.Message);
@@ -348,8 +461,10 @@ async Task<byte[]?> Frame(string dir, string name)
     }
 }
 // 相機內參與位姿只用來對齊 Isaac Sim 的模擬相機；取不到時模擬端沿用上次的相機，不中斷實驗。
+// 純模擬沒有真實相機，模擬相機由虛擬場景檔決定。
 async Task<JsonElement?> CameraInfo()
 {
+    if (sim) return null;
     try
     {
         using var doc = JsonDocument.Parse(await http.GetStringAsync("camera"));

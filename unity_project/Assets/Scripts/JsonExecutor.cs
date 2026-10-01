@@ -242,7 +242,7 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
-    public const float QR1_X = -0.38637f-0.005f;
+    public const float QR1_X = -0.38637f-0.007f;
     public const float QR1_Y = -0.35747f; //+0.005f
     public const float QR1_Z = 0.030f;
 
@@ -380,7 +380,20 @@ public class JsonExecutor : MonoBehaviour
 
         DiscardStaleCommandFile();
         EnsureUrConnectionStarted();
+        RunMode.Changed += OnRunModeChanged;
         StartCoroutine(PollLoop());
+    }
+
+    // 正在執行一批（或手動回 Home 中斷前的批次）：UI 不允許這時切換模式
+    public bool IsBusy => currentStepCoroutine != null;
+
+    // 切換純模擬 / 實機：手動控制與非 URSim 批次用的連線改連新模式的手臂（下次用到時重新連線）
+    void OnRunModeChanged()
+    {
+        if (IsBusy) return;
+        if (urListener != null && urListener != ursimListener) urListener.Close();
+        urListener = null;
+        Debug.Log($"[Executor] 切換成{(RunMode.IsSim ? "純模擬：手動控制改連 URSim（" + ursimIP + "）" : "實機：手動控制連實體手臂（" + urIP + "）")}");
     }
 
     // PollLoop 用 lastProcessedStepJson 判斷指令是不是新的，但這份紀錄每次按 Play 都從空的開始；
@@ -430,6 +443,7 @@ public class JsonExecutor : MonoBehaviour
 
     void OnDestroy()
     {
+        RunMode.Changed -= OnRunModeChanged;
         urListener?.Close();
         if (ursimListener != null && ursimListener != urListener) ursimListener.Close();
         if (parkedRealListener != null && parkedRealListener != urListener) parkedRealListener.Close();
@@ -613,8 +627,11 @@ public class JsonExecutor : MonoBehaviour
                     continue;
                 }
 
-                // 3D 疊放驗證：整批用同一套執行流程，但連線換成 URSim；跑完一定換回實機連線
+                // 3D 疊放驗證與純模擬的所有批次：整批用同一套執行流程，但連線換成 URSim；跑完一定換回實機連線
                 bool onUrsim = batch.robot_target == "ursim";
+                if (!onUrsim && RunMode.IsSim)
+                    Debug.LogWarning($"[Executor] batch {batch.batch_id} 是實機模式任務的批次，但 Unity 已切成純模擬；" +
+                                     "這批會送到手動控制目前連的手臂（純模擬時是 URSim）");
                 if (onUrsim)
                 {
                     if (string.IsNullOrWhiteSpace(ursimIP))
@@ -1298,22 +1315,25 @@ public class JsonExecutor : MonoBehaviour
         var readySolution = UR3eKinematics.IKNearest(readyPose, reference);
         if (!readySolution.ok)
         {
-            error = $"收尾回到 Ready 姿勢無解（{UR3eKinematics.Describe(readySolution.error)}）：{readySolution.message}";
-            return false;
+            Debug.LogWarning($"[Executor-shared] 抓放路徑可執行，但收尾 Ready 姿勢無解，將停在最後的安全抬升位置：{readySolution.message}");
+            error = null;
+            return true;
         }
         double[] ready = readySolution.q;
-        if (!ValidateJointTransition(reference, ready, out error, allowSingularEnd: false))
+        if (!ValidateJointTransition(reference, ready, out string readyError, allowSingularEnd: false))
         {
-            error = "收尾回到 Ready 的路徑：" + error;
-            return false;
+            Debug.LogWarning($"[Executor-shared] 抓放路徑可執行，但收尾 Ready 路徑不安全，將停在最後的安全抬升位置：{readyError}");
+            error = null;
+            return true;
         }
         sharedFinalTrajectory.Add((double[])ready.Clone());
         reference = ready;
         double[] homeTarget = { -1.5708, -1.5708, 0.0, -1.5708, 0.0, 0.0 };
-        if (!ValidateJointTransition(reference, homeTarget, out error, allowSingularEnd: true))
+        if (!ValidateJointTransition(reference, homeTarget, out string homeError, allowSingularEnd: true))
         {
-            error = "收尾回到 Home 的路徑：" + error;
-            return false;
+            Debug.LogWarning($"[Executor-shared] 已規劃安全 Ready 收尾，但 Ready 到 Home 路徑不安全，將停在 Ready：{homeError}");
+            error = null;
+            return true;
         }
         sharedFinalTrajectory.Add(homeTarget);
 
@@ -2528,9 +2548,11 @@ public class JsonExecutor : MonoBehaviour
     void EnsureUrConnectionStarted()
     {
         if (urListener != null) return;
+        // 純模擬時手動控制（夾爪、回 Home）也只動 URSim；批次一律由 robot_target 決定（純模擬的批次都是 "ursim"）
+        string ip = RunMode.IsSim ? ursimIP : urIP;
         urListener = new URPackageListener();
-        urListener.Connect(urIP);
-        Debug.Log("嘗試連線至 UR：" + urIP);
+        urListener.Connect(ip);
+        Debug.Log("嘗試連線至 UR：" + ip);
     }
 
     IEnumerator ExecuteStep(StepEnvelope env, long stepEpoch, bool managePerceptionMode = true)
@@ -3356,6 +3378,7 @@ public class JsonExecutor : MonoBehaviour
         return (x * x + y * y) > maxRadius * maxRadius;
     }
 
+    // 回傳的是夾爪方向（SharedTargetPose：horizontal = 0°、其他 = 90°），不是積木的方向
     string EffectiveOrientation(NamedPosition pos, bool isSource)
     {
         if (pos == null)
@@ -3364,7 +3387,10 @@ public class JsonExecutor : MonoBehaviour
         // needless 90-degree wrist rotation merely because it is a source pick.
         if (pos.shape != "domino")
             return "horizontal";
-        return pos.orientation ?? "horizontal";
+        // 實體夾爪張開只有 3.5 cm，只跨得住 domino 2.5 cm 的短邊；手指沿工具 X 開合，0° 時落在 ±X 兩側
+        // （2026-09-30 實測）。長邊沿 X 的 horizontal domino（沒標方向也當 horizontal）要轉 90°，
+        // 手指才會落在長邊兩側；長邊沿 Y 的 vertical domino 用 0°。
+        return pos.orientation == "vertical" ? "horizontal" : "vertical";
     }
 
     bool IsNearHomeJointPose()
@@ -3444,7 +3470,9 @@ public class JsonExecutor : MonoBehaviour
     {
         string json = "{\"mode\":\"" + mode + "\"}";
         byte[] body = Encoding.UTF8.GetBytes(json);
-        using (UnityWebRequest req = new UnityWebRequest(perceptionModeUrl, "POST"))
+        // 純模擬時通知 Isaac Sim（SceneSyncer 也改從那裡輪詢），實機模式通知 perception_server
+        string url = RunMode.IsSim ? RunMode.SimPerceptionUrl + "scene/mode" : perceptionModeUrl;
+        using (UnityWebRequest req = new UnityWebRequest(url, "POST"))
         {
             req.uploadHandler = new UploadHandlerRaw(body);
             req.downloadHandler = new DownloadHandlerBuffer();

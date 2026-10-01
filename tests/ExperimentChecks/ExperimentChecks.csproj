@@ -3,11 +3,13 @@
   <ItemGroup>
     <Compile Include="../../csharp_server/ExperimentChecks.cs" Link="ExperimentChecks.cs" />
     <Compile Include="../../csharp_server/ExperimentMetrics.cs" Link="ExperimentMetrics.cs" />
+    <Compile Include="../../csharp_server/NaturalLanguagePlanAdapter.cs" Link="NaturalLanguagePlanAdapter.cs" />
     <Compile Include="../../csharp_server/RobotPlan.cs" Link="RobotPlan.cs" />
     <Compile Include="../../csharp_server/LayeredTypes.cs" Link="LayeredTypes.cs" />
     <Compile Include="../../csharp_server/MotionPlanValidator.cs" Link="MotionPlanValidator.cs" />
     <Compile Include="../../csharp_server/Verifier.cs" Link="Verifier.cs" />
     <Compile Include="../../csharp_server/LayeredHeights.cs" Link="LayeredHeights.cs" />
+    <Compile Include="../../csharp_server/RunModeConfig.cs" Link="RunModeConfig.cs" />
     <Compile Include="../../unity_project/Assets/Scripts/LayeredGraspGeometry.cs" Link="LayeredGraspGeometry.cs" />
   </ItemGroup>
 </Project>

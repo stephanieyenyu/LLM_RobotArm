@@ -288,8 +288,8 @@ MonoBehaviour:
   pollIntervalSec: 0.3
   workspaceWidthM: 0.85
   workspaceDepthM: 0.375
-  armBaseAtQrX: 0.38824
-  armBaseAtQrY: 0.35473
+  armBaseAtQrX: 0.39337
+  armBaseAtQrY: 0.35747
   armBaseAtQrZ: -0.03
   planeMarginM: 0.15
   cubeSizeM: 0.025
@@ -695,10 +695,10 @@ MonoBehaviour:
   currentStepFile: current_step.json
   stepDoneFile: step_done.json
   urIP: 192.168.50.204
+  ursimIP: 192.168.50.221
   pollIntervalSec: 0.3
   perceptionModeUrl: http://localhost:5000/scene/mode
   uiManager: {fileID: 0}
-  simulationOnly: 0
   sceneSyncer: {fileID: 447807163}
   robotArm: {fileID: 1799080993}
   simMoveSecPerStep: 1.2
@@ -1037,23 +1037,23 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 849375843051583541, guid: 805cce6afb81cac48bbcdbf7ce583e81, type: 3}
       propertyPath: m_LocalRotation.w
-      value: 0.5
+      value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 849375843051583541, guid: 805cce6afb81cac48bbcdbf7ce583e81, type: 3}
       propertyPath: m_LocalRotation.x
-      value: -0.5
+      value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 849375843051583541, guid: 805cce6afb81cac48bbcdbf7ce583e81, type: 3}
       propertyPath: m_LocalRotation.y
-      value: -0.5
+      value: -0.70710677
       objectReference: {fileID: 0}
     - target: {fileID: 849375843051583541, guid: 805cce6afb81cac48bbcdbf7ce583e81, type: 3}
       propertyPath: m_LocalRotation.z
-      value: 0.5
+      value: 0.70710677
       objectReference: {fileID: 0}
     - target: {fileID: 849375843051583541, guid: 805cce6afb81cac48bbcdbf7ce583e81, type: 3}
       propertyPath: m_LocalEulerAnglesHint.x
-      value: 0
+      value: 90
       objectReference: {fileID: 0}
     - target: {fileID: 849375843051583541, guid: 805cce6afb81cac48bbcdbf7ce583e81, type: 3}
       propertyPath: m_LocalEulerAnglesHint.y
@@ -1453,7 +1453,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   uiDocument: {fileID: 1993866154}
   executor: {fileID: 1353763073}
-  sceneSyncer: {fileID: 0}
 --- !u!114 &1993866154
 MonoBehaviour:
   m_ObjectHideFlags: 0

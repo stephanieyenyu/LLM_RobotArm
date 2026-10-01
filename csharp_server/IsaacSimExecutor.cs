@@ -46,23 +46,52 @@ public static class IsaacSimExecutor
                 .Any(o => Math.Sqrt(Math.Pow(o.X - s.Target.X, 2) + Math.Pow(o.Y - s.Target.Y, 2)) < StackFootprintM);
         });
 
-    /// <summary>投影真實場景並開始驗證；Isaac 或 URSim 不可用時丟 SimulationUnavailableException。</summary>
+    /// <summary>
+    /// 投影真實場景並開始驗證；Isaac 或 URSim 不可用時丟 SimulationUnavailableException。
+    /// useCurrentWorld（純模擬）：Isaac 本身就是世界，不重新投影，直接從目前的物理狀態開始驗證。
+    /// </summary>
     public static async Task BeginVerifyAsync(List<SceneObject> scene, List<TranslatedStep> steps,
-        JsonElement? camera, byte[]? realFrame, string dir)
+        JsonElement? camera, byte[]? realFrame, string dir, bool useCurrentWorld = false)
     {
         await IsaacLock.WaitAsync();
         try
         {
-            var body = new
-            {
-                scene,
-                camera,
-                steps = steps.Select(s => new { source_index = s.SourceIndex, target = s.Target, actions = s.Actions }),
-            };
+            var stepBodies = steps.Select(s => new { source_index = s.SourceIndex, target = s.Target, actions = s.Actions });
+            object body = useCurrentWorld
+                ? new { scene, camera, steps = stepBodies, use_current_world = true }
+                : new { scene, camera, steps = stepBodies };
             File.WriteAllText(Path.Combine(dir, "isaac_verify_begin.json"), await Post("verify/begin", body));
             await SaveFrame(dir, "isaac_before.jpg");
-            if (realFrame != null) await SaveOverlay(dir, realFrame);
+            // 純模擬的「真實畫面」就是 Isaac 自己的畫面，不做疊合
+            if (realFrame != null && !useCurrentWorld) await SaveOverlay(dir, realFrame);
         }
+        finally { IsaacLock.Release(); }
+    }
+
+    /// <summary>純模擬時場景與相機畫面由 Isaac 提供，端點格式同 perception_server。</summary>
+    public static Uri PerceptionBaseUri => new(Http.BaseAddress!, "perception/");
+
+    /// <summary>純模擬：用虛擬場景重建 Isaac 世界（中止還沒結束的驗證）。</summary>
+    public static async Task<string> LoadSimSceneAsync(List<SceneObject> scene, JsonElement? camera)
+    {
+        await IsaacLock.WaitAsync();
+        try { return await Post("sim/load", new { scene, camera }); }
+        finally { IsaacLock.Release(); }
+    }
+
+    /// <summary>純模擬：記下目前積木位姿（3D 驗證前）。</summary>
+    public static async Task SnapshotWorldAsync()
+    {
+        await IsaacLock.WaitAsync();
+        try { await Post("sim/snapshot", new { }); }
+        finally { IsaacLock.Release(); }
+    }
+
+    /// <summary>純模擬：積木放回快照的位姿（3D 驗證後，正式執行從驗證前的狀態開始）。</summary>
+    public static async Task RestoreWorldAsync()
+    {
+        await IsaacLock.WaitAsync();
+        try { await Post("sim/restore", new { }); }
         finally { IsaacLock.Release(); }
     }
 
