@@ -183,6 +183,12 @@ public class BatchEnvelope
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool LayeredGrasp { get; set; }
 
+    // 這一批的軌跡在前一批已經在 Unity 預覽過（3D 疊放的正式執行，跟 URSim 驗證那批同一條軌跡）：
+    // Unity 不再播預覽，直接執行，模擬只動一次。false 時不寫出這個欄位，2D 批次的 JSON 不變。
+    [JsonPropertyName("skip_preview")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SkipPreview { get; set; }
+
     // 這一批是否關閉「模擬結束比對 bitmap」（對照組）。欄位名刻意用 disabled：Unity 讀不到
     // 這個欄位時預設 false，等於驗證開啟，版本不同步時不會默默變成對照組。
     [JsonPropertyName("verification_disabled")]
@@ -227,11 +233,18 @@ public class SimulationCheckReport
     public int ExpectedCount { get; set; }
     [JsonPropertyName("correct_count")]
     public int CorrectCount { get; set; }
-    // 重疊率 = 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）；大於門檻才算吻合
+    // 畫面重疊率 = 預覽結束時 Unity 俯視畫面的方塊像素跟預期佔地的交集 ÷ 聯集；大於門檻才算吻合（2026-10-01 起，
+    // 之前是下面的格子重疊率）
     [JsonPropertyName("overlap_ratio")]
     public double OverlapRatio { get; set; }
     [JsonPropertyName("overlap_threshold")]
     public double OverlapThreshold { get; set; }
+    // 座標比對的格子重疊率 = 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數），只當說明
+    [JsonPropertyName("cell_overlap_ratio")]
+    public double CellOverlapRatio { get; set; }
+    // 比對圖（Unity StreamingAssets 底下的檔名，左：Unity 俯視畫面，右：綠 = 重疊、紅 = 該有沒有、藍 = 多出來）
+    [JsonPropertyName("image_file")]
+    public string? ImageFile { get; set; }
     [JsonPropertyName("expected_rows")]
     public List<string> ExpectedRows { get; set; } = new();
     [JsonPropertyName("result_rows")]

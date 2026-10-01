@@ -48,6 +48,28 @@ public static class FigureBitmap
         return (grid.Select(r => new string(r)).ToList(), cells, cellX, cellY);
     }
 
+    /// <summary>
+    /// 3D 疊放逐層畫，由下往上：每一層都用整個圖形的同一組格子（格距、原點相同），上下層才對得齊。
+    /// layerOf[i] 是 placed[i] 在第幾層（1 = 放在桌面上）。
+    /// </summary>
+    public static List<(int Layer, List<string> Rows)> Layers(IReadOnlyList<SceneObject> placed, IReadOnlyList<int> layerOf)
+    {
+        var (rows, cells, _, _) = Build(placed);
+        var result = new List<(int, List<string>)>();
+        foreach (int layer in layerOf.Distinct().OrderBy(l => l))
+        {
+            var grid = rows.Select(r => Enumerable.Repeat('□', r.Length).ToArray()).ToArray();
+            for (int i = 0; i < cells.Count; i++)
+            {
+                if (layerOf[i] != layer) continue;
+                grid[cells[i].Row][cells[i].Col] = '■';
+                if (cells[i].SecondRow >= 0) grid[cells[i].SecondRow][cells[i].SecondCol] = '■';
+            }
+            result.Add((layer, grid.Select(r => new string(r)).ToList()));
+        }
+        return result;
+    }
+
     public static void Print(string title, IEnumerable<string> rows)
     {
         Console.WriteLine(title);
@@ -78,28 +100,48 @@ public static class FigureBitmap
                (letters > 1 ? $"（{letters} 個字母最多高 {MaxLetterCells} 格 × 寬 {maxWidth} 格）" : "");
     }
 
-    // 同一列相鄰物件的 X 間距取中位數當 X 格距，同一行相鄰物件的 Y 間距當 Y 格距；
+    // X、Y 各自估格距；有 cube 時只用 cube 量（佔兩格的 domino 中心落在兩格中間），
     // 只有一個方向量得到時兩個方向用同一個，都量不到就用預設格距
     static (double X, double Y) CellSize(IReadOnlyList<SceneObject> placed)
     {
-        double? x = MedianNeighbourGap(placed, o => o.X, o => o.Y);
-        double? y = MedianNeighbourGap(placed, o => o.Y, o => o.X);
+        var cubes = placed.Where(o => o.Shape != "domino").ToList();
+        double? x = Pitch(cubes, o => o.X) ?? Pitch(placed, o => o.X);
+        double? y = Pitch(cubes, o => o.Y) ?? Pitch(placed, o => o.Y);
         return (Math.Clamp(x ?? y ?? DefaultCellM, MinCellM, MaxCellM), Math.Clamp(y ?? x ?? DefaultCellM, MinCellM, MaxCellM));
     }
 
-    // along：量間距的軸；across：判斷是不是同一列（行）的軸
-    static double? MedianNeighbourGap(IReadOnlyList<SceneObject> placed, Func<SceneObject, double> along, Func<SceneObject, double> across)
+    // 採用一個格距時，落在格點上（離格點不到 OnGridTolerance 格）的物件至少要佔這個比例
+    // （其餘可能是移開讓位、不屬於圖形的物件）
+    const double OnGridShare = 0.75;
+    const double OnGridTolerance = 0.1;
+
+    // 一個軸的格距：中心相差 SameLineM 以內算同一列（行），相鄰兩列的距離（不超過 MaxCellM 的）都是候選格距，
+    // 由大到小取第一個讓 OnGridShare 以上的物件落在格點上的；都不到就取落在格點上最多的。看的是所有列之間的距離、
+    // 不是同一列裡的鄰居：Z、N、X 的斜筆畫每列只有一塊，同一行裡的鄰居隔好幾格，拿來當格距會把兩列併成一列。
+    // 每兩列都隔超過 MaxCellM 時改用最小距離的等分（中間留空列），格子才會等距。
+    static double? Pitch(IReadOnlyList<SceneObject> objects, Func<SceneObject, double> axis)
     {
-        var gaps = new List<double>();
-        foreach (var o in placed)
+        var lines = new List<List<double>>();
+        foreach (double v in objects.Select(axis).OrderBy(v => v))
         {
-            var neighbours = placed.Where(p => !ReferenceEquals(p, o) && Math.Abs(across(p) - across(o)) < SameLineM)
-                .Select(p => Math.Abs(along(p) - along(o))).Where(d => d > SameLineM).ToList();
-            if (neighbours.Count > 0) gaps.Add(neighbours.Min());
+            if (lines.Count == 0 || v - lines[^1][^1] > SameLineM) lines.Add(new List<double>());
+            lines[^1].Add(v);
         }
-        if (gaps.Count == 0) return null;
-        gaps.Sort();
-        return gaps[gaps.Count / 2];
+        if (lines.Count < 2) return null;
+        var centres = lines.Select(l => l.Average()).ToList();
+        var gaps = centres.Zip(centres.Skip(1), (a, b) => b - a).ToList();
+        var candidates = gaps.Where(g => g <= MaxCellM + 1e-9).Select(g => Math.Max(g, MinCellM)).ToList();
+        if (candidates.Count == 0) candidates.Add(gaps.Min() / Math.Ceiling(gaps.Min() / MaxCellM - 1e-9));
+        candidates = candidates.Distinct().OrderByDescending(p => p).ToList();
+        // 以其中一列為原點、落在格點上的物件數，取最好的原點
+        int OnGrid(double pitch) => centres.Max(origin => lines.Where((_, i) =>
+        {
+            double k = (centres[i] - origin) / pitch;
+            return Math.Abs(k - Math.Round(k)) <= OnGridTolerance;
+        }).Sum(line => line.Count));
+        foreach (double pitch in candidates)
+            if (OnGrid(pitch) >= OnGridShare * objects.Count) return pitch;
+        return candidates.OrderByDescending(OnGrid).ThenByDescending(p => p).First();
     }
 
     // cube 佔一格；domino 格距放得下兩格時沿長軸佔兩格。第一格是左邊（較小 x）或上面（較大 y）那格，

@@ -73,6 +73,9 @@ public class BatchEnvelope
     // true = 3D 疊放批次（URSim 驗證與通過後的實機）：descend 改用 LayeredGraspGeometry 的分層夾取深度，
     // 碰撞模型的手指段只檢查指尖。2D 批次不送這個欄位，JsonUtility 讀成 false，所有計算跟加欄位前相同。
     public bool layered_grasp;
+    // true = 這批的軌跡在前一批已經預覽過（3D 疊放的正式執行，跟 URSim 驗證那批同一條軌跡），不再播預覽、直接執行。
+    // 2D 批次不送這個欄位，JsonUtility 讀成 false，照常預覽與比對 bitmap。
+    public bool skip_preview;
 }
 
 // bitmap 裡一個應該放積木的物件（cube 佔一格，domino 佔兩格），QR frame 座標
@@ -100,8 +103,10 @@ public class SimulationCheckReport
     public bool verification_enabled;  // 開 = 不通過就擋；關 = 只記錄
     public int expected_count;
     public int correct_count;
-    public float overlap_ratio;        // 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）
-    public float overlap_threshold;    // 重疊率要大於這個值才算吻合
+    public float overlap_ratio;        // 畫面重疊率：Unity 俯視畫面的方塊像素跟預期佔地的交集 ÷ 聯集（判定用）
+    public float overlap_threshold;    // 畫面重疊率要大於這個值才算吻合
+    public float cell_overlap_ratio;   // 座標比對的格子重疊率：放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數），只當說明
+    public string image_file;          // 比對圖（StreamingAssets 底下）；空字串 = 沒存到
     public List<string> expected_rows;
     public List<string> result_rows;
     public List<string> errors;
@@ -217,7 +222,6 @@ public class JsonExecutor : MonoBehaviour
     public float simHomeWrist2   =   0f;
     public float simHomeWrist3   =   0f;
     public bool previewBatchInUnityBeforeRobot = true;
-    public bool freezeUnityRobotDuringRealBatch = true;
     public float placeDescendExtraZ = 0f;
 
     [Header("預演 / 實機共用 movej 軌跡")]
@@ -234,7 +238,8 @@ public class JsonExecutor : MonoBehaviour
     public float bitmapXYToleranceM = 0.020f;
     // 落點頂面高度跟預期差多少以內算對；超過代表疊到別的方塊上，或在空中放開
     public float bitmapZToleranceM = 0.010f;
-    // 重疊率 = 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）；大於這個值才算跟 bitmap 吻合、送實機
+    // 畫面重疊率 = 預覽結束時 Unity 俯視畫面裡方塊的像素跟預期佔地的交集 ÷ 聯集（FigureImageOverlap）；
+    // 大於這個值才算跟 bitmap 吻合、送實機。預覽的落點就在 TCP 正下方，放對時接近 100%
     public float bitmapOverlapThreshold = 0.9f;
     // 模擬夾取時，夾爪 TCP 離方塊中心多遠以內才夾得到
     public float simGraspToleranceM = 0.020f;
@@ -668,6 +673,8 @@ public class JsonExecutor : MonoBehaviour
                 yield return currentStepCoroutine;
                 currentStepCoroutine = null;
                 currentStepId = -1;
+                // 整批結束（成功或失敗）才解凍：Unity 手臂一次對齊實機最後的姿勢，手動控制也恢復顯示
+                RobotArm.FreezeVisualFeedback = false;
                 if (batch.layered_grasp && sceneSyncer != null)
                     sceneSyncer.SetTableHeightOffset(0f);
                 if (onUrsim)
@@ -818,7 +825,7 @@ public class JsonExecutor : MonoBehaviour
             sceneSyncer = FindObjectOfType<SceneSyncer>();
         if (robotArm == null)
             robotArm = FindObjectOfType<RobotArm>();
-        if (previewBatchInUnityBeforeRobot || previewOnlySharedTrajectory || usingTopLeftFallback)
+        if ((previewBatchInUnityBeforeRobot || previewOnlySharedTrajectory || usingTopLeftFallback) && !batch.skip_preview)
         {
             // 動畫預覽：手臂 + 方塊完整演示（跑完自動復原）
             // 預覽期間關 followRealRobotFeedback，讓 Update() 用我們設的 Angles 而非實機 q_actual
@@ -838,8 +845,11 @@ public class JsonExecutor : MonoBehaviour
         }
         else
         {
-            ReportSimulationCheckSkippedIfNeeded(batch,
-                "previewBatchInUnityBeforeRobot 關閉，沒有播模擬，直接送實機");
+            if (batch.skip_preview)
+                Debug.Log($"[Executor-preview] batch {batch.batch_id} 的軌跡在驗證批次已經預覽過，不再預覽，直接執行");
+            ReportSimulationCheckSkippedIfNeeded(batch, batch.skip_preview
+                ? "這批的軌跡在前一批已經預覽過，沒有再播模擬"
+                : "previewBatchInUnityBeforeRobot 關閉，沒有播模擬，直接送實機");
         }
         if (previewOnlySharedTrajectory)
         {
@@ -861,9 +871,11 @@ public class JsonExecutor : MonoBehaviour
             Debug.LogWarning("[Executor-preview] Top-left cube yaw fallback previewed only; no UR motion sent.");
             yield break;
         }
-        // 預覽結束、實機開始：Unity 手臂改由實機 feedback 驅動
+        // 預覽結束、實機（或 URSim）開始：模擬只在預覽動一次，執行期間 Unity 的手臂與方塊都不動
+        // （FreezeVisualFeedback 也讓 SyncGripper 停住，不會照實機夾爪把方塊夾著走）；
+        // 整批結束才解凍（PollLoop），手臂一次對齊實機最後的姿勢，方塊由感知或模擬世界刷新
         if (robotArm != null) robotArm.followRealRobotFeedback = true;
-        RobotArm.FreezeVisualFeedback = freezeUnityRobotDuringRealBatch;
+        RobotArm.FreezeVisualFeedback = true;
 
         float waited = 0f;
         while (!urListener.Connected && waited < 3f)
@@ -1539,9 +1551,9 @@ public class JsonExecutor : MonoBehaviour
         return cell.shape == "domino" ? $"{cells} domino {cell.orientation}" : $"{cells} {cell.shape}";
     }
 
-    // 模擬結束後比對：每個 bitmap 物件是否有一顆方塊落在對應格子（容許誤差內），
-    // 形狀、domino 方向、高度也要對；多放、少放、放錯格、在空中放開都算錯。
-    // 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）= 重疊率，大於 bitmapOverlapThreshold 才通過；
+    // 模擬結束後比對：判定用 Unity 畫面跟預期佔地的像素重疊率（FigureImageOverlap），大於 bitmapOverlapThreshold 才通過。
+    // 另外逐格做座標比對當說明：每個 bitmap 物件是否有一顆方塊落在對應格子（容許誤差內），形狀、domino 方向、高度也要對；
+    // 多放、少放、放錯格、在空中放開都列進錯誤清單，給反思看原因。
     // 把報告印出來，錯誤清單存在 bitmapCheckErrors（null = 這批沒有 bitmap），通過與否存在 bitmapCheckPassed。
     void RunBitmapCheck(BatchEnvelope batch)
     {
@@ -1674,7 +1686,14 @@ public class JsonExecutor : MonoBehaviour
                 extraCells += cand.state.isDomino ? 2 : 1;
             }
         }
-        float overlap = expectedCellCount + extraCells > 0 ? (float)hitCells / (expectedCellCount + extraCells) : 0f;
+        // 座標比對的格子重疊率只當說明；判定用 Unity 畫面跟預期佔地的像素重疊率
+        float cellOverlap = expectedCellCount + extraCells > 0 ? (float)hitCells / (expectedCellCount + extraCells) : 0f;
+        float overlap = FigureImageOverlap(expected, cellX, cellY, out string imageFile, out string imageError);
+        if (overlap < 0f)
+        {
+            errors.Add("無法擷取 Unity 畫面做比對：" + imageError);
+            overlap = 0f;
+        }
         bool passed = overlap > bitmapOverlapThreshold;
 
         var resultRows = new List<string>();
@@ -1686,10 +1705,11 @@ public class JsonExecutor : MonoBehaviour
         }
 
         var report = new System.Text.StringBuilder();
-        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ 模擬結果跟 bitmap 吻合" : "✗ 模擬結果跟 bitmap 不吻合")}，" +
-                          $"重疊率 {overlap * 100f:F0}%（要大於 {bitmapOverlapThreshold * 100f:F0}%），" +
-                          $"預期 {expected.Count} 個物件，放對 {correct}，錯誤 {errors.Count} 項");
-        report.AppendLine("  預期 bitmap    模擬結果（■ 正確  ✗ 少放/錯誤  ● 多放/放錯  □ 空）");
+        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ Unity 畫面跟 bitmap 吻合" : "✗ Unity 畫面跟 bitmap 不吻合")}，" +
+                          $"畫面重疊率 {overlap * 100f:F0}%（要大於 {bitmapOverlapThreshold * 100f:F0}%）；" +
+                          $"座標比對：預期 {expected.Count} 個物件，放對 {correct}（格子重疊率 {cellOverlap * 100f:F0}%），錯誤 {errors.Count} 項" +
+                          (imageFile != null ? $"；畫面比對圖 StreamingAssets/{imageFile}" : ""));
+        report.AppendLine("  預期 bitmap    座標比對結果（■ 正確  ✗ 少放/錯誤  ● 多放/放錯  □ 空）");
         for (int r = 0; r < rows; r++)
         {
             string want = batch.bitmap != null && r < batch.bitmap.Count ? batch.bitmap[r] : "";
@@ -1714,11 +1734,167 @@ public class JsonExecutor : MonoBehaviour
             correct_count = correct,
             overlap_ratio = overlap,
             overlap_threshold = bitmapOverlapThreshold,
+            cell_overlap_ratio = cellOverlap,
+            image_file = imageFile ?? "",
             expected_rows = batch.bitmap ?? new List<string>(),
             result_rows = resultRows,
             errors = errors,
             notes = new List<string>(simPlacementNotes),
         });
+    }
+
+    // 畫面比對用的暫時圖層（專案沒用到的最後一層）與取樣解析度（1 像素 = 1 mm）
+    const int FigureCaptureLayer = 31;
+    const float FigurePixelM = 0.001f;
+
+    // 預覽結束、場景還原前拍 Unity 畫面跟預期佔地比對。臨時架一台正上方的正交相機，只拍方塊
+    // （手臂、桌面、QR 標記不拍；夾爪上還夾著的不算），再重新取樣成跟 bitmap 同方向（上 = +Y、右 = +X）的 QR 格子；
+    // 同一張格子畫出預期格每塊應有的佔地（cube 2.5×2.5 cm，domino 5×2.5 cm 照方向）。
+    // 重疊率 = 兩者交集的像素 ÷ 聯集的像素；範圍是預期佔地的外框四邊各加半格，範圍內多出來的方塊一樣算進聯集。
+    // 比對圖存成 StreamingAssets/sim_check.png（左：Unity 俯視畫面；右：綠 = 重疊、紅 = 該有沒有、藍 = 多出來）。
+    // 擷取失敗回傳 -1 並給原因。
+    float FigureImageOverlap(List<ExpectedCell> expected, float cellX, float cellY, out string imageFile, out string error)
+    {
+        imageFile = null;
+        error = null;
+        float size = sceneSyncer.cubeSizeM;
+        (float hx, float hy) Half(ExpectedCell e) => e.shape != "domino" ? (size / 2f, size / 2f)
+            : e.orientation == "vertical" ? (size / 2f, size) : (size, size / 2f);
+        float x0 = float.MaxValue, x1 = float.MinValue, y0 = float.MaxValue, y1 = float.MinValue;
+        foreach (var e in expected)
+        {
+            var (hx, hy) = Half(e);
+            x0 = Mathf.Min(x0, e.x - hx); x1 = Mathf.Max(x1, e.x + hx);
+            y0 = Mathf.Min(y0, e.y - hy); y1 = Mathf.Max(y1, e.y + hy);
+        }
+        x0 -= cellX / 2f; x1 += cellX / 2f; y0 -= cellY / 2f; y1 += cellY / 2f;
+        int w = Mathf.CeilToInt((x1 - x0) / FigurePixelM), h = Mathf.CeilToInt((y1 - y0) / FigurePixelM);
+        if (w <= 0 || h <= 0 || w > 2000 || h > 2000)
+        {
+            error = $"比對範圍不合理（{w}×{h} 像素）";
+            return -1f;
+        }
+
+        // QR → 世界座標都經過方塊所在的 frame（跟 BlockQR 同一套），相機方向與比例由它推出來，不假設場景的擺法
+        Transform frame = SimBlockFrame();
+        Vector3 World(float x, float y, float z) => frame.TransformPoint(SceneSyncer.QRToUnity(x, y, z));
+        float cx = (x0 + x1) / 2f, cy = (y0 + y1) / 2f;
+        Vector3 centre = World(cx, cy, size);
+        Vector3 down = (World(cx, cy, 0f) - World(cx, cy, 1f)).normalized;
+        Vector3 up = (World(cx, cy + 1f, size) - centre).normalized;
+        float worldPerM = (World(cx + 1f, cy, size) - centre).magnitude;
+        float side = Mathf.Max(x1 - x0, y1 - y0) * 1.1f;
+        int n = Mathf.Clamp(Mathf.CeilToInt(side / (FigurePixelM / 2f)), 64, 4096);
+
+        var camGo = new GameObject("FigureCheckCamera") { hideFlags = HideFlags.HideAndDontSave };
+        var cam = camGo.AddComponent<Camera>();
+        cam.enabled = false;
+        cam.orthographic = true;
+        cam.orthographicSize = side * worldPerM / 2f;
+        cam.aspect = 1f;
+        cam.clearFlags = CameraClearFlags.SolidColor;
+        cam.backgroundColor = Color.magenta;   // 黃、黑、紅、藍的方塊都跟洋紅背景分得開
+        cam.cullingMask = 1 << FigureCaptureLayer;
+        cam.allowMSAA = false;
+        cam.allowHDR = false;
+        cam.nearClipPlane = 0.01f * worldPerM;
+        cam.farClipPlane = 2f * worldPerM;
+        camGo.transform.SetPositionAndRotation(centre - down * worldPerM, Quaternion.LookRotation(down, up));
+
+        var blocks = sceneSyncer.GetCurrentCubes().Where(b => b != null && !SimBlock(b).held).ToList();
+        var layers = blocks.Select(b => b.layer).ToList();
+        var rt = RenderTexture.GetTemporary(n, n, 24, RenderTextureFormat.ARGB32);
+        var shot = new Texture2D(n, n, TextureFormat.RGBA32, false);
+        var previous = RenderTexture.active;
+        var actual = new bool[w * h];
+        var colour = new Color32[w * h];
+        try
+        {
+            foreach (var b in blocks) b.layer = FigureCaptureLayer;
+            cam.targetTexture = rt;
+            cam.Render();
+            RenderTexture.active = rt;
+            shot.ReadPixels(new Rect(0, 0, n, n), 0, 0);
+            shot.Apply();
+            Color32[] pixels = shot.GetPixels32();
+            for (int i = 0; i < h; i++)
+                for (int j = 0; j < w; j++)
+                {
+                    // 每個像素取中心點，正交相機往下看，高度不影響落在畫面哪裡
+                    Vector3 vp = cam.WorldToViewportPoint(World(x0 + (j + 0.5f) * FigurePixelM, y1 - (i + 0.5f) * FigurePixelM, size));
+                    int u = Mathf.Clamp((int)(vp.x * n), 0, n - 1), v = Mathf.Clamp((int)(vp.y * n), 0, n - 1);
+                    Color32 c = pixels[v * n + u];
+                    colour[i * w + j] = c;
+                    actual[i * w + j] = Mathf.Abs(c.r - 255) + c.g + Mathf.Abs(c.b - 255) > 150;
+                }
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return -1f;
+        }
+        finally
+        {
+            for (int i = 0; i < blocks.Count; i++)
+                if (blocks[i] != null) blocks[i].layer = layers[i];
+            cam.targetTexture = null;
+            RenderTexture.active = previous;
+            RenderTexture.ReleaseTemporary(rt);
+            Destroy(shot);
+            Destroy(camGo);
+        }
+
+        int both = 0, union = 0;
+        var want = new bool[w * h];
+        for (int i = 0; i < h; i++)
+            for (int j = 0; j < w; j++)
+            {
+                float qx = x0 + (j + 0.5f) * FigurePixelM, qy = y1 - (i + 0.5f) * FigurePixelM;
+                int k = i * w + j;
+                foreach (var e in expected)
+                {
+                    var (hx, hy) = Half(e);
+                    if (Mathf.Abs(qx - e.x) <= hx && Mathf.Abs(qy - e.y) <= hy) { want[k] = true; break; }
+                }
+                if (want[k] || actual[k]) union++;
+                if (want[k] && actual[k]) both++;
+            }
+
+        // 比對圖：每 1 mm 放大成 2×2 像素，左右兩格中間空 8 像素
+        const int scale = 2, gap = 8;
+        int imageW = (2 * w + gap) * scale, imageH = h * scale;
+        var fill = new Color32[imageW * imageH];
+        for (int p = 0; p < fill.Length; p++) fill[p] = new Color32(255, 255, 255, 255);
+        void Put(int col, int row, Color32 c)
+        {
+            for (int dy = 0; dy < scale; dy++)
+                for (int dx = 0; dx < scale; dx++)
+                    fill[((h - 1 - row) * scale + dy) * imageW + col * scale + dx] = c;   // Texture2D 的 y 由下往上
+        }
+        for (int i = 0; i < h; i++)
+            for (int j = 0; j < w; j++)
+            {
+                int k = i * w + j;
+                Put(j, i, actual[k] ? colour[k] : new Color32(235, 235, 235, 255));
+                Put(w + gap + j, i, want[k] && actual[k] ? new Color32(60, 170, 80, 255)
+                    : want[k] ? new Color32(220, 60, 50, 255)
+                    : actual[k] ? new Color32(50, 110, 230, 255)
+                    : new Color32(255, 255, 255, 255));
+            }
+        var image = new Texture2D(imageW, imageH, TextureFormat.RGBA32, false);
+        image.SetPixels32(fill);
+        image.Apply();
+        try
+        {
+            File.WriteAllBytes(Path.Combine(Application.streamingAssetsPath, "sim_check.png"), image.EncodeToPNG());
+            imageFile = "sim_check.png";
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[BitmapCheck] 比對圖存檔失敗：{ex.Message}");
+        }
+        Destroy(image);
+        return union > 0 ? (float)both / union : 0f;
     }
 
     // 排 pattern 的批次一定要給 server 一個交代：沒做到比對也要寫「未進行」和原因
@@ -1757,11 +1933,11 @@ public class JsonExecutor : MonoBehaviour
         if (bitmapCheckErrors == null || bitmapCheckPassed) return true;
         if (!verificationEnabled)
         {
-            Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：bitmap 重疊率 {bitmapOverlapRatio * 100f:F0}% " +
+            Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：畫面重疊率 {bitmapOverlapRatio * 100f:F0}% " +
                              $"沒有大於 {bitmapOverlapThreshold * 100f:F0}%，對照組照樣繼續");
             return true;
         }
-        string summary = $"模擬結束比對不通過：重疊率 {bitmapOverlapRatio * 100f:F0}% 沒有大於 " +
+        string summary = $"模擬結束比對不通過：Unity 畫面重疊率 {bitmapOverlapRatio * 100f:F0}% 沒有大於 " +
                          $"{bitmapOverlapThreshold * 100f:F0}%（{bitmapCheckErrors.Count} 項）：" +
                          string.Join(" | ", bitmapCheckErrors);
         Debug.LogError("[BitmapCheck] " + summary);

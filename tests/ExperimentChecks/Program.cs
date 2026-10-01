@@ -77,6 +77,9 @@ Check(!JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7 }, batchJson).Co
       "2D batch JSON has no layered_grasp field, so Unity receives the same text as before");
 Check(JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7, LayeredGrasp = true }, batchJson).Contains("\"layered_grasp\": true"),
       "3D batch JSON carries layered_grasp");
+Check(!JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7 }, batchJson).Contains("skip_preview") &&
+      JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7, SkipPreview = true }, batchJson).Contains("\"skip_preview\": true"),
+      "only the 3D formal batch (already previewed with the URSim check) tells Unity to skip the preview; 2D JSON is unchanged");
 bool Near(double a, double b) => Math.Abs(a - b) < 1e-9;
 Check(new[] { -0.0075, 0.0015, 0.013, 0.0179, 0.0277, 0.029 }.All(z => Near(LayeredGraspGeometry.SnapTopToLayer(z), 0.025)),
       "every table-level top seen so far (black -32..+3 mm, yellow -7..+3 mm) snaps to layer 1");
@@ -266,6 +269,29 @@ var wideT = FigureBitmap.Build(new[] { Figure(0.40, 0.20), Figure(0.45, 0.20), F
 Check(Near(wideT.CellXM, 0.05) && Near(wideT.CellYM, 0.03) &&
       wideT.Rows.SequenceEqual(new[] { "■■■■■", "□□■□□", "□□■□□", "□□■□□", "□□■□□" }),
       "a T spaced 5 cm along X and 3 cm along Y draws as a 5x5 T");
+// 格距看所有列（行）之間的距離，不是同一列裡的鄰居（2026-10-01 的 Z 畫成 4 列、H 少一行，都是兩列被併成一列）
+var zCubes = new[] { Figure(0.59, 0.30), Figure(0.65, 0.30), Figure(0.71, 0.30), Figure(0.71, 0.24), Figure(0.65, 0.18),
+                     Figure(0.59, 0.12), Figure(0.59, 0.06), Figure(0.65, 0.06), Figure(0.71, 0.06) };
+var zLetter = FigureBitmap.Build(zCubes);
+Check(Near(zLetter.CellXM, 0.06) && Near(zLetter.CellYM, 0.06) &&
+      zLetter.Rows.SequenceEqual(new[] { "■■■", "□□■", "□■□", "■□□", "■■■" }),
+      "a Z whose diagonal has one cube per row keeps all 5 rows");
+var hLetter = FigureBitmap.Build(new[] { 0.09, 0.15, 0.21, 0.27, 0.33 }.SelectMany(y => new[] { Figure(0.50, y), Figure(0.74, y) })
+    .Concat(new[] { Figure(0.56, 0.21), Figure(0.62, 0.21), Figure(0.68, 0.21) }).ToList());
+Check(Near(hLetter.CellXM, 0.06) && hLetter.Rows.SequenceEqual(new[] { "■□□□■", "■□□□■", "■■■■■", "■□□□■", "■□□□■" }),
+      "an H whose crossbar is the only row with neighbours keeps all 5 columns");
+Check(FigureBitmap.Build(new[] { Figure(0.52, 0.12), Figure(0.60, 0.12), Figure(0.56, 0.155), Figure(0.52, 0.19), Figure(0.60, 0.19) })
+          .Rows.SequenceEqual(new[] { "■□■", "□■□", "■□■" }),
+      "four corners and a centre draw as an X, not as two merged rows");
+var zWithParked = FigureBitmap.Build(zCubes.Append(Figure(0.30, 0.20)).ToList());
+Check(Near(zWithParked.CellXM, 0.06) && Near(zWithParked.CellYM, 0.06), "one cube parked off the grid does not shrink the cell size");
+var sparse = FigureBitmap.Build(new[] { Figure(0.40, 0.08), Figure(0.40, 0.20), Figure(0.40, 0.32) });
+Check(Near(sparse.CellYM, 0.06) && sparse.Rows.SequenceEqual(new[] { "■", "□", "■", "□", "■" }),
+      "rows 12 cm apart (over the 8 cm cap) use half of it, with empty rows between, so the grid stays even");
+var bridge = FigureBitmap.Layers(new[] { Figure(0.40, 0.20), Figure(0.46, 0.20), Figure(0.43, 0.20) }, new[] { 1, 1, 2 });
+Check(bridge.Count == 2 && bridge[0] is (1, var bottom) && bottom.SequenceEqual(new[] { "■□■" }) &&
+      bridge[1] is (2, var top) && top.SequenceEqual(new[] { "□■□" }),
+      "a 3D plan is drawn layer by layer on one shared grid, bottom layer first");
 Check(FigureBitmap.LetterCount("用黃色積木排一個L") == 1 && FigureBitmap.LetterCount("排出CAT") == 3 &&
       FigureBitmap.LetterCount("排一個字母") == 1 && FigureBitmap.LetterCount("把 yellow_cube 移到 QR1 旁邊") == 0 &&
       FigureBitmap.LetterCount("用方塊排一個 3x3 的正方形") == 0 && FigureBitmap.LetterCount("把方塊疊成 3D 的塔") == 0,

@@ -36,7 +36,7 @@ UR3e
 - `Program.cs` — 任務起點確認（目前桌面穩定，或固定配置比對）、任務內保留現況、十次嘗試與逐操作執行
 - `ExperimentLlm.cs` — 自由拆解、自然語言規劃、獨立結果驗證及反思
 - `NaturalLanguagePlanAdapter.cs` — 把規劃文字裡明確寫出的「source index N → target (x, y, z)」與「執行路徑開始／結束」之間的函式呼叫轉成內部執行資料（不呼叫 LLM；domino 方向沿用來源，白名單以外的函式會被略過）
-- `FigureBitmap.cs` — 把 2D 計畫放下的物件畫成 bitmap（跟相機畫面同方向，X、Y 格距分開），印在 terminal，也送給 Unity 當模擬結束比對的預期格；排字母時每個字母最多 5×5 格，超過就在送出前退回
+- `FigureBitmap.cs` — 把計畫放下的物件畫成 bitmap（跟相機畫面同方向，X、Y 格距分開），規劃轉譯完就印在 terminal 的 LLM 進度後面（3D 疊放逐層畫），2D 也送給 Unity 當模擬結束比對的預期格；排字母時每個字母最多 5×5 格，超過就在送出前退回
 - `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
 - `ExperimentMetrics.cs` — 首次／十次內成功率及各次累積成功率
 - `MotionPlanValidator.cs` — 執行前安全狀態機驗證
@@ -85,7 +85,7 @@ dotnet run
 
 ## 3D 疊放驗證：URSim + Isaac Sim
 
-- **2D 平面移動**：所有步驟包成一批，Unity 先預覽整批，模擬結果跟計畫畫出的 bitmap 比對（重疊率要大於 90%，`JsonExecutor.bitmapOverlapThreshold`），通過才整批送實體手臂；bitmap 與比對結果印在 csharp_server 的 terminal。
+- **2D 平面移動**：所有步驟包成一批，Unity 先預覽整批，預覽結束用正上方的正交相機拍 Unity 畫面，跟計畫畫出的 bitmap（每塊應有的佔地）比像素重疊率（交集 ÷ 聯集，要大於 90%，`JsonExecutor.bitmapOverlapThreshold`；比對圖存成 `sim_check.png`），通過才整批送實體手臂；bitmap 與比對結果印在 csharp_server 的 terminal。
 - **3D 疊放**（任一步的目標壓在另一塊積木上，或比來源高出半層）：
   1. csharp_server 把真實場景投影到 Isaac Sim（積木、相機、桌面與 QR1-4 範圍）。
   2. 整輪步驟以 `robot_target = "ursim"` 交給 Unity，Unity 用同一套關節軌跡只在 **URSim** 執行，實體手臂不動。
@@ -95,6 +95,11 @@ dotnet run
      實機跑的就是 Isaac 驗證過的同一條關節軌跡。不通過就算這次嘗試失敗、進 Reflection。
      整批送出前會確認來源積木在驗證後沒被移動（超過 1 cm 就不執行）；步驟之間不重新觀測、不做局部驗證，
      由最後的整體驗證判定。逐步送會讓每一步結束都回 Ready，那些收尾路徑驗證時沒有，靠近手臂的目標位置常回不去。
+
+**模擬與實機各動一次**（2026-10-01 起）：Unity 的手臂只在預覽時動；預覽還原後，URSim 或實體手臂執行期間，
+Unity 的手臂與方塊都不動（以前手臂會跟著實機再動一次，夾爪同步還會把畫面上的方塊夾著走）。整批結束才一次對齊實機最後的姿勢，
+方塊由感知或模擬世界刷新。3D 的正式執行跟 URSim 驗證那批是同一條軌跡，不再預覽（`skip_preview`）：
+Unity、URSim + Isaac、實體手臂各動一次。
 
 **夾爪**：實體夾爪張開時兩指內側只有約 3.5 cm，每根手指厚、寬各約 1.5 cm（2026-09-30 實測），只跨得住 2.5 cm 的邊。
 手指沿工具 X 開合：夾 cube 時在 ±X 兩側；domino 一律跨短邊夾，橫放（長邊沿 X）的夾爪轉 90°、直放的用 0°

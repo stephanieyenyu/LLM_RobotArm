@@ -80,6 +80,7 @@ unity_project/Assets/StreamingAssets/step_done.json*
 unity_project/Assets/StreamingAssets/verification_enabled.txt*
 unity_project/Assets/StreamingAssets/skip_pattern_review.txt*
 unity_project/Assets/StreamingAssets/sim_check.json*
+unity_project/Assets/StreamingAssets/sim_check.png*
 # 純模擬 / 實機切換狀態（Unity 按鈕寫、csharp_server 讀），每台電腦各自的設定
 unity_project/Assets/StreamingAssets/run_mode.json*
 unity_project/Assets/StreamingAssets/sim_world.json*
