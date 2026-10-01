@@ -18,9 +18,9 @@ perception_server (Python + Flask)
    ↓
 LLM 自由拆解子任務 → 自然語言操作計畫
    ↓  本地確定性轉譯（NaturalLanguagePlanAdapter，不呼叫 LLM）→ 內部執行資料
-MotionPlanValidator → Unity 逐操作執行
+MotionPlanValidator + 積木重疊檢查 → Unity 整批（2D 先預覽並比對 bitmap；3D 先在 URSim/Isaac 驗證）
    ↓
-局部觀測檢查 + 獨立視覺模型整體驗證
+獨立視覺模型整體驗證
    └─ 未達標：失敗摘要 → 自行生成規則 → 更新 prompt（最多 10 次）
    ↓  StreamingAssets/current_step.json（robot function sequence）
 Unity JsonExecutor（高階 function → URScript）
@@ -36,6 +36,7 @@ UR3e
 - `Program.cs` — 任務起點確認（目前桌面穩定，或固定配置比對）、任務內保留現況、十次嘗試與逐操作執行
 - `ExperimentLlm.cs` — 自由拆解、自然語言規劃、獨立結果驗證及反思
 - `NaturalLanguagePlanAdapter.cs` — 把規劃文字裡明確寫出的「source index N → target (x, y, z)」與「執行路徑開始／結束」之間的函式呼叫轉成內部執行資料（不呼叫 LLM；domino 方向沿用來源，白名單以外的函式會被略過）
+- `FigureBitmap.cs` — 把 2D 計畫放下的物件畫成 bitmap（跟相機畫面同方向，X、Y 格距分開），印在 terminal，也送給 Unity 當模擬結束比對的預期格；排字母時每個字母最多 5×5 格，超過就在送出前退回
 - `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
 - `ExperimentMetrics.cs` — 首次／十次內成功率及各次累積成功率
 - `MotionPlanValidator.cs` — 執行前安全狀態機驗證
@@ -84,7 +85,7 @@ dotnet run
 
 ## 3D 疊放驗證：URSim + Isaac Sim
 
-- **2D 平面移動**：照舊，Unity 模擬預覽驗證後直接送實體手臂。
+- **2D 平面移動**：所有步驟包成一批，Unity 先預覽整批，模擬結果跟計畫畫出的 bitmap 比對（重疊率要大於 90%，`JsonExecutor.bitmapOverlapThreshold`），通過才整批送實體手臂；bitmap 與比對結果印在 csharp_server 的 terminal。
 - **3D 疊放**（任一步的目標壓在另一塊積木上，或比來源高出半層）：
   1. csharp_server 把真實場景投影到 Isaac Sim（積木、相機、桌面與 QR1-4 範圍）。
   2. 整輪步驟以 `robot_target = "ursim"` 交給 Unity，Unity 用同一套關節軌跡只在 **URSim** 執行，實體手臂不動。
@@ -93,7 +94,7 @@ dotnet run
      再由 LLM 看模擬畫面；都通過才把同一批（同樣的步驟、來源位置與積木高度）整批送實體手臂，
      實機跑的就是 Isaac 驗證過的同一條關節軌跡。不通過就算這次嘗試失敗、進 Reflection。
      整批送出前會確認來源積木在驗證後沒被移動（超過 1 cm 就不執行）；步驟之間不重新觀測、不做局部驗證，
-     由最後的整體驗證判定。逐步送會讓每一步結束都回 Ready，那些收尾路徑驗證時沒有，擺放區靠手臂的格點常回不去。
+     由最後的整體驗證判定。逐步送會讓每一步結束都回 Ready，那些收尾路徑驗證時沒有，靠近手臂的目標位置常回不去。
 
 **夾爪**：實體夾爪張開時兩指內側只有約 3.5 cm，每根手指厚、寬各約 1.5 cm（2026-09-30 實測），只跨得住 2.5 cm 的邊。
 手指沿工具 X 開合：夾 cube 時在 ±X 兩側；domino 一律跨短邊夾，橫放（長邊沿 X）的夾爪轉 90°、直放的用 0°
@@ -154,18 +155,20 @@ csharp_server 每個任務開始時讀一次，整個任務都用同一個模式
 
 | | 實機 | 純模擬 |
 |---|---|---|
-| 場景與照片 | perception_server（相機） | Isaac Sim 的 `/perception/*`（同格式） |
+| 場景與照片 | perception_server（相機） | Isaac Sim 的 `/perception/*`（同格式）；沒開 Isaac 時 2D 用 csharp_server 內建的虛擬世界（俯視示意圖） |
 | 初始桌面 | 收到指令時的真實桌面 | 虛擬場景檔 `sim_scenes/*.json`：切換的當下載入並顯示，每個任務開始時再重建 Isaac 世界 |
 | 動作 | 實體 UR3e（3D 先在 URSim + Isaac 驗證） | 全部送 URSim，Isaac 跟隨 URSim 讓積木依物理移動 |
 | 紀錄 | `csharp_server/outputs/experiments/` | `csharp_server/outputs/experiments_sim/`（成功率另算） |
 
+沒開 Isaac Sim 時，csharp_server 每個任務開始連不到 Isaac 就改用內建的虛擬世界（`VirtualSimWorld.cs`），只支援 2D：起點是場景檔，2D 整批通過 Unity 預覽的 bitmap 比對、URSim 跑完後，照計畫把放下的物件移過去（沒有物理，不會被推動或傾倒）；給 LLM 的畫面是依座標畫的俯視示意圖（`TopViewRenderer.cs`，跟相機同方向）。世界寫在 `StreamingAssets/sim_world.json`，Unity 連不上 Isaac 時從這裡顯示積木、做預覽。遇到 3D 疊放會停下來並說明需要 Isaac（記為 infrastructure_error）。每個任務用哪一種記在 `sim_backend.txt`。
+
 啟動（純模擬不用開 perception_server）：
 1. URSim 虛擬機開機、切 Remote Control。
-2. `D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui`
+2. `D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui`（3D 疊放才需要；2D 沒開 Isaac 時自動改用內建的虛擬世界）
 3. `cd csharp_server` 後 `dotnet run`
 4. Unity Play → 右上角「模式」切成純模擬 →「場景」按鈕輪流切換 `sim_scenes/` 裡的檔案 → 輸入指令。
 
-切到純模擬或按「場景」換檔的當下，Unity 先畫出場景檔的積木，同時呼叫 Isaac 的 `/sim/load` 重建模擬世界，
+切到純模擬、按「場景」換檔，或在純模擬下重開 Unity 的當下，桌面都重置成場景檔：Unity 先畫出場景檔的積木，同時呼叫 Isaac 的 `/sim/load` 重建模擬世界（連不上 Isaac 時，作廢上次留下的內建虛擬世界 `sim_world.json`），
 載入完改顯示 Isaac 回報的位置（物理落定後）；結果顯示在狀態列。Isaac 還沒開時畫面先顯示場景檔，等 Isaac 開好、
 世界裡還沒有積木時自動載入。手臂執行中兩個按鈕都不給按；Isaac 正在 3D 驗證時也不重建（`if_idle`）。
 但任務在 LLM 規劃階段時切換或換場景仍會重設模擬世界，任務進行中不要按。切回實機時畫面先清空，等相機的場景。
@@ -190,7 +193,7 @@ URSim 在純模擬途中安全停止時，Unity 最多等 300 秒，逾時這一
   目前是從 2026-09-30 實拍畫面的 QR1-4 估計的）。相機或 QR 貼紙移動過，接上相機後執行
   `python isaac_sim/save_sim_camera.py` 換成 RealSense 的真實參數。
 - `run_mode.json` 的 `reset_each_task` 改成 false，之後的任務就接續目前的模擬世界，不重建。
-- 內建三個：`two_cubes`（黑、黃方塊各一）、`letter_blocks`（8 塊方塊，排字母或疊結構用）、`domino_cubes`。
+- 內建三個：`two_cubes`（黑、黃方塊各一）、`letter_blocks`（15 塊黃方塊排在桌面左側，前方與右側留空排字母）、`domino_cubes`。
 
 限制：模擬回報的是 Isaac 的精確位置，沒有相機的偵測誤差、遮擋與高度偏差，結果會比實機樂觀；
 適合測 LLM 的規劃能力，不能取代實機成功率。

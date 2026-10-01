@@ -246,6 +246,78 @@ var missingPair = NaturalLanguagePlanAdapter.Translate(
     multiPlan.Replace("第 2 顆：source index 2 → target (0.604, 0.184, 0.025)", ""), multiScene);
 Check(!string.IsNullOrEmpty(missingPair.Error),
       "natural language adapter refuses unmatched multi-step actions");
+// 2D 整批：計畫放下的物件畫成 bitmap（跟相機畫面同方向：上 = +Y、右 = +X），也是 Unity 比對的預期格
+SceneObject Figure(double x, double y, string shape = "cube", string? orientation = null) =>
+    new() { Name = shape == "domino" ? "black_domino" : "yellow_cube", Shape = shape, Orientation = orientation, X = x, Y = y, Z = 0.025 };
+var lShape = FigureBitmap.Build(new[] { Figure(0.50, 0.20), Figure(0.50, 0.17), Figure(0.50, 0.14), Figure(0.53, 0.14) });
+Check(Near(lShape.CellXM, 0.03) && Near(lShape.CellYM, 0.03) && lShape.Rows.SequenceEqual(new[] { "■□", "■□", "■■" }),
+      "an L planned with 3 cm spacing draws as an upright L in camera orientation");
+Check(lShape.Cells.Count == 4 && lShape.Cells.All(c => c.SecondRow == -1) && lShape.Cells[3] is { Row: 2, Col: 1 },
+      "each planned cube becomes one expected cell at its grid position");
+var withDomino = FigureBitmap.Build(new[] { Figure(0.40, 0.20), Figure(0.43, 0.20), Figure(0.475, 0.20, "domino", "horizontal") });
+Check(withDomino.Rows.SequenceEqual(new[] { "■■■■" }) && withDomino.Cells[2] is { Row: 0, Col: 2, SecondRow: 0, SecondCol: 3 },
+      "a horizontal domino fills two cells along X, the left one first");
+var vertical = FigureBitmap.Build(new[] { Figure(0.40, 0.20, "domino", "vertical") });
+Check(vertical.Rows.SequenceEqual(new[] { "■", "■" }) && vertical.Cells[0] is { Row: 0, SecondRow: 1 },
+      "a vertical domino fills two cells along Y, the far (+Y) one first");
+// 手指沿 X 開合，X 方向排得比 Y 疏時，X、Y 格距分開算：5 格寬的 T 照樣是 5 格寬
+var wideT = FigureBitmap.Build(new[] { Figure(0.40, 0.20), Figure(0.45, 0.20), Figure(0.50, 0.20), Figure(0.55, 0.20), Figure(0.60, 0.20),
+                                       Figure(0.50, 0.17), Figure(0.50, 0.14), Figure(0.50, 0.11), Figure(0.50, 0.08) });
+Check(Near(wideT.CellXM, 0.05) && Near(wideT.CellYM, 0.03) &&
+      wideT.Rows.SequenceEqual(new[] { "■■■■■", "□□■□□", "□□■□□", "□□■□□", "□□■□□" }),
+      "a T spaced 5 cm along X and 3 cm along Y draws as a 5x5 T");
+Check(FigureBitmap.LetterCount("用黃色積木排一個L") == 1 && FigureBitmap.LetterCount("排出CAT") == 3 &&
+      FigureBitmap.LetterCount("排一個字母") == 1 && FigureBitmap.LetterCount("把 yellow_cube 移到 QR1 旁邊") == 0 &&
+      FigureBitmap.LetterCount("用方塊排一個 3x3 的正方形") == 0 && FigureBitmap.LetterCount("把方塊疊成 3D 的塔") == 0,
+      "letter goals are recognised from standalone capital letters or the word 字母, not object names, QR1 or 3x3");
+Check(FigureBitmap.LetterSizeProblem(1, wideT.Rows) == null && FigureBitmap.LetterSizeProblem(0, new[] { "■■■■■■■" }) == null,
+      "a 5x5 letter passes and non-letter figures are not limited");
+Check(FigureBitmap.LetterSizeProblem(1, new[] { "■", "■", "■", "■", "■", "■" }) is string tall && tall.Contains("高 6 格") &&
+      FigureBitmap.LetterSizeProblem(2, new[] { "■■■■■□□■■■■■" }) == null && FigureBitmap.LetterSizeProblem(2, new[] { "■■■■■■■■■■■■■" }) != null,
+      "letters taller than 5 cells, or wider than 5 cells each plus 2 gap cells, are rejected");
+// 執行前檢查：放置目標跟同一層的積木部分重疊（含同一批前面步驟剛放的）
+var spread = new List<SceneObject> { Block("yellow_cube", 0.20, 0.10, 0.025), Block("yellow_cube", 0.30, 0.10, 0.025),
+                                     Block("black_cube", 0.50, 0.20, 0.025) };
+Check(LayeredHeights.SameLayerOverlaps(new[] { Move(0, 0.515, 0.20, 0.025) }, spread) is [var partial] &&
+      partial.Contains("black_cube（場景 index 2）") && partial.Contains("10×25 mm"),
+      "a flat placement 15 mm from a block on the same layer is reported as a partial overlap");
+Check(LayeredHeights.SameLayerOverlaps(new[] { Move(0, 0.525, 0.20, 0.025) }, spread).Count == 0,
+      "blocks placed flush side by side do not overlap");
+Check(LayeredHeights.SameLayerOverlaps(new[] { Move(0, 0.50, 0.20, 0.05) }, spread).Count == 0,
+      "stacking on top of a block is a different layer, not an overlap");
+Check(LayeredHeights.SameLayerOverlaps(new[] { Move(0, 0.502, 0.199, 0.0265) }, spread).Count == 0,
+      "a full-footprint overlap with z read from a low perceived top is still treated as stacking");
+var twoTargets = LayeredHeights.SameLayerOverlaps(new[] { Move(0, 0.60, 0.10, 0.025), Move(1, 0.62, 0.10, 0.025) }, spread);
+Check(twoTargets is [var earlier] && earlier.StartsWith("第 2 個操作") && earlier.Contains("第 1 個操作放下的 yellow_cube"),
+      "a target overlapping a block placed earlier in the same batch is reported");
+Check(LayeredHeights.SameLayerOverlaps(new[] { Move(0, 0.21, 0.10, 0.025) }, spread).Count == 0,
+      "moving a block a little does not collide with its own old position");
+// 純模擬沒開 Isaac Sim：內建虛擬世界照計畫移動放下的物件，寫成 Unity SceneSyncer 讀得懂的 /scene 格式
+var world = new VirtualSimWorld(new[] { Block("yellow_cube", 0.20, 0.10, 0.025), Block("black_domino", 0.30, 0.10, 0.025, "horizontal") });
+var firstView = world.Snapshot();
+firstView[0].X = 9;
+Check(Near(world.Snapshot()[0].X, 0.20), "virtual world snapshots are copies, not the world itself");
+world.Place(0, new SceneObject { X = 0.50, Y = 0.15, Z = 0.019 }, 0.025);
+world.Place(1, new SceneObject { X = 0.55, Y = 0.15, Z = 0.025, Orientation = "horizontal" }, 0.025);
+var placedWorld = world.Snapshot();
+Check(Near(placedWorld[0].X, 0.50) && Near(placedWorld[0].Y, 0.15) && Near(placedWorld[0].Z, 0.025) &&
+      placedWorld[0].Name == "yellow_cube" && placedWorld[1].Orientation == "horizontal" && placedWorld.Count == 2,
+      "a placement moves that scene index to the planned target with the layer top height");
+var worldDir = Path.Combine(Path.GetTempPath(), "robot_world_" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(worldDir);
+world.Write(worldDir);
+using (var worldJson = JsonDocument.Parse(File.ReadAllText(Path.Combine(worldDir, VirtualSimWorld.FileName))))
+{
+    var objects = worldJson.RootElement.GetProperty("objects");
+    var position = objects[0].GetProperty("position");
+    Check(objects.GetArrayLength() == 2 && Near(position.GetProperty("x").GetDouble(), 0.50) &&
+          position.GetProperty("source").GetString() == VirtualSimWorld.Source &&
+          objects[1].GetProperty("shape").GetString() == "domino",
+          "sim_world.json uses the perception /scene format with a non-empty position source");
+}
+VirtualSimWorld.Delete(worldDir);
+Check(!File.Exists(Path.Combine(worldDir, VirtualSimWorld.FileName)), "the world file is removed when Isaac is used");
+Directory.Delete(worldDir, true);
 var root = Path.Combine(Path.GetTempPath(), "robot_metrics_" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
 void Outcome(string id, bool success, string status, int attempts, string[]? outcomes = null) {

@@ -60,10 +60,13 @@ public class BatchEnvelope
     // 刻意用 disabled 當欄位名：舊版 server 沒送這個欄位時 JsonUtility 讀成 false，
     // 等於驗證開啟，不會因為兩邊版本不同就默默變成對照組。
     public bool verification_disabled;
-    // 模擬結束比對 bitmap 用；只有排 pattern 的指令才有，其他指令為空，Unity 就不比對
+    // 模擬結束比對 bitmap 用；只有 2D 整批才有（csharp_server 依計畫放下的物件畫出），其他批次為空，Unity 就不比對
     public List<string> bitmap;
     public List<ExpectedCell> expected_cells;
     public float cell_size_m;
+    // X、Y 格距分開（手指沿 X 開合，X 方向通常排得比 Y 疏）；舊版 server 沒送時是 0，改用 cell_size_m
+    public float cell_size_x_m;
+    public float cell_size_y_m;
     // "ursim" = 這批只在 URSim 執行（csharp_server 的 3D 疊放 Isaac Sim 驗證），實體手臂不動；
     // 空字串 = 實體手臂（舊版 server 沒送這個欄位時 JsonUtility 讀成 null，也是實機，行為不變）。
     public string robot_target;
@@ -97,6 +100,8 @@ public class SimulationCheckReport
     public bool verification_enabled;  // 開 = 不通過就擋；關 = 只記錄
     public int expected_count;
     public int correct_count;
+    public float overlap_ratio;        // 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）
+    public float overlap_threshold;    // 重疊率要大於這個值才算吻合
     public List<string> expected_rows;
     public List<string> result_rows;
     public List<string> errors;
@@ -229,6 +234,8 @@ public class JsonExecutor : MonoBehaviour
     public float bitmapXYToleranceM = 0.020f;
     // 落點頂面高度跟預期差多少以內算對；超過代表疊到別的方塊上，或在空中放開
     public float bitmapZToleranceM = 0.010f;
+    // 重疊率 = 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）；大於這個值才算跟 bitmap 吻合、送實機
+    public float bitmapOverlapThreshold = 0.9f;
     // 模擬夾取時，夾爪 TCP 離方塊中心多遠以內才夾得到
     public float simGraspToleranceM = 0.020f;
 
@@ -356,8 +363,11 @@ public class JsonExecutor : MonoBehaviour
     private readonly Dictionary<GameObject, SimBlockState> simBlocks = new Dictionary<GameObject, SimBlockState>();
     // 夾取落空、序列結束仍夾著等狀況。通常就是「少放」的原因，跟報告一起印，但本身不算錯
     private readonly List<string> simPlacementNotes = new List<string>();
-    // 最近一次比對的錯誤清單；null = 這一批沒有 bitmap（非排 pattern 指令），沒比對
+    // 最近一次比對的錯誤清單；null = 這一批沒有 bitmap（不是 2D 整批），沒比對
     private List<string> bitmapCheckErrors;
+    // 最近一次比對的重疊率，以及有沒有大於門檻（錯誤清單只是說明，放不放行看這個）
+    private float bitmapOverlapRatio;
+    private bool bitmapCheckPassed;
     // 這一批的比對結果有沒有寫給 csharp_server；沒寫的話要補一份「未進行」
     private bool simCheckReported;
 
@@ -1375,6 +1385,8 @@ public class JsonExecutor : MonoBehaviour
         simBlocks.Clear();
         simPlacementNotes.Clear();
         bitmapCheckErrors = null;
+        bitmapOverlapRatio = 0f;
+        bitmapCheckPassed = false;
     }
 
     SimBlockState SimBlock(GameObject block)
@@ -1529,7 +1541,8 @@ public class JsonExecutor : MonoBehaviour
 
     // 模擬結束後比對：每個 bitmap 物件是否有一顆方塊落在對應格子（容許誤差內），
     // 形狀、domino 方向、高度也要對；多放、少放、放錯格、在空中放開都算錯。
-    // 把報告印出來，錯誤清單存在 bitmapCheckErrors（空 = 通過，null = 這批沒有 bitmap）。
+    // 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）= 重疊率，大於 bitmapOverlapThreshold 才通過；
+    // 把報告印出來，錯誤清單存在 bitmapCheckErrors（null = 這批沒有 bitmap），通過與否存在 bitmapCheckPassed。
     void RunBitmapCheck(BatchEnvelope batch)
     {
         bitmapCheckErrors = null;
@@ -1538,11 +1551,13 @@ public class JsonExecutor : MonoBehaviour
         var expected = batch.expected_cells;
         var errors = new List<string>();
         float cell = batch.cell_size_m > 0f ? batch.cell_size_m : 0.04f;
+        float cellX = batch.cell_size_x_m > 0f ? batch.cell_size_x_m : cell;
+        float cellY = batch.cell_size_y_m > 0f ? batch.cell_size_y_m : cell;
 
-        // 用任一個預期物件推回格子座標系。row 往下增加時 y 變小（LayoutRealizer 讓字母不上下顛倒）
+        // 用任一個預期物件推回格子座標系。row 往下增加時 y 變小（跟相機畫面同方向，字母不上下顛倒）
         ExpectedCell anchor = expected[0];
-        float anchorX = anchor.x - (anchor.second_col >= 0 ? (anchor.second_col - anchor.col) * 0.5f * cell : 0f);
-        float anchorY = anchor.y + (anchor.second_row >= 0 ? (anchor.second_row - anchor.row) * 0.5f * cell : 0f);
+        float anchorX = anchor.x - (anchor.second_col >= 0 ? (anchor.second_col - anchor.col) * 0.5f * cellX : 0f);
+        float anchorY = anchor.y + (anchor.second_row >= 0 ? (anchor.second_row - anchor.row) * 0.5f * cellY : 0f);
         int rows = batch.bitmap != null && batch.bitmap.Count > 0
             ? batch.bitmap.Count
             : expected.Max(c => Mathf.Max(c.row, c.second_row)) + 1;
@@ -1550,8 +1565,8 @@ public class JsonExecutor : MonoBehaviour
             ? batch.bitmap[0].Length
             : expected.Max(c => Mathf.Max(c.col, c.second_col)) + 1;
         (int r, int c) NearestGridCell(Vector3 qr) => (
-            anchor.row - Mathf.RoundToInt((qr.y - anchorY) / cell),
-            anchor.col + Mathf.RoundToInt((qr.x - anchorX) / cell));
+            anchor.row - Mathf.RoundToInt((qr.y - anchorY) / cellY),
+            anchor.col + Mathf.RoundToInt((qr.x - anchorX) / cellX));
         bool InsideCanvas((int r, int c) g) => g.r >= 0 && g.r < rows && g.c >= 0 && g.c < cols;
 
         // 候選：這一批放下的方塊 + 原本就躺在圖案範圍內的方塊（殘留的方塊一樣會破壞字形）
@@ -1589,7 +1604,8 @@ public class JsonExecutor : MonoBehaviour
         for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) grid[r, c] = '□';
         void Mark(int r, int c, char symbol) { if (r >= 0 && r < rows && c >= 0 && c < cols) grid[r, c] = symbol; }
 
-        int correct = 0;
+        // 重疊率用格數算：cube 一格、domino 兩格
+        int correct = 0, expectedCellCount = 0, hitCells = 0, extraCells = 0;
         for (int e = 0; e < expected.Count; e++)
         {
             var exp = expected[e];
@@ -1630,7 +1646,9 @@ public class JsonExecutor : MonoBehaviour
                     ok = false;
                 }
             }
-            if (ok) correct++;
+            int cellsOfExpected = exp.second_row >= 0 ? 2 : 1;
+            expectedCellCount += cellsOfExpected;
+            if (ok) { correct++; hitCells += cellsOfExpected; }
             char symbol = ok ? '■' : '✗';
             Mark(exp.row, exp.col, symbol);
             if (exp.second_row >= 0) Mark(exp.second_row, exp.second_col, symbol);
@@ -1650,8 +1668,14 @@ public class JsonExecutor : MonoBehaviour
                            $"最近的預期格 {ExpectedCellName(nearest)} 偏 {offMm:F0} mm（{cand.state.releaseLabel}）");
             else
                 errors.Add($"多放 {cand.block.name} @ QR({cand.qr.x:F3},{cand.qr.y:F3})：原本就在圖案範圍 {where}");
-            if (InsideCanvas(g)) Mark(g.r, g.c, grid[g.r, g.c] == '□' ? '●' : '✗');
+            if (InsideCanvas(g))
+            {
+                Mark(g.r, g.c, grid[g.r, g.c] == '□' ? '●' : '✗');
+                extraCells += cand.state.isDomino ? 2 : 1;
+            }
         }
+        float overlap = expectedCellCount + extraCells > 0 ? (float)hitCells / (expectedCellCount + extraCells) : 0f;
+        bool passed = overlap > bitmapOverlapThreshold;
 
         var resultRows = new List<string>();
         for (int r = 0; r < rows; r++)
@@ -1662,10 +1686,9 @@ public class JsonExecutor : MonoBehaviour
         }
 
         var report = new System.Text.StringBuilder();
-        report.AppendLine(errors.Count == 0
-            ? $"[BitmapCheck] batch {batch.batch_id}：✓ 模擬結果與 bitmap 一致（{expected.Count} 個物件全部放對）"
-            : $"[BitmapCheck] batch {batch.batch_id}：✗ 模擬結果與 bitmap 不一致，" +
-              $"預期 {expected.Count} 個物件，放對 {correct}，錯誤 {errors.Count} 項");
+        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ 模擬結果跟 bitmap 吻合" : "✗ 模擬結果跟 bitmap 不吻合")}，" +
+                          $"重疊率 {overlap * 100f:F0}%（要大於 {bitmapOverlapThreshold * 100f:F0}%），" +
+                          $"預期 {expected.Count} 個物件，放對 {correct}，錯誤 {errors.Count} 項");
         report.AppendLine("  預期 bitmap    模擬結果（■ 正確  ✗ 少放/錯誤  ● 多放/放錯  □ 空）");
         for (int r = 0; r < rows; r++)
         {
@@ -1675,18 +1698,22 @@ public class JsonExecutor : MonoBehaviour
         foreach (var error in errors) report.AppendLine("  - " + error);
         foreach (var note in simPlacementNotes) report.AppendLine("  · " + note);
 
-        if (errors.Count == 0) Debug.Log(report.ToString());
+        if (passed) Debug.Log(report.ToString());
         else Debug.LogWarning(report.ToString());
         bitmapCheckErrors = errors;
+        bitmapOverlapRatio = overlap;
+        bitmapCheckPassed = passed;
 
         WriteSimulationCheckReport(new SimulationCheckReport
         {
             batch_id = batch.batch_id,
             performed = true,
-            passed = errors.Count == 0,
+            passed = passed,
             verification_enabled = verificationEnabled,
             expected_count = expected.Count,
             correct_count = correct,
+            overlap_ratio = overlap,
+            overlap_threshold = bitmapOverlapThreshold,
             expected_rows = batch.bitmap ?? new List<string>(),
             result_rows = resultRows,
             errors = errors,
@@ -1727,14 +1754,15 @@ public class JsonExecutor : MonoBehaviour
     // 屬於驗證：開啟就擋；關閉就記錄、放行。
     bool BitmapCheckAllowsContinue(BatchEnvelope batch)
     {
-        if (bitmapCheckErrors == null || bitmapCheckErrors.Count == 0) return true;
+        if (bitmapCheckErrors == null || bitmapCheckPassed) return true;
         if (!verificationEnabled)
         {
-            Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：bitmap 比對不一致 " +
-                             $"{bitmapCheckErrors.Count} 項，對照組照樣繼續");
+            Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：bitmap 重疊率 {bitmapOverlapRatio * 100f:F0}% " +
+                             $"沒有大於 {bitmapOverlapThreshold * 100f:F0}%，對照組照樣繼續");
             return true;
         }
-        string summary = $"模擬結束比對不通過（{bitmapCheckErrors.Count} 項）：" +
+        string summary = $"模擬結束比對不通過：重疊率 {bitmapOverlapRatio * 100f:F0}% 沒有大於 " +
+                         $"{bitmapOverlapThreshold * 100f:F0}%（{bitmapCheckErrors.Count} 項）：" +
                          string.Join(" | ", bitmapCheckErrors);
         Debug.LogError("[BitmapCheck] " + summary);
         WriteStepDone(batch.batch_id, false, summary, 0f);

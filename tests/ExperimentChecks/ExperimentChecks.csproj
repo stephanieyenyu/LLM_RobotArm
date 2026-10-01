@@ -9,6 +9,8 @@
     <Compile Include="../../csharp_server/MotionPlanValidator.cs" Link="MotionPlanValidator.cs" />
     <Compile Include="../../csharp_server/Verifier.cs" Link="Verifier.cs" />
     <Compile Include="../../csharp_server/LayeredHeights.cs" Link="LayeredHeights.cs" />
+    <Compile Include="../../csharp_server/FigureBitmap.cs" Link="FigureBitmap.cs" />
+    <Compile Include="../../csharp_server/VirtualSimWorld.cs" Link="VirtualSimWorld.cs" />
     <Compile Include="../../csharp_server/RunModeConfig.cs" Link="RunModeConfig.cs" />
     <Compile Include="../../unity_project/Assets/Scripts/LayeredGraspGeometry.cs" Link="LayeredGraspGeometry.cs" />
   </ItemGroup>

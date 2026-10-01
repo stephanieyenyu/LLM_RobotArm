@@ -188,9 +188,9 @@ public class BatchEnvelope
     [JsonPropertyName("verification_disabled")]
     public bool VerificationDisabled { get; set; }
 
-    // 模擬結束比對 bitmap 用。只有排 pattern 的指令才有，其他指令為 null（Unity 就不比對）。
-    // bitmap：Layer 1 的 ■□ 字串；expected_cells：Layer 2 把 bitmap 展開成的每個物件
-    // 應該落在哪。這份清單跟 steps 分開產生，才抓得到漏排的格子。
+    // 模擬結束比對 bitmap 用。只有 2D 整批才有（FigureBitmap 依計畫放下的物件畫出），其他批次為 null
+    // （Unity 就不比對）。bitmap：■□ 字串；expected_cells：每個物件應該落在哪一格與 QR 座標。
+    // 這份清單跟 steps 分開產生，才抓得到漏放或多放。
     [JsonPropertyName("bitmap")]
     public List<string>? Bitmap { get; set; }
 
@@ -199,6 +199,13 @@ public class BatchEnvelope
 
     [JsonPropertyName("cell_size_m")]
     public double CellSizeM { get; set; }
+
+    // X、Y 格距分開（手指沿 X 開合，X 方向通常排得比 Y 疏）；舊版 Unity 讀不到時用 cell_size_m
+    [JsonPropertyName("cell_size_x_m")]
+    public double CellSizeXM { get; set; }
+
+    [JsonPropertyName("cell_size_y_m")]
+    public double CellSizeYM { get; set; }
 }
 
 /// <summary>
@@ -220,6 +227,11 @@ public class SimulationCheckReport
     public int ExpectedCount { get; set; }
     [JsonPropertyName("correct_count")]
     public int CorrectCount { get; set; }
+    // 重疊率 = 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）；大於門檻才算吻合
+    [JsonPropertyName("overlap_ratio")]
+    public double OverlapRatio { get; set; }
+    [JsonPropertyName("overlap_threshold")]
+    public double OverlapThreshold { get; set; }
     [JsonPropertyName("expected_rows")]
     public List<string> ExpectedRows { get; set; } = new();
     [JsonPropertyName("result_rows")]

@@ -91,6 +91,50 @@ public static class LayeredHeights
         return result;
     }
 
+    /// <summary>
+    /// 執行前檢查：依步驟順序更新佔地（同一批前面步驟放下的積木也算），放置目標跟同一層的積木部分重疊就回報。
+    /// 同一層 = LLM 的 target.z 對齊層高後跟那塊積木的頂面同層；場景積木的頂面用 SceneTops，前面步驟放下的用 ForSteps。
+    /// 重疊不超過 OverlapMarginM 的不算（並排貼齊加上感知誤差）。重疊超過較小那塊佔地的一半當成要疊上去，
+    /// 照原本的 3D 疊放處理（感知 z 偏低時，LLM 照感知值給的 z 會落在下面那層）。回傳每一處重疊的說明，空 = 沒有。
+    /// </summary>
+    public static List<string> SameLayerOverlaps(IReadOnlyList<TranslatedStep> steps, IReadOnlyList<SceneObject> scene)
+    {
+        var placedTops = ForSteps(steps, scene);
+        var blocks = new Dictionary<int, (Block Footprint, string Label)>();
+        foreach (var (i, top) in SceneTops(scene))
+        {
+            var (halfX, halfY) = HalfExtents(scene[i].Shape, scene[i].Orientation);
+            blocks[i] = (new Block { X = scene[i].X, Y = scene[i].Y, HalfX = halfX, HalfY = halfY, Top = top },
+                $"{scene[i].Name}（場景 index {i}）");
+        }
+        var problems = new List<string>();
+        for (int k = 0; k < steps.Count; k++)
+        {
+            var step = steps[k];
+            var source = step.SourceIndex >= 0 && step.SourceIndex < scene.Count ? scene[step.SourceIndex] : null;
+            blocks.Remove(step.SourceIndex);
+            var target = step.Target;
+            if (source == null || target == null || !IsBlock(source)) continue;
+            var (halfX, halfY) = HalfExtents(source.Shape, target.Orientation ?? source.Orientation);
+            double intendedTop = LayeredGraspGeometry.SnapTopToLayer(target.Z);
+            foreach (var (b, label) in blocks.Values)
+            {
+                if (Math.Abs(b.Top - intendedTop) > LayeredGraspGeometry.BlockLayerM / 2) continue;
+                double overlapX = Math.Min(b.X + b.HalfX, target.X + halfX) - Math.Max(b.X - b.HalfX, target.X - halfX);
+                double overlapY = Math.Min(b.Y + b.HalfY, target.Y + halfY) - Math.Max(b.Y - b.HalfY, target.Y - halfY);
+                if (overlapX <= OverlapMarginM || overlapY <= OverlapMarginM) continue;
+                double smallerArea = Math.Min(b.HalfX * b.HalfY, halfX * halfY) * 4;
+                if (overlapX * overlapY >= smallerArea / 2) continue;
+                problems.Add($"第 {k + 1} 個操作的 target ({target.X:F3}, {target.Y:F3}) 跟 {label}（中心 ({b.X:F3}, {b.Y:F3})）" +
+                             $"在同一層部分重疊 {overlapX * 1000:F0}×{overlapY * 1000:F0} mm");
+            }
+            if (EndsReleased(step.Actions))
+                blocks[step.SourceIndex] = (new Block { X = target.X, Y = target.Y, HalfX = halfX, HalfY = halfY, Top = placedTops[k].TargetTopM },
+                    $"第 {k + 1} 個操作放下的 {source.Name}");
+        }
+        return problems;
+    }
+
     // 這一步結束時已放開（最後一次 release 在最後一次 grasp 之後）；還夾著的積木不在桌上
     static bool EndsReleased(List<RobotFunctionCall> actions)
     {

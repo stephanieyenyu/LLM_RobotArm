@@ -216,7 +216,7 @@ public class UIManager : MonoBehaviour
         UpdateModeButtons();
         ShowMessage(RunMode.IsSim
             ? $"已切成純模擬：正在把 {RunMode.Scene} 載入 Isaac Sim，畫面會顯示模擬的積木；下一個指令起動作只送 URSim。" +
-              "要先開 isaac_sim_server（--ursim_ip）與 URSim。"
+              "要先開 URSim；3D 疊放另外需要 isaac_sim_server（--ursim_ip），2D 沒開 Isaac 時用 csharp_server 內建的虛擬世界。"
             : "已切成實機：畫面改顯示相機看到的積木，下一個指令起動作送實體手臂。要先開 perception_server。");
     }
 

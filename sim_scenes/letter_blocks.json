@@ -1,14 +1,21 @@
 {
-  "description": "排字母或疊結構用：6 塊黃方塊、2 塊黑方塊排在補貨區，中心間距 7 cm，夾爪下降時手指碰不到旁邊的方塊。",
+  "description": "排字母用：15 塊黃方塊排在桌面左側（3 排 × 5 列，中心間距 6 cm），前方與右側留空給字母。每塊離手臂基座 0.21～0.44 m，都夾得到；夾爪下降時手指碰不到旁邊的方塊，也不會蓋到 QR 標記。",
   "objects": [
-    { "name": "yellow_cube", "shape": "cube", "x": 0.120, "y": 0.060, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.070, "y": 0.060, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.130, "y": 0.060, "z": 0.025, "orientation": null },
     { "name": "yellow_cube", "shape": "cube", "x": 0.190, "y": 0.060, "z": 0.025, "orientation": null },
-    { "name": "yellow_cube", "shape": "cube", "x": 0.260, "y": 0.060, "z": 0.025, "orientation": null },
-    { "name": "yellow_cube", "shape": "cube", "x": 0.120, "y": 0.130, "z": 0.025, "orientation": null },
-    { "name": "yellow_cube", "shape": "cube", "x": 0.190, "y": 0.130, "z": 0.025, "orientation": null },
-    { "name": "yellow_cube", "shape": "cube", "x": 0.260, "y": 0.130, "z": 0.025, "orientation": null },
-    { "name": "black_cube", "shape": "cube", "x": 0.120, "y": 0.200, "z": 0.025, "orientation": null },
-    { "name": "black_cube", "shape": "cube", "x": 0.190, "y": 0.200, "z": 0.025, "orientation": null }
+    { "name": "yellow_cube", "shape": "cube", "x": 0.070, "y": 0.120, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.130, "y": 0.120, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.190, "y": 0.120, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.070, "y": 0.180, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.130, "y": 0.180, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.190, "y": 0.180, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.070, "y": 0.240, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.130, "y": 0.240, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.190, "y": 0.240, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.070, "y": 0.300, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.130, "y": 0.300, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.190, "y": 0.300, "z": 0.025, "orientation": null }
   ],
   "camera": null
 }
