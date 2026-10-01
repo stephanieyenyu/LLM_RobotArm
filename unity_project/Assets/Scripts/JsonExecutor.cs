@@ -1605,6 +1605,9 @@ public class JsonExecutor : MonoBehaviour
         void Mark(int r, int c, char symbol) { if (r >= 0 && r < rows && c >= 0 && c < cols) grid[r, c] = symbol; }
 
         // 重疊率用格數算：cube 一格、domino 兩格
+        // 除錯用：每個配到的預期格實際是哪顆方塊滿足的，特別標出「這一批沒有搬動」的——
+        // 那種配對代表這格是靠殘留方塊（可能是上一輪沒清乾淨的）湊到的，不是這一批真的放的。
+        var matchLog = new List<string>();
         int correct = 0, expectedCellCount = 0, hitCells = 0, extraCells = 0;
         for (int e = 0; e < expected.Count; e++)
         {
@@ -1619,6 +1622,8 @@ public class JsonExecutor : MonoBehaviour
             else
             {
                 var cand = candidates[matchOf[e]];
+                matchLog.Add($"{name} ← {cand.block.name}" +
+                    (cand.state.released ? "" : "（★這一批沒有搬動這顆，沿用它原本就在的位置）"));
                 bool expectDomino = exp.shape == "domino";
                 if (expectDomino != cand.state.isDomino)
                 {
@@ -1697,6 +1702,8 @@ public class JsonExecutor : MonoBehaviour
         }
         foreach (var error in errors) report.AppendLine("  - " + error);
         foreach (var note in simPlacementNotes) report.AppendLine("  · " + note);
+        report.AppendLine("  配對明細：");
+        foreach (var m in matchLog) report.AppendLine("    " + m);
 
         if (passed) Debug.Log(report.ToString());
         else Debug.LogWarning(report.ToString());
@@ -1754,7 +1761,19 @@ public class JsonExecutor : MonoBehaviour
     // 屬於驗證：開啟就擋；關閉就記錄、放行。
     bool BitmapCheckAllowsContinue(BatchEnvelope batch)
     {
-        if (bitmapCheckErrors == null || bitmapCheckPassed) return true;
+        if (bitmapCheckErrors == null)
+        {
+            // 這批本來就沒有 bitmap 要比（不是整批排圖形），沒什麼好擋的
+            if (batch.expected_cells == null || batch.expected_cells.Count == 0) return true;
+            // 這批有 bitmap 要比，卻沒跑到 RunBitmapCheck 就結束了（最可能是動畫中途出例外）。
+            // 沒比對過不能當作通過，不然沒跑完的預覽也會被送去真的執行。
+            string abortSummary = $"batch {batch.batch_id}：這批有 bitmap 要比對，但模擬預覽沒有跑完比對就結束" +
+                                  "（可能動畫中途發生例外），沒有比對結果不能送實機";
+            Debug.LogError("[BitmapCheck] " + abortSummary);
+            WriteStepDone(batch.batch_id, false, abortSummary, 0f);
+            return false;
+        }
+        if (bitmapCheckPassed) return true;
         if (!verificationEnabled)
         {
             Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：bitmap 重疊率 {bitmapOverlapRatio * 100f:F0}% " +
@@ -2453,6 +2472,7 @@ public class JsonExecutor : MonoBehaviour
 
         // 復原：原本 cube 的位置/名稱（預覽不會新增方塊，所以只需要還原）
         var currentCubes = sceneSyncer.GetCurrentCubes();
+        var restored = new HashSet<GameObject>();
         for (int i = currentCubes.Count - 1; i >= 0; i--)
         {
             var cube = currentCubes[i];
@@ -2463,6 +2483,15 @@ public class JsonExecutor : MonoBehaviour
             cube.transform.localPosition = initialCubePositions[cube];
             cube.transform.localScale = initialCubeScales[cube];
             cube.name = initialCubeNames[cube];
+            restored.Add(cube);
+        }
+        // 除錯用：確認這一批動過的每顆方塊都真的復原了。少了任何一顆，下一輪的動畫、
+        // bitmap 比對都會用到這顆方塊沒復原前的殘留狀態（是目前懷疑的根本原因，先用這個抓現行）。
+        foreach (var kv in initialCubePositions)
+        {
+            if (kv.Key == null || restored.Contains(kv.Key)) continue;
+            Debug.LogError($"[Executor-preview] batch {batch.batch_id}：方塊「{initialCubeNames[kv.Key]}」" +
+                           "預覽結束沒有復原（不在 GetCurrentCubes() 清單裡，可能還掛在夾爪下）——下一輪會沿用它現在的殘留位置");
         }
 
         Debug.Log($"[Executor-preview] 動畫預覽結束，已復原場景。實機開始執行");
