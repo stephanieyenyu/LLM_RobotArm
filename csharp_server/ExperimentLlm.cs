@@ -18,8 +18,6 @@ public sealed class ExperimentLlm
             Transport = new HttpClientPipelineTransport(ModelHttpClient)
         });
     }
-    static string RuleText(List<string> rules) => string.Join("\n\n",
-        rules.Select((rule, index) => $"--- 暫定規則版本 {index + 1} ---\n{rule}"));
     const string CoordinateDirections = "QR 工作座標方向：+X=左、-X=右、+Y=後、-Y=前、+Z=上、-Z=下；方向詞一律依 QR 工作座標解讀，不依相機畫面方向。";
     // 夾爪幾何是設備事實，不是解法（2026-09-30 實測：張開時內側約 3.5 cm）
     const string GripperFacts = "夾爪為平行雙指，每根手指厚約 0.015 m、寬約 0.015 m；張開時兩指內側間距只有約 0.035 m：只跨得住物件 0.025 m 寬的邊，跨不住 domino 的 0.05 m 長邊。夾 cube 時兩指落在 cube 的 ±X 兩側；夾 domino 時系統會轉動夾爪讓兩指跨住短邊、落在長邊兩側（horizontal domino 在 ±Y 兩側，vertical domino 在 ±X 兩側）。descend 夾取或放置時，兩指會下降到物件在閉合方向上的兩側：每根手指內側離物件表面只有約 0.005 m、外側離物件中心約 0.0325 m，垂直閉合方向只佔物件中心線兩側各約 0.0075 m；旁邊物件的佔地碰到這兩塊手指範圍就會被撞到，例如閉合方向上相鄰的兩個 cube，中心要相距約 0.045 m 以上。只能夾取上方沒有其他物件的物件。";
@@ -34,12 +32,10 @@ public sealed class ExperimentLlm
     string ImageNote => SchematicImage ? SchematicImageNote : "";
     // 排字母的規範：每個字母最多 5×5 格、要能辨識；方向以相機畫面為準（跟 terminal 印的 bitmap、整體驗證看的畫面相同）
     const string LetterDesign = "在桌面上排字母時，每個字母設計在最多 5×5 的方格上（高最多 5 格、寬最多 5 格）：每個方向用固定的格距（相鄰格的中心距，格距要讓手指放得下，見夾爪事實），每一格放一個 cube，domino 佔同一排相鄰的兩格；筆畫要像 5×5 點陣字一樣足以辨識是哪個字母。字母形狀以相機畫面判讀：畫面上方是 +Y、畫面右方是 +X（也就是方向詞的「左」），字母在這個方向下要是正的，不能上下或左右顛倒。";
-    static string Prompt(List<string> rules) => Role + (rules.Count == 0 ? "" :
-        "\n本任務依失敗經驗累積的暫定規則如下，按時間由舊到新排列。不衝突的舊規則持續有效；若新規則根據較新證據明確修正或取代舊規則，以新規則優先：\n" + RuleText(rules));
     static string SceneText(List<SceneObject> scene) => JsonSerializer.Serialize(scene.Select((item, index) => new { index, item }));
-    public Task<string> Decompose(string goal, List<SceneObject> scene, List<string> rules, string feedback, byte[]? image, string dir) => Call(Prompt(rules),
+    public Task<string> Decompose(string goal, List<SceneObject> scene, string feedback, byte[]? image, string dir) => Call(Role,
         $"目標：{goal}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n環境：{CoordinateDirections}{WorkspaceFacts}{FigureAcceptance}{LetterDesign}{ImageNote}\n注意：index 只代表這一張目前場景清單的位置，每次重新觀測都可能重排，不能當作跨輪次的物件身分。請自行拆解本輪的子任務，以自然語言描述。", image, dir, "decomposition");
-    public Task<string> Plan(string goal, List<SceneObject> scene, string hierarchy, List<string> rules, string feedback, byte[]? image, string dir) => Call(Prompt(rules),
+    public Task<string> Plan(string goal, List<SceneObject> scene, string hierarchy, string feedback, byte[]? image, string dir) => Call(Role,
         $"目標：{goal}\n子任務：{hierarchy}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n" +
         $"環境：QR 座標為公尺，X/Y 在桌面上，Z 向上；物件 Z 為頂面高度。{CoordinateDirections}cube 尺寸 0.025m，domino 為 0.05×0.025×0.025m。{WorkspaceFacts}{FigureAcceptance}{LetterDesign}{ImageNote}場景 index 只適用本輪目前清單，重新觀測後可能重排。\n" +
         "每一輪 operation plan 都必須在文字中完整列出每個 target 的實際 (x,y,z) 數值；不得只寫「沿用 P0~P4」、「維持既定目標點」或其他需要查舊輪上下文的代號。\n" +
@@ -57,7 +53,7 @@ public sealed class ExperimentLlm
         "descend(target)\n" +
         "release()\n" +
         "lift(target, 0.12)\n" +
-        "請根據實際目標與目前觀測，自行規劃操作。迭代執行期間無法向使用者追問或等待補充資料；本輪計畫只能使用提示中已有的目標、場景、結果與暫定規則。請以自然語言自行決定本輪操作與參數。為讓本地執行介面忠實辨識你的決定，每組抓放都必須在同一行寫出「source index N → target (x, y, z)」，並在「執行路徑開始」與「執行路徑結束」之間依相同順序逐行列出要執行的函式呼叫。", image, dir, "operation_plan");
+        "請根據實際目標與目前觀測，自行規劃操作。迭代執行期間無法向使用者追問或等待補充資料；本輪計畫只能使用提示中已有的目標、場景與結果，每一輪都是獨立的新嘗試，不會沿用先前輪次的任何判斷。請以自然語言自行決定本輪操作與參數。為讓本地執行介面忠實辨識你的決定，每組抓放都必須在同一行寫出「source index N → target (x, y, z)」，並在「執行路徑開始」與「執行路徑結束」之間依相同順序逐行列出要執行的函式呼叫。", image, dir, "operation_plan");
     public Task<TranslatedPlan> Translate(string plan, List<SceneObject> scene, string dir)
     {
         File.WriteAllText(Path.Combine(dir, "translation.system.txt"),
@@ -71,11 +67,6 @@ public sealed class ExperimentLlm
     public Task<string> Validate(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image, string dir) => Call(
         "你是獨立的結果驗證者。只根據原始目標、初始場景及目前實際觀測判斷，不提供操作解法。檢查整體目標與局部幾何完整度（包含直線、連接與堆疊）。若目標要求平移、對齊、放置到座標或距離，實際結果與目標值在 0.02 m（2 公分）以內的量測誤差可接受，不得只因 2 公分內的座標偏差判定失敗；超過 2 公分或方向明顯錯誤才視為幾何未達標。沒有足夠觀測證據或目標含糊時不可通過。第一行僅寫 PASS 或 FAIL，後續自然語言描述觀測問題與不確定性。",
         $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n環境：{CoordinateDirections}{FigureAcceptance}\n" + (image == null ? "影像不可取得，證據不足，不能通過。" : SchematicImage ? SchematicImageNote : "附圖是目前實際相機畫面。"), image, dir, "global_validation");
-    public Task<string> Reflect(string goal, string plan, string translation, string feedback, List<string> rules, List<SceneObject> scene, string dir) => Call(
-        "你是 UR3 任務控制者。分析未達標結果，區分觀測事實與原因假設。「實際流程（系統紀錄）」與「轉譯結果」是系統記錄的觀測事實；沒有出現在紀錄裡的步驟、檢查或量測都沒有發生，不能寫成觀測事實。" +
-        "先判斷本輪失敗是否代表目標本質上不可能達成（例如這組結構在物理上不可能疊放穩定），第一行只寫 GIVE_UP 或 CONTINUE；只有清楚的物理不可能證據才能寫 GIVE_UP，只是這次嘗試方法不對或資訊不足時寫 CONTINUE。" +
-        "第二行起，CONTINUE 時以自然語言產生本輪失敗摘要以及要新增或修正的暫定規則，GIVE_UP 時說明判斷依據。規則必須來自本輪失敗證據；資訊不足時寫明未知，不能把假設當事實，不能改變原始目標。本輪結果是最新證據，不得把舊輪錯誤誤報為本輪事實。若目標要求平移、對齊、放置到座標或距離，2 公分以內的量測誤差屬可接受範圍；不要把 2 公分內的座標偏差寫成失敗原因或新增修正規則，除非另有明確幾何問題。物件中心與本輪計畫指定的 target 座標相差 0.02 m 以內時，必須視為已達成，不得產生再次對中、重複抓放或只因些微座標偏差而移動該物件的規則。不衝突的舊規則會繼續使用，不必全部重寫；若本輪新證據推翻舊規則，必須明確指出取代哪一條及原因，較新的修正優先。暫定規則不得要求下一輪用未展開的 P0/P1/P2 等代號或「沿用既定目標點」；下一輪規劃必須能直接列出完整 target 座標。迭代執行期間無法向使用者追問或等待補充資料，下一輪規則必須能利用提示中已有的目標、場景與結果直接規劃。場景 index 每次觀測可能重排，不是跨輪次物件身分。設備實際只提供 source/target 與 move_above、descend、grasp、release、lift、wait（height_m 0.05～0.15 m、seconds 0.1～3、每個操作最多 20 個函式；同一個操作內依序執行，中途不會重新感知），不提供任意 XY 偏移、條件分支或同輪失敗後續跑；每輪只能提交一條確定的動作路徑。" + GripperFacts + "執行器會在收尾路徑安全時自動回 Ready/Home，否則留在最後的安全抬升位置；暫定規則不得要求規劃器加入 go_home。這是能力邊界，不是預先指定的解題順序。",
-        $"目標：{goal}\n本輪操作：{plan}\n轉譯結果（內部執行資料）：{translation}\n本輪結果：{feedback}\n本輪最新場景：{SceneText(scene)}\n環境事實：QR 座標為公尺，X/Y 在桌面上，Z 向上；場景物件的 Z 是物件頂面高度。{CoordinateDirections}{WorkspaceFacts}{FigureAcceptance}{LetterDesign}\n既有暫定規則（由舊到新）：{RuleText(rules)}", null, dir, "reflection");
     async Task<string> Call(string system, string user, byte[]? image, string dir, string name)
     {
         File.WriteAllText(Path.Combine(dir, name + ".system.txt"), system);

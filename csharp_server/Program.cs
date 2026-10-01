@@ -58,20 +58,22 @@ while (true)
     Directory.CreateDirectory(run);
     File.WriteAllText(Path.Combine(run, "task.txt"), goal);
     if (sim) Console.WriteLine($"[純模擬] 動作只送 URSim；場景與畫面來自 Isaac Sim，沒開 Isaac 時 2D 改用內建的虛擬世界；紀錄在 {simOutput}。");
-    Save(run, "config.json", new { model, max_attempts = 10, reset_between_tasks = !sim && fixedBaseline,
+    Save(run, "config.json", new { model, max_attempts = (int?)null, unbounded_attempts = true, reflection = false,
+        reset_between_tasks = !sim && fixedBaseline,
         initial_scene_source = sim ? (mode.ResetEachTask ? "sim_scene_file" : "sim_continued")
             : fixedBaseline ? "fixed_baseline" : "table_at_command",
         run_mode = sim ? "sim" : "real", sim_scene = sim ? mode.Scene : null,
         reset_within_task = false, reset_xy_m = ExperimentChecks.ResetXYToleranceM, reset_z_m = ExperimentChecks.ResetZToleranceM,
-        rule_scope = "task", evaluation = "independent_visual_model", started_utc = DateTime.UtcNow });
+        rule_scope = "none", evaluation = "independent_visual_model", started_utc = DateTime.UtcNow });
     bool success = false;
     bool executionPending = false;
     string status = "failed";
     int attempts = 0;
     // 每一輪的結果：success 或失敗類型（見下方 stageKind），寫進 result.json 供分開統計轉譯與規劃／執行失敗
     var attemptOutcomes = new List<string>();
-    var rules = new List<string>();
-    var feedback = "無前次結果。";
+    // 這個分支沒有 Reflection：每次 attempt 都是獨立全新嘗試，不帶上一輪的任何規則或觀察，
+    // 純粹窮舉「規劃→模擬→驗證覆蓋率」直到通過，對照另一版有 Reflection 累積規則的架構。
+    const string NoPriorFeedback = "無前次結果（本架構不使用 Reflection，每輪皆為獨立全新嘗試）。";
     try
     {
         if (sim)
@@ -149,17 +151,18 @@ while (true)
         if (waitForBaseline && baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
         Save(run, "initial_scene.json", initial);
         Console.WriteLine($"[任務開始] 初始桌面已確認（{SceneInventory(initial)}）；本任務內不再重置。");
-        for (int attempt = 1; attempt <= 10; attempt++)
+        // 不限次數：沒有 Reflection 可以收斂，純靠窮舉撞到覆蓋率門檻，所以不設上限，直到成功或任務被手動中止。
+        for (int attempt = 1; ; attempt++)
         {
             var dir = Path.Combine(run, $"attempt_{attempt:00}");
             Directory.CreateDirectory(dir);
-            Console.WriteLine($"[實驗] 第 {attempt}/10 次規劃，保留目前場景。");
+            Console.WriteLine($"[實驗] 第 {attempt} 次規劃（不限次數，窮舉直到覆蓋率達標），保留目前場景。");
             attempts = attempt;
-            string failure = "", failureKind = "", plan = "", translationText = "（沒有產生轉譯結果）";
+            string failure = "", failureKind = "", plan = "";
             var local = new List<VerifyResult>();
             var isaacDir = Path.Combine(dir, "isaac_sim");
             JsonElement? camera = null;
-            // 系統實際走過的流程，給下一輪規劃與反思當觀測事實；沒有記在這裡的步驟都沒有發生。
+            // 系統實際走過的流程，只用來寫進這一輪的 feedback.txt 存證；沒有 Reflection，不會帶到下一輪。
             var trace = new List<string>();
             string stage = "觀測場景";
             // 在這個階段停止時記錄的失敗類型：planning（拆解或規劃階段）、translation_format（轉譯輸出讀不懂）、
@@ -180,16 +183,14 @@ while (true)
                 if (!sim) IsaacSimExecutor.SyncRealScene(before, camera);
                 trace.Add($"觀測到 {before.Count} 個物件");
                 stage = "拆解子任務";
-                var hierarchy = await llm.Decompose(goal, before, rules, feedback, image, dir);
+                var hierarchy = await llm.Decompose(goal, before, NoPriorFeedback, image, dir);
                 stage = "操作規劃";
-                plan = await llm.Plan(goal, before, hierarchy, rules, feedback, image, dir);
+                plan = await llm.Plan(goal, before, hierarchy, NoPriorFeedback, image, dir);
                 stage = "轉譯成執行資料";
                 stageKind = "translation_format";
                 var translated = await llm.Translate(plan, before, dir);
                 Save(dir, "translated_plan.json", translated);
-                translationText = JsonSerializer.Serialize(translated,
-                    new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
-                // 轉譯失敗也算一輪，照常進 Reflection
+                // 轉譯失敗也算一輪失敗
                 if (!string.IsNullOrWhiteSpace(translated.Error))
                 {
                     stageKind = "translation_rejected";
@@ -208,7 +209,7 @@ while (true)
                     throw new InvalidOperationException("執行前檢查：放置位置會跟其他積木重疊：" + string.Join("；", overlaps));
                 // 3D 疊放：整輪步驟先交給 Unity 在 URSim 執行（robot_target = "ursim"），Isaac Sim 的手臂
                 // 即時跟隨 URSim、積木用物理模擬；URSim 跑完由 Isaac 做幾何檢查，再讓 LLM 看模擬畫面，
-                // 都通過才把同一批整批送實體手臂。不通過就算這次 attempt 失敗、實機完全不動，照常進 Reflect。
+                // 都通過才把同一批整批送實體手臂。不通過就算這次 attempt 失敗、實機完全不動，直接進下一次全新嘗試。
                 // 2D 平面移動不經過這裡（見下方 2D 整批）。存檔另開子資料夾，避免跟實機結果撞名。
                 // 3D 的每一批（URSim 與之後的實機）都帶 layered_grasp：Unity 用分層夾取深度，實機執行的就是
                 // Isaac 驗證過的同一套深度；2D 批次不帶這個欄位，Unity 照舊。
@@ -305,7 +306,7 @@ while (true)
                         Comment = "3D 疊放正式執行（整批，同驗證軌跡）", LayeredGrasp = true, RobotTarget = sim ? "ursim" : "" };
                     Save(dir, $"batch_{batchId3d}.json", batch3d);
                     AtomicWrite(Path.Combine(assets, "current_step.json"), batch3d);
-                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 3D 整批（{executionSteps.Count} 個操作）：batch {batchId3d}。");
+                    Console.WriteLine($"[實驗] 第 {attempt} 輪已送出 3D 整批（{executionSteps.Count} 個操作）：batch {batchId3d}。");
                     executionPending = true;
                     var execution3d = await Wait(attempt, batchId3d);
                     if (execution3d != null) executionPending = false;
@@ -314,10 +315,10 @@ while (true)
                     if (!execution3d.Completed)
                     {
                         var executionError = $"3D 疊放整批執行失敗：{execution3d.Error ?? "沒有回報原因"}";
-                        Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 退回：{executionError}");
+                        Console.WriteLine($"[實驗] 第 {attempt} 輪 Unity/UR3 退回：{executionError}");
                         throw new InvalidOperationException(executionError);
                     }
-                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 已完成 3D 整批 batch {batchId3d}。");
+                    Console.WriteLine($"[實驗] 第 {attempt} 輪 Unity/UR3 已完成 3D 整批 batch {batchId3d}。");
                     robotOperations = executionSteps.Count;
                     trace.Add($"3D 疊放 {executionSteps.Count} 個操作整批由實體手臂執行完成");
                 }
@@ -393,7 +394,7 @@ while (true)
                             batch2d.CellSizeM = cellX;
                             batch2d.CellSizeXM = cellX;
                             batch2d.CellSizeYM = cellY;
-                            FigureBitmap.Print($"[Bitmap] 第 {attempt}/10 輪計畫的圖形（{figure.Count} 個物件，格距 X {cellX * 1000:F0} mm、" +
+                            FigureBitmap.Print($"[Bitmap] 第 {attempt} 輪計畫的圖形（{figure.Count} 個物件，格距 X {cellX * 1000:F0} mm、" +
                                                $"Y {cellY * 1000:F0} mm，跟相機畫面同方向：上 = +Y、右 = +X）：", rows);
                             // 排字母時每個字母最多 5×5 格：超過就不送，算執行前檢查失敗
                             var sizeProblem = FigureBitmap.LetterSizeProblem(FigureBitmap.LetterCount(goal), rows);
@@ -410,7 +411,7 @@ while (true)
                         var simCheckPath = Path.Combine(assets, "sim_check.json");
                         if (File.Exists(simCheckPath)) File.Delete(simCheckPath);
                         AtomicWrite(Path.Combine(assets, "current_step.json"), batch2d);
-                        Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 2D 整批（{batchSteps.Count} 個操作）：batch {batchId2d}。");
+                        Console.WriteLine($"[實驗] 第 {attempt} 輪已送出 2D 整批（{batchSteps.Count} 個操作）：batch {batchId2d}。");
                         executionPending = true;
                         var execution2d = await Wait(attempt, batchId2d);
                         if (execution2d != null) executionPending = false;
@@ -432,10 +433,10 @@ while (true)
                             // Unity 的錯誤用內部 step_id，換成第幾個操作與它的來源、目標，反思才對得上計畫
                             var executionError = $"2D 整批執行失敗：{execution2d.Error ?? "沒有回報原因"}" +
                                 $"\n（Unity 的 step_id：{string.Join("；", operationOf.Select(p => $"{p.Key} = {p.Value}"))}；座標只適用本輪觀測）";
-                            Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 退回：{executionError}");
+                            Console.WriteLine($"[實驗] 第 {attempt} 輪 Unity/UR3 退回：{executionError}");
                             throw new InvalidOperationException(executionError);
                         }
-                        Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 已完成 2D 整批 batch {batchId2d}。");
+                        Console.WriteLine($"[實驗] 第 {attempt} 輪 Unity/UR3 已完成 2D 整批 batch {batchId2d}。");
                         robotOperations = batchSteps.Count;
                         if (sim && virtualWorld != null)
                         {
@@ -454,7 +455,7 @@ while (true)
                 failure = ex.Message;
                 failureKind = stageKind;
                 trace.Add($"在「{stage}」停止");
-                Console.WriteLine($"[實驗] 第 {attempt}/10 輪轉譯失敗，將進入 Reflection：{failure}");
+                Console.WriteLine($"[實驗] 第 {attempt} 輪轉譯失敗：{failure}");
             }
             catch (InvalidOperationException ex) { failure = ex.Message; failureKind = stageKind; trace.Add($"在「{stage}」停止"); }
             trace.Add($"實體手臂完整執行了 {robotOperations} 個操作");
@@ -464,24 +465,16 @@ while (true)
             if (!sim) IsaacSimExecutor.SyncRealScene(after, camera);
             var afterImage = await Frame(dir, "after.jpg");
             var verdict = await llm.Validate(goal, initial, after, afterImage, dir);
-            feedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n執行／局部觀察：{failure}\n整體觀察：{verdict}";
-            File.WriteAllText(Path.Combine(dir, "feedback.txt"), feedback);
+            var attemptFeedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n執行／局部觀察：{failure}\n整體觀察：{verdict}";
+            File.WriteAllText(Path.Combine(dir, "feedback.txt"), attemptFeedback);
             success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
             if (!success && string.IsNullOrEmpty(failureKind)) failureKind = "global_validation";
             attemptOutcomes.Add(success ? "success" : failureKind);
             Save(dir, "attempt_result.json", new { attempt, success, failure_kind = success ? null : failureKind,
                 failure_stage = string.IsNullOrEmpty(failure) ? null : stage, failure = string.IsNullOrEmpty(failure) ? null : failure });
             if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
-            var reflection = await llm.Reflect(goal, plan, translationText, feedback, rules, after, dir);
-            File.WriteAllText(Path.Combine(dir, "rules_for_next_attempt.txt"), reflection);
-            var reflectionLines = reflection.Split('\n');
-            if (reflectionLines[0].Trim() == "GIVE_UP")
-            {
-                Console.WriteLine($"[實驗] LLM 判斷本任務無法達成，第 {attempt} 次後結束嘗試。");
-                break;
-            }
-            // 規則逐輪累積（由舊到新）；第一行的 CONTINUE 是判定，不是規則內容
-            rules.Add(reflectionLines[0].Trim() == "CONTINUE" ? string.Join('\n', reflectionLines.Skip(1)).Trim() : reflection);
+            // 沒有 Reflection：不產生規則、不帶任何本輪資訊到下一輪，直接用全新的獨立嘗試重來。
+            Console.WriteLine($"[實驗] 第 {attempt} 次未達標，不使用 Reflection，直接以全新獨立嘗試重新規劃。");
         }
     }
     catch (Exception ex)
@@ -494,7 +487,7 @@ while (true)
     }
     Save(run, "result.json", new { success, status, attempts, attempt_outcomes = attemptOutcomes,
         counts_toward_success_rate = status is "success" or "failed",
-        final_rules = rules, finished_utc = DateTime.UtcNow });
+        finished_utc = DateTime.UtcNow });
     ExperimentMetrics.Write(root);
     if (status == "execution_unknown") { Console.WriteLine("執行狀態未知，服務停止。確認手臂停止後再重新啟動。"); break; }
     AtomicWrite(Path.Combine(assets, "current_step.json"), new StepEnvelope { StepId = ++stepId, Done = true });
@@ -551,7 +544,7 @@ async Task<byte[]?> Frame(string dir, string name)
     catch (Exception ex)
     {
         File.WriteAllText(Path.Combine(dir, name + ".error.txt"), ex.Message);
-        throw new SceneUnavailableException("相機影像不可取得，不能作為任務失敗進行 Reflection。");
+        throw new SceneUnavailableException("相機影像不可取得，不能作為任務失敗的判斷依據。");
     }
 }
 // 相機內參與位姿只用來對齊 Isaac Sim 的模擬相機；取不到時模擬端沿用上次的相機，不中斷實驗。
@@ -590,7 +583,7 @@ async Task<ExecutionResult?> Wait(int attempt, int id)
         if (elapsedSeconds >= lastReportedSeconds + 15)
         {
             lastReportedSeconds = elapsedSeconds;
-            Console.WriteLine($"[Unity/UR3] 第 {attempt}/10 輪，batch {id} 仍在執行，已等待 {elapsedSeconds} 秒（無逾時限制）...");
+            Console.WriteLine($"[Unity/UR3] 第 {attempt} 輪，batch {id} 仍在執行，已等待 {elapsedSeconds} 秒（無逾時限制）...");
         }
         await Task.Delay(200);
     }
