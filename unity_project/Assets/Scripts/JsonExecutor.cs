@@ -1539,9 +1539,128 @@ public class JsonExecutor : MonoBehaviour
         return cell.shape == "domino" ? $"{cells} domino {cell.orientation}" : $"{cells} {cell.shape}";
     }
 
-    // 模擬結束後比對：每個 bitmap 物件是否有一顆方塊落在對應格子（容許誤差內），
-    // 形狀、domino 方向、高度也要對；多放、少放、放錯格、在空中放開都算錯。
-    // 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）= 重疊率，大於 bitmapOverlapThreshold 才通過；
+    // ---- 覆蓋率改成「真的把畫面渲染出來、逐格比對」----
+    // 逐字稿的要求是渲染出模擬結果再跟計畫的 bitmap 逐格比對，不是直接讀 Unity 內部物件座標。
+    // 架一台暫時的正交俯視相機，把 preview 結束當下的桌面拍成一張圖存檔（跟 isaac_before/after.jpg
+    // 留底同個精神），再用每格中心點投影到畫面上的像素顏色，跟桌面底色比對判斷這格有沒有方塊。
+    // 正交相機的畫面 X/Y 跟物件高度無關，方塊疊多高都不影響投影到哪一格，不用額外處理透視。
+    const int CoverageRenderPixels = 640;
+    const float CoverageMarginCells = 2.5f;                    // 畫面邊界外推幾格，確保四角落在圖案外面能當底色參考
+    const float CoverageOccupiedColorDeltaThreshold = 0.12f;   // 跟底色的顏色距離超過這個就算「這格有方塊」
+
+    bool[,] CaptureCoverageGrid(int rows, int cols, float anchorX, float anchorY, float cellX, float cellY,
+        int anchorRow, int anchorCol, int batchId, out string savedImagePath)
+    {
+        savedImagePath = null;
+        Vector2 CellCenterQR(int r, int c) =>
+            new Vector2(anchorX + (c - anchorCol) * cellX, anchorY + (anchorRow - r) * cellY);
+
+        float marginX = cellX * CoverageMarginCells;
+        float marginY = cellY * CoverageMarginCells;
+        float minQrX = float.MaxValue, maxQrX = float.MinValue, minQrY = float.MaxValue, maxQrY = float.MinValue;
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+            {
+                Vector2 p = CellCenterQR(r, c);
+                minQrX = Mathf.Min(minQrX, p.x); maxQrX = Mathf.Max(maxQrX, p.x);
+                minQrY = Mathf.Min(minQrY, p.y); maxQrY = Mathf.Max(maxQrY, p.y);
+            }
+        minQrX -= marginX; maxQrX += marginX;
+        minQrY -= marginY; maxQrY += marginY;
+
+        float centerQrX = (minQrX + maxQrX) / 2f;
+        float centerQrY = (minQrY + maxQrY) / 2f;
+        Vector3 centerUnity = SceneSyncer.QRToUnity(centerQrX, centerQrY, 0f);
+        // extentQrX 對應螢幕「垂直」方向（相機轉 90 度後 up = world +Z = QR +X）
+        // extentQrY 對應螢幕「水平」方向（相機 right 不受 X 軸旋轉影響 = world +X = QR -Y）
+        float extentQrX = Mathf.Max(0.01f, maxQrX - minQrX);
+        float extentQrY = Mathf.Max(0.01f, maxQrY - minQrY);
+
+        int height = CoverageRenderPixels;
+        int width = Mathf.Clamp(Mathf.RoundToInt(height * (extentQrY / extentQrX)), 64, 2048);
+
+        var camGo = new GameObject("CoverageTopDownCamera");
+        var cam = camGo.AddComponent<Camera>();
+        cam.orthographic = true;
+        cam.orthographicSize = extentQrX / 2f;
+        cam.aspect = width / (float)height;
+        cam.nearClipPlane = 0.01f;
+        cam.farClipPlane = 3f;
+        cam.clearFlags = CameraClearFlags.SolidColor;
+        cam.backgroundColor = Color.black;
+        cam.transform.position = new Vector3(centerUnity.x, 1.0f, centerUnity.z);
+        cam.transform.rotation = Quaternion.Euler(90f, 0f, 0f);   // 往下看：forward = world -Y
+
+        var rt = new RenderTexture(width, height, 16);
+        cam.targetTexture = rt;
+        cam.Render();
+
+        // 相機活著的時候先把每格中心點投影成畫面像素座標（正交投影下跟方塊高度無關）
+        var cellPixel = new Vector2Int[rows, cols];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+            {
+                Vector2 qr = CellCenterQR(r, c);
+                Vector3 world = SceneSyncer.QRToUnity(qr.x, qr.y, 0f);
+                Vector3 screen = cam.WorldToScreenPoint(new Vector3(world.x, 1.0f, world.z));
+                cellPixel[r, c] = new Vector2Int(Mathf.RoundToInt(screen.x), Mathf.RoundToInt(screen.y));
+            }
+
+        var prevActive = RenderTexture.active;
+        RenderTexture.active = rt;
+        var tex = new Texture2D(width, height, TextureFormat.RGB24, false);
+        tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+        tex.Apply();
+        RenderTexture.active = prevActive;
+
+        cam.targetTexture = null;
+        rt.Release();
+        Destroy(rt);
+        Destroy(camGo);
+
+        try
+        {
+            savedImagePath = Path.Combine(Application.streamingAssetsPath, $"coverage_batch_{batchId}.jpg");
+            File.WriteAllBytes(savedImagePath, tex.EncodeToJPG(85));
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[BitmapCheck] 覆蓋率渲染圖存檔失敗：{e.Message}");
+        }
+
+        Color SamplePatch(int px, int py)
+        {
+            int half = Mathf.Max(1, Mathf.Min(width, height) / 40);
+            int x0 = Mathf.Clamp(px - half, 0, width - 1), x1 = Mathf.Clamp(px + half, 0, width - 1);
+            int y0 = Mathf.Clamp(py - half, 0, height - 1), y1 = Mathf.Clamp(py + half, 0, height - 1);
+            Color sum = Color.black; int n = 0;
+            for (int y = y0; y <= y1; y++)
+                for (int x = x0; x <= x1; x++) { sum += tex.GetPixel(x, y); n++; }
+            return n > 0 ? sum / n : Color.black;
+        }
+
+        // 底色：取四個角落的平均色（留白夠大，角落保證落在圖案外面、沒有方塊）
+        Color bg = (SamplePatch(8, 8) + SamplePatch(width - 8, 8) +
+                    SamplePatch(8, height - 8) + SamplePatch(width - 8, height - 8)) / 4f;
+
+        var occupied = new bool[rows, cols];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+            {
+                Vector2Int px = cellPixel[r, c];
+                Color sample = SamplePatch(px.x, px.y);
+                float delta = Mathf.Abs(sample.r - bg.r) + Mathf.Abs(sample.g - bg.g) + Mathf.Abs(sample.b - bg.b);
+                occupied[r, c] = delta > CoverageOccupiedColorDeltaThreshold;
+            }
+
+        Destroy(tex);
+        return occupied;
+    }
+
+    // 模擬結束後比對：渲染出 preview 結束當下的桌面、逐格判斷有沒有方塊（CaptureCoverageGrid），
+    // 跟計畫畫出的 bitmap 逐格比對；放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）= 重疊率，
+    // 大於 bitmapOverlapThreshold 才通過，這是送不送實機的唯一依據。
+    // 另外保留一份用 Unity 內部物件座標（而非渲染圖）比對的結果，只當除錯用的詳細錯誤訊息，不影響判定。
     // 把報告印出來，錯誤清單存在 bitmapCheckErrors（null = 這批沒有 bitmap），通過與否存在 bitmapCheckPassed。
     void RunBitmapCheck(BatchEnvelope batch)
     {
@@ -1600,9 +1719,11 @@ public class JsonExecutor : MonoBehaviour
             candidateUsed[p.c] = true;
         }
 
-        var grid = new char[rows, cols];
-        for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) grid[r, c] = '□';
-        void Mark(int r, int c, char symbol) { if (r >= 0 && r < rows && c >= 0 && c < cols) grid[r, c] = symbol; }
+        // 這份 grid 是用 Unity 內部物件座標比對出來的，只當除錯用的詳細資訊（哪裡形狀不符、
+        // 哪裡高度不對、哪顆方塊放錯）；實際過不過關看下面用渲染圖逐格比對出的 imgGrid。
+        var stateGrid = new char[rows, cols];
+        for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) stateGrid[r, c] = '□';
+        void Mark(int r, int c, char symbol) { if (r >= 0 && r < rows && c >= 0 && c < cols) stateGrid[r, c] = symbol; }
 
         // 重疊率用格數算：cube 一格、domino 兩格
         // 除錯用：每個配到的預期格實際是哪顆方塊滿足的，特別標出「這一批沒有搬動」的——
@@ -1675,34 +1796,84 @@ public class JsonExecutor : MonoBehaviour
                 errors.Add($"多放 {cand.block.name} @ QR({cand.qr.x:F3},{cand.qr.y:F3})：原本就在圖案範圍 {where}");
             if (InsideCanvas(g))
             {
-                Mark(g.r, g.c, grid[g.r, g.c] == '□' ? '●' : '✗');
+                Mark(g.r, g.c, stateGrid[g.r, g.c] == '□' ? '●' : '✗');
                 extraCells += cand.state.isDomino ? 2 : 1;
             }
         }
-        float overlap = expectedCellCount + extraCells > 0 ? (float)hitCells / (expectedCellCount + extraCells) : 0f;
+        // 狀態比對的重疊率只當除錯參考，不拿來決定過不過關（見下面渲染圖逐格比對）
+        float stateOverlap = expectedCellCount + extraCells > 0 ? (float)hitCells / (expectedCellCount + extraCells) : 0f;
+
+        var stateResultRows = new List<string>();
+        for (int r = 0; r < rows; r++)
+        {
+            var line = new System.Text.StringBuilder();
+            for (int c = 0; c < cols; c++) line.Append(stateGrid[r, c]);
+            stateResultRows.Add(line.ToString());
+        }
+
+        // ---- 渲染圖逐格比對：這才是送不送實機的依據 ----
+        var occupied = CaptureCoverageGrid(rows, cols, anchorX, anchorY, cellX, cellY,
+            anchor.row, anchor.col, batch.batch_id, out string coverageImagePath);
+
+        var expectedCellLookup = new HashSet<(int r, int c)>();
+        foreach (var exp in expected)
+        {
+            expectedCellLookup.Add((exp.row, exp.col));
+            if (exp.second_row >= 0) expectedCellLookup.Add((exp.second_row, exp.second_col));
+        }
+
+        var imgGrid = new char[rows, cols];
+        for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) imgGrid[r, c] = '□';
+        int imgExpectedCells = 0, imgHitCells = 0, imgExtraCells = 0, imgCorrect = 0;
+        foreach (var exp in expected)
+        {
+            int cells = exp.second_row >= 0 ? 2 : 1;
+            imgExpectedCells += cells;
+            bool hit = InsideCanvas((exp.row, exp.col)) && occupied[exp.row, exp.col] &&
+                (exp.second_row < 0 || (InsideCanvas((exp.second_row, exp.second_col)) && occupied[exp.second_row, exp.second_col]));
+            if (hit) { imgHitCells += cells; imgCorrect++; }
+            char symbol = hit ? '■' : '✗';
+            imgGrid[exp.row, exp.col] = symbol;
+            if (exp.second_row >= 0) imgGrid[exp.second_row, exp.second_col] = symbol;
+        }
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+            {
+                if (expectedCellLookup.Contains((r, c)) || !occupied[r, c]) continue;
+                imgGrid[r, c] = '●';
+                imgExtraCells++;
+            }
+        float overlap = imgExpectedCells + imgExtraCells > 0 ? (float)imgHitCells / (imgExpectedCells + imgExtraCells) : 0f;
         bool passed = overlap > bitmapOverlapThreshold;
 
         var resultRows = new List<string>();
         for (int r = 0; r < rows; r++)
         {
             var line = new System.Text.StringBuilder();
-            for (int c = 0; c < cols; c++) line.Append(grid[r, c]);
+            for (int c = 0; c < cols; c++) line.Append(imgGrid[r, c]);
             resultRows.Add(line.ToString());
         }
 
         var report = new System.Text.StringBuilder();
-        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ 模擬結果跟 bitmap 吻合" : "✗ 模擬結果跟 bitmap 不吻合")}，" +
+        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ 渲染圖逐格比對吻合" : "✗ 渲染圖逐格比對不吻合")}，" +
                           $"重疊率 {overlap * 100f:F0}%（要大於 {bitmapOverlapThreshold * 100f:F0}%），" +
-                          $"預期 {expected.Count} 個物件，放對 {correct}，錯誤 {errors.Count} 項");
-        report.AppendLine("  預期 bitmap    模擬結果（■ 正確  ✗ 少放/錯誤  ● 多放/放錯  □ 空）");
+                          $"放對 {imgCorrect}/{expected.Count} 格，渲染圖：{coverageImagePath ?? "存檔失敗"}");
+        report.AppendLine("  預期 bitmap    渲染圖比對結果（■ 正確  ✗ 少放/錯誤  ● 多放  □ 空）");
         for (int r = 0; r < rows; r++)
         {
             string want = batch.bitmap != null && r < batch.bitmap.Count ? batch.bitmap[r] : "";
             report.AppendLine($"  {want.PadRight(cols)}          {resultRows[r]}");
         }
+        report.AppendLine($"  （內部狀態比對僅供除錯參考，不影響過關與否：重疊率 {stateOverlap * 100f:F0}%，" +
+                          $"放對 {correct}，錯誤 {errors.Count} 項）");
+        for (int r = 0; r < rows; r++)
+        {
+            string want = batch.bitmap != null && r < batch.bitmap.Count ? batch.bitmap[r] : "";
+            report.AppendLine($"    {want.PadRight(cols)}          {stateResultRows[r]}");
+        }
         foreach (var error in errors) report.AppendLine("  - " + error);
         foreach (var note in simPlacementNotes) report.AppendLine("  · " + note);
-        report.AppendLine("  配對明細：");
+        report.AppendLine("  配對明細（狀態比對）：");
         foreach (var m in matchLog) report.AppendLine("    " + m);
 
         if (passed) Debug.Log(report.ToString());
@@ -1718,7 +1889,7 @@ public class JsonExecutor : MonoBehaviour
             passed = passed,
             verification_enabled = verificationEnabled,
             expected_count = expected.Count,
-            correct_count = correct,
+            correct_count = imgCorrect,
             overlap_ratio = overlap,
             overlap_threshold = bitmapOverlapThreshold,
             expected_rows = batch.bitmap ?? new List<string>(),

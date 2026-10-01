@@ -510,6 +510,9 @@ SimulationCheckReport? ReadSimulationCheck(string path, int batchId, string dir)
     catch (Exception ex) when (ex is IOException or JsonException) { return null; }
     if (report == null || report.BatchId != batchId) return null;
     File.Copy(path, Path.Combine(dir, "sim_check.json"), true);
+    // Unity 渲染出來逐格比對用的那張圖，跟 sim_check.json 放在同個資料夾，留底進這一輪方便事後對照
+    string coverageImage = Path.Combine(Path.GetDirectoryName(path)!, $"coverage_batch_{batchId}.jpg");
+    if (File.Exists(coverageImage)) File.Copy(coverageImage, Path.Combine(dir, $"coverage_batch_{batchId}.jpg"), true);
     PrintSimulationCheck(report);
     return report;
 }
