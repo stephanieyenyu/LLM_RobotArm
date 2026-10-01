@@ -31,7 +31,7 @@ public sealed class ExperimentLlm
     const string SchematicImageNote = "附圖是程式依目前場景座標畫的俯視示意圖（純模擬沒開 Isaac Sim），不是相機照片：上方 = +Y、右方 = +X，方塊上的數字是場景 index，灰色圓弧是手臂可達範圍。";
     string ImageNote => SchematicImage ? SchematicImageNote : "";
     // 排字母的規範：每個字母最多 5×5 格、要能辨識；方向以相機畫面為準（跟 terminal 印的 bitmap、整體驗證看的畫面相同）
-    const string LetterDesign = "在桌面上排字母時，每個字母設計在最多 5×5 的方格上（高最多 5 格、寬最多 5 格）：每個方向用固定的格距（相鄰格的中心距，格距要讓手指放得下，見夾爪事實），每一格放一個 cube，domino 佔同一排相鄰的兩格；筆畫要像 5×5 點陣字一樣足以辨識是哪個字母。字母形狀以相機畫面判讀：畫面上方是 +Y、畫面右方是 +X（也就是方向詞的「左」），字母在這個方向下要是正的，不能上下或左右顛倒。";
+    const string LetterDesign = "在桌面上排字母時，每個字母設計在最多 5×5 的方格上（高最多 5 格、寬最多 5 格）：每個方向用固定的格距（相鄰格的中心距，格距要讓手指放得下，見夾爪事實），每一格放一個 cube，domino 佔同一排相鄰的兩格；筆畫要像 5×5 點陣字一樣足以辨識是哪個字母。字母是否正立直接用 X/Y 座標數值判斷，這跟前面方向詞（左右前後）的定義是分開的兩件事，不要混用：相機畫面上方對應 Y 值較大、下方對應 Y 值較小；畫面右方對應 X 值較大、左方對應 X 值較小。字母要在這個座標對應下正立，不能上下或左右顛倒——例如正立的大寫 L：直筆畫沿 Y 方向排列，橫筆畫接在直筆畫 Y 值最小（畫面最下方）的那一端，往 X 值變大（畫面右方）的方向延伸；橫筆畫不能接在 Y 值最大（畫面最上方）的那一端，否則會變成上下顛倒的字母。";
     static string SceneText(List<SceneObject> scene) => JsonSerializer.Serialize(scene.Select((item, index) => new { index, item }));
     public Task<string> Decompose(string goal, List<SceneObject> scene, string feedback, byte[]? image, string dir) => Call(Role,
         $"目標：{goal}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n環境：{CoordinateDirections}{WorkspaceFacts}{FigureAcceptance}{LetterDesign}{ImageNote}\n注意：index 只代表這一張目前場景清單的位置，每次重新觀測都可能重排，不能當作跨輪次的物件身分。請自行拆解本輪的子任務，以自然語言描述。", image, dir, "decomposition");
