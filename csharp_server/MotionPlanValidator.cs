@@ -36,19 +36,16 @@ public static class MotionPlanValidator
         var source = assignment.Source;
         var target = assignment.Target;
         if (!InsideWorkspace(source.X, source.Y) || !InsideWorkspace(target.WorldX, target.WorldY))
+            // 會進到 LLM 的回饋：只給座標、不給允許範圍（可達範圍不給 LLM，2026-10-02 起）
             return Fail(
                 $"source or target is outside the validated QR workspace " +
                 $"(source=({source.X:F3},{source.Y:F3}), " +
-                $"target=({target.WorldX:F3},{target.WorldY:F3}), " +
-                $"allowed X={MinX - WorkspaceMeasurementToleranceM:F3}.." +
-                $"{MaxX + WorkspaceMeasurementToleranceM:F3}, " +
-                $"Y={MinY - WorkspaceMeasurementToleranceM:F3}.." +
-                $"{MaxY + WorkspaceMeasurementToleranceM:F3})",
+                $"target=({target.WorldX:F3},{target.WorldY:F3}))",
                 out error);
 
         double transferDistance = Distance2D(source.X, source.Y, target.WorldX, target.WorldY);
         if (transferDistance > MaxTransferDistanceM)
-            return Fail($"transfer distance {transferDistance:F3} m exceeds {MaxTransferDistanceM:F2} m", out error);
+            return Fail($"transfer distance {transferDistance:F3} m is too long", out error);
 
         // Scene snapshots create new SceneObject instances, so ReferenceEquals cannot
         // identify the source. Exclude it by name and position instead.

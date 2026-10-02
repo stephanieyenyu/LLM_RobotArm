@@ -16,9 +16,11 @@ perception_server (Python + Flask)
    ├─ YOLO11n（COCO 物件） + HSV 立方體 + ArUco QR
    └─ 每 200ms 更新場景，回傳 3D 世界座標
    ↓
-LLM 自由拆解子任務 → 自然語言操作計畫
+目標 bitmap 設計（release 260917）：OpenAI、Gemini 各畫一張、互相審查、加權投票 80/20（每個任務都先畫）
+   ↓
+LLM 自由拆解子任務 → 自然語言操作計畫（有目標 bitmap 時照它排）
    ↓  本地確定性轉譯（NaturalLanguagePlanAdapter，不呼叫 LLM）→ 內部執行資料
-MotionPlanValidator + 積木重疊檢查 → Unity 整批（2D 先預覽並比對 bitmap；3D 先在 URSim/Isaac 驗證）
+計畫的圖形要跟目標 bitmap 相同 + MotionPlanValidator + 積木重疊檢查 → Unity 整批（2D 先預覽並比對 bitmap；3D 先在 URSim/Isaac 驗證）
    ↓
 獨立視覺模型整體驗證
    └─ 未達標：失敗摘要 → 自行生成規則 → 更新 prompt（最多 10 次）
@@ -36,7 +38,9 @@ UR3e
 - `Program.cs` — 任務起點確認（目前桌面穩定，或固定配置比對）、任務內保留現況、十次嘗試與逐操作執行
 - `ExperimentLlm.cs` — 自由拆解、自然語言規劃、獨立結果驗證及反思
 - `NaturalLanguagePlanAdapter.cs` — 把規劃文字裡明確寫出的「source index N → target (x, y, z)」與「執行路徑開始／結束」之間的函式呼叫轉成內部執行資料（不呼叫 LLM；domino 方向沿用來源，白名單以外的函式會被略過）
-- `FigureBitmap.cs` — 把計畫放下的物件畫成 bitmap（跟相機畫面同方向，X、Y 格距分開），規劃轉譯完就印在 terminal 的 LLM 進度後面（3D 疊放逐層畫），2D 也送給 Unity 當模擬結束比對的預期格；排字母時每個字母最多 5×5 格，超過就在送出前退回
+- `PatternDesigner.cs`、`BitmapParser.cs` — release 260917 的目標 bitmap 設計（prompt 原封不動）：每個任務都先由 OpenAI 與 Gemini 各畫一張最多 5×5 的 bitmap、互相審查、加權投票 80/20；每次呼叫存在任務資料夾的 `design/`，結果存成 `design.json`
+- `FigureBitmap.cs` — 把計畫放下的物件畫成 bitmap（跟相機畫面同方向，X、Y 格距分開；3D 疊放是俯視高度圖，例如站起來的 L 是 `3 1 1`），規劃轉譯完就印在 terminal 的 LLM 進度後面，也送給 Unity 當畫面比對的預期；排字母時每個字母最多 5×5 格，超過就在送出前退回
+- `SimCheckImage.cs` — Unity 畫面比對圖（Unity 俯視畫面 / 預期 / 疊合）加上重疊率、PASS/FAIL 與圖例，3D 標出每處疊幾層，存進每一輪的資料夾
 - `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
 - `ExperimentMetrics.cs` — 首次／十次內成功率及各次累積成功率
 - `MotionPlanValidator.cs` — 執行前安全狀態機驗證
@@ -62,6 +66,7 @@ UR3e
 - Intel RealSense D435i（USB 3 直接接筆電）
 - `setx OPENAI_API_KEY "sk-你的-key"` 後重開 PowerShell
 - 可選：ROBOT_MODEL 指定本次實驗的 OpenAI 模型
+- 雙模型設計需要 `setx GEMINI_API_KEY "你的-key"`（可選 GEMINI_MODEL，預設 gemini-3.1-flash-lite）；沒設定時在 Unity 把「pattern審查」關掉，就只用 OpenAI 畫一次目標 bitmap
 - UR3e 或 URSim（Teach Pendant 切 Remote Control、TCP Z offset 設 0.170、速度滑桿 100%）
 - 工作台貼四張 ArUco（QR1 左下、QR2 右下、QR3 左上、QR4 右上）
 
@@ -88,9 +93,10 @@ dotnet run
 - **2D 平面移動**：所有步驟包成一批，Unity 先預覽整批，預覽結束用正上方的正交相機拍 Unity 畫面，跟計畫畫出的 bitmap（每塊應有的佔地）比像素重疊率（交集 ÷ 聯集，要大於 90%，`JsonExecutor.bitmapOverlapThreshold`；比對圖存成 `sim_check.png`），通過才整批送實體手臂；bitmap 與比對結果印在 csharp_server 的 terminal。
 - **3D 疊放**（任一步的目標壓在另一塊積木上，或比來源高出半層）：
   1. csharp_server 把真實場景投影到 Isaac Sim（積木、相機、桌面與 QR1-4 範圍）。
-  2. 整輪步驟以 `robot_target = "ursim"` 交給 Unity，Unity 用同一套關節軌跡只在 **URSim** 執行，實體手臂不動。
-  3. Isaac Sim 的手臂即時跟隨 URSim（唯讀埠 30013 的關節角 + DO4 夾爪），積木用物理模擬被夾起、放下。
-  4. URSim 跑完，Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定度、指尖是否低於桌面），
+  2. Unity 先預覽一次，預覽結束逐層切開拍俯視畫面得到每一點疊幾層，跟計畫的俯視高度圖（含壓在底下沒被搬的支撐）比畫面重疊率（Σ min ÷ Σ max，要大於 90%），不通過 URSim 與實機都不動。
+  3. 整輪步驟以 `robot_target = "ursim"` 交給 Unity，Unity 用同一套關節軌跡只在 **URSim** 執行，實體手臂不動。
+  4. Isaac Sim 的手臂即時跟隨 URSim（唯讀埠 30013 的關節角 + DO4 夾爪），積木用物理模擬被夾起、放下。
+  5. URSim 跑完，Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定度、指尖是否低於桌面），
      再由 LLM 看模擬畫面；都通過才把同一批（同樣的步驟、來源位置與積木高度）整批送實體手臂，
      實機跑的就是 Isaac 驗證過的同一條關節軌跡。不通過就算這次嘗試失敗、進 Reflection。
      整批送出前會確認來源積木在驗證後沒被移動（超過 1 cm 就不執行）；步驟之間不重新觀測、不做局部驗證，
@@ -162,10 +168,10 @@ csharp_server 每個任務開始時讀一次，整個任務都用同一個模式
 |---|---|---|
 | 場景與照片 | perception_server（相機） | Isaac Sim 的 `/perception/*`（同格式）；沒開 Isaac 時 2D 用 csharp_server 內建的虛擬世界（俯視示意圖） |
 | 初始桌面 | 收到指令時的真實桌面 | 虛擬場景檔 `sim_scenes/*.json`：切換的當下載入並顯示，每個任務開始時再重建 Isaac 世界 |
-| 動作 | 實體 UR3e（3D 先在 URSim + Isaac 驗證） | 全部送 URSim，Isaac 跟隨 URSim 讓積木依物理移動 |
+| 動作 | 實體 UR3e（3D 先在 URSim + Isaac 驗證） | 2D：Unity 預覽與 bitmap 比對通過就算執行（不連 URSim），模擬世界照預覽落點更新；3D：送 URSim，Isaac 跟隨 URSim 讓積木依物理移動 |
 | 紀錄 | `csharp_server/outputs/experiments/` | `csharp_server/outputs/experiments_sim/`（成功率另算） |
 
-沒開 Isaac Sim 時，csharp_server 每個任務開始連不到 Isaac 就改用內建的虛擬世界（`VirtualSimWorld.cs`），只支援 2D：起點是場景檔，2D 整批通過 Unity 預覽的 bitmap 比對、URSim 跑完後，照計畫把放下的物件移過去（沒有物理，不會被推動或傾倒）；給 LLM 的畫面是依座標畫的俯視示意圖（`TopViewRenderer.cs`，跟相機同方向）。世界寫在 `StreamingAssets/sim_world.json`，Unity 連不上 Isaac 時從這裡顯示積木、做預覽。遇到 3D 疊放會停下來並說明需要 Isaac（記為 infrastructure_error）。每個任務用哪一種記在 `sim_backend.txt`。
+沒開 Isaac Sim 時，csharp_server 每個任務開始連不到 Isaac 就改用內建的虛擬世界（`VirtualSimWorld.cs`），只支援 2D：起點是場景檔，2D 整批通過 Unity 預覽的 bitmap 比對就把方塊移到預覽的落點（沒有物理，不會被推動或傾倒）；給 LLM 的畫面是依座標畫的俯視示意圖（`TopViewRenderer.cs`，跟相機同方向）。世界寫在 `StreamingAssets/sim_world.json`，Unity 連不上 Isaac 時從這裡顯示積木、做預覽。遇到 3D 疊放會停下來並說明需要 Isaac（記為 infrastructure_error）。每個任務用哪一種記在 `sim_backend.txt`。
 
 啟動（純模擬不用開 perception_server）：
 1. URSim 虛擬機開機、切 Remote Control。

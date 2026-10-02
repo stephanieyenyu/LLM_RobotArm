@@ -80,6 +80,14 @@ Check(JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7, LayeredGrasp = t
 Check(!JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7 }, batchJson).Contains("skip_preview") &&
       JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7, SkipPreview = true }, batchJson).Contains("\"skip_preview\": true"),
       "only the 3D formal batch (already previewed with the URSim check) tells Unity to skip the preview; 2D JSON is unchanged");
+Check(!JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7 }, batchJson).Contains("preview_only") &&
+      JsonSerializer.Serialize(new BatchEnvelope { BatchId = 7, PreviewOnly = true }, batchJson).Contains("\"preview_only\": true"),
+      "only pure-simulation 2D batches end at the Unity preview; real-arm batch JSON is unchanged");
+var previewDone = JsonSerializer.Deserialize<ExecutionResult>(
+    "{\"step_id\":7,\"completed\":true,\"error\":\"\",\"duration_sec\":0," +
+    "\"final_blocks\":[{\"from_x\":0.07,\"from_y\":0.3,\"x\":0.541,\"y\":0.218,\"z\":0.025,\"orientation\":\"\"}]}")!;
+Check(previewDone.Completed && previewDone.FinalBlocks is [{ FromX: 0.07, X: 0.541, Y: 0.218 }],
+      "a preview-only result carries where each released block started and where it landed in the Unity preview");
 bool Near(double a, double b) => Math.Abs(a - b) < 1e-9;
 Check(new[] { -0.0075, 0.0015, 0.013, 0.0179, 0.0277, 0.029 }.All(z => Near(LayeredGraspGeometry.SnapTopToLayer(z), 0.025)),
       "every table-level top seen so far (black -32..+3 mm, yellow -7..+3 mm) snaps to layer 1");
@@ -288,10 +296,25 @@ Check(Near(zWithParked.CellXM, 0.06) && Near(zWithParked.CellYM, 0.06), "one cub
 var sparse = FigureBitmap.Build(new[] { Figure(0.40, 0.08), Figure(0.40, 0.20), Figure(0.40, 0.32) });
 Check(Near(sparse.CellYM, 0.06) && sparse.Rows.SequenceEqual(new[] { "■", "□", "■", "□", "■" }),
       "rows 12 cm apart (over the 8 cm cap) use half of it, with empty rows between, so the grid stays even");
-var bridge = FigureBitmap.Layers(new[] { Figure(0.40, 0.20), Figure(0.46, 0.20), Figure(0.43, 0.20) }, new[] { 1, 1, 2 });
-Check(bridge.Count == 2 && bridge[0] is (1, var bottom) && bottom.SequenceEqual(new[] { "■□■" }) &&
-      bridge[1] is (2, var top) && top.SequenceEqual(new[] { "□■□" }),
-      "a 3D plan is drawn layer by layer on one shared grid, bottom layer first");
+// 3D 的 bitmap 是俯視高度圖：站起來的 L = 左邊疊 3 層、右邊兩格各 1 層 → "311"
+var standingL = FigureBitmap.HeightMap(new[] { Figure(0.40, 0.20), Figure(0.40, 0.20), Figure(0.40, 0.20), Figure(0.43, 0.20), Figure(0.46, 0.20) },
+                                       new[] { 1, 2, 3, 1, 1 });
+Check(standingL.Rows.SequenceEqual(new[] { "311" }) && standingL.Cells.Count == 5 && standingL.Cells.Take(3).All(c => c is { Row: 0, Col: 0 }),
+      "a standing L of three stacked cubes and two on the table is the height map 3 1 1");
+Check(FigureBitmap.HeightMap(new[] { Figure(0.40, 0.20), Figure(0.46, 0.20), Figure(0.43, 0.20) }, new[] { 1, 1, 2 }).Rows.SequenceEqual(new[] { "121" }),
+      "a block bridging two others shows its own layer where it sits");
+// 設計出的目標 bitmap：跟計畫排出的圖形比對前，兩邊都去掉四周的空列、空行
+Check(FigureBitmap.Trim(new[] { "00000", "01110", "00100", "00000" }).SequenceEqual(new[] { "111", "010" }) &&
+      FigureBitmap.Trim(new[] { "000" }).Count == 0 && FigureBitmap.Trim(new[] { "311" }).SequenceEqual(new[] { "311" }),
+      "a designed bitmap is compared after trimming empty border rows and columns");
+// 沒被搬、但最後壓在放下的積木底下的場景積木是結構的一部分（高度圖與 Unity 比對都算它）
+var baseScene = new List<SceneObject> { Block("yellow_cube", 0.40, 0.20, 0.025), Block("yellow_cube", 0.10, 0.10, 0.025),
+                                        Block("yellow_cube", 0.12, 0.30, 0.025), Block("yellow_cube", 0.55, 0.20, 0.025) };
+var onBase = new[] { Move(1, 0.40, 0.20, 0.050), Move(2, 0.40, 0.20, 0.075) };
+var finalPlaced = LayeredHeights.ForSteps(onBase, baseScene).Select((t, k) => new SceneObject {
+    Name = "yellow_cube", Shape = "cube", X = 0.40, Y = 0.20, Z = t.TargetTopM }).ToList();
+Check(LayeredHeights.UnmovedSupports(onBase, baseScene, finalPlaced) is { Count: 1 } supports && Near(supports[0], 0.025),
+      "the unmoved block a tower is built on is part of the structure; unrelated blocks are not");
 Check(FigureBitmap.LetterCount("用黃色積木排一個L") == 1 && FigureBitmap.LetterCount("排出CAT") == 3 &&
       FigureBitmap.LetterCount("排一個字母") == 1 && FigureBitmap.LetterCount("把 yellow_cube 移到 QR1 旁邊") == 0 &&
       FigureBitmap.LetterCount("用方塊排一個 3x3 的正方形") == 0 && FigureBitmap.LetterCount("把方塊疊成 3D 的塔") == 0,

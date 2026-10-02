@@ -17,12 +17,17 @@ public class UIManager : MonoBehaviour
     private Button sendButton;
     private Button simModeButton;
     private Button simSceneButton;
+    private Button patternReviewButton;
+    // pattern審查開關的目前狀態（從 skip_pattern_review.txt 讀回來；OnGUI 每幀用，不每幀讀檔）
+    private bool patternReviewEnabled = true;
     private Label statusLabel;
     private Coroutine uiMonitor;
     private string fallbackCommand = "";
 
     void OnEnable()
     {
+        // 下方備用指令列（OnGUI）也顯示 pattern審查狀態，不能等 UI Toolkit 面板建好才讀
+        patternReviewEnabled = ReadPatternReviewEnabled();
         // UIDocument may rebuild its root after OnEnable (including domain
         // reload in Play Mode). Build only after its panel has been attached.
         uiMonitor = StartCoroutine(EnsureUiReady());
@@ -164,6 +169,12 @@ public class UIManager : MonoBehaviour
         simSceneButton.style.height = 36;
         simSceneButton.style.width = 120;
         simSceneButton.style.marginTop = 4;
+        // 雙模型設計 bitmap 的交叉審查開關（release 260917 的 pattern審查按鈕）
+        patternReviewButton = new Button(TogglePatternReview);
+        patternReviewButton.style.height = 36;
+        patternReviewButton.style.width = 120;
+        patternReviewButton.style.marginTop = 10;
+        patternReviewEnabled = ReadPatternReviewEnabled();
         UpdateModeButtons();
 
         controlPanel.Add(openBtn);
@@ -171,6 +182,7 @@ public class UIManager : MonoBehaviour
         controlPanel.Add(homeBtn);
         controlPanel.Add(simModeButton);
         controlPanel.Add(simSceneButton);
+        controlPanel.Add(patternReviewButton);
         root.Add(controlPanel);
         Debug.Log("[UI] 輸入框、執行按鈕與手動控制已建立。", this);
     }
@@ -215,8 +227,8 @@ public class UIManager : MonoBehaviour
         }
         UpdateModeButtons();
         ShowMessage(RunMode.IsSim
-            ? $"已切成純模擬：正在把 {RunMode.Scene} 載入 Isaac Sim，畫面會顯示模擬的積木；下一個指令起動作只送 URSim。" +
-              "要先開 URSim；3D 疊放另外需要 isaac_sim_server（--ursim_ip），2D 沒開 Isaac 時用 csharp_server 內建的虛擬世界。"
+            ? $"已切成純模擬：正在把 {RunMode.Scene} 載入 Isaac Sim，畫面會顯示模擬的積木。2D 由 Unity 預覽與 bitmap 比對完成就算執行，" +
+              "不用開 URSim；3D 疊放需要 URSim 與 isaac_sim_server（--ursim_ip）。2D 沒開 Isaac 時用 csharp_server 內建的虛擬世界。"
             : "已切成實機：畫面改顯示相機看到的積木，下一個指令起動作送實體手臂。要先開 perception_server。");
     }
 
@@ -249,8 +261,49 @@ public class UIManager : MonoBehaviour
         ShowMessage($"虛擬場景：{next}，正在載入 Isaac Sim…");
     }
 
+    // ---------------------------------------------------------
+    // pattern審查開關：跟 csharp_server/PatternDesigner 共用 StreamingAssets/skip_pattern_review.txt，
+    // 檔案記的是「跳過」："1" = 跳過交叉審查（只請 OpenAI 畫一次就採用），其他或檔案不存在 = OpenAI 與 Gemini
+    // 各畫一張、互相審查、投票。server 每個任務開始時重讀，下一個指令生效。
+    // ---------------------------------------------------------
+    string SkipPatternReviewFlagPath => Path.Combine(SHARED_DIR, "skip_pattern_review.txt");
+    string PatternReviewButtonText() => patternReviewEnabled ? "pattern審查：開" : "pattern審查：關";
+
+    bool ReadPatternReviewEnabled()
+    {
+        try
+        {
+            return !(File.Exists(SkipPatternReviewFlagPath) && File.ReadAllText(SkipPatternReviewFlagPath).Trim() == "1");
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+    }
+
+    void TogglePatternReview()
+    {
+        bool enable = !ReadPatternReviewEnabled();
+        try
+        {
+            File.WriteAllText(SkipPatternReviewFlagPath, enable ? "0" : "1");
+        }
+        catch (IOException e)
+        {
+            ShowMessage("切換 pattern審查失敗（寫不了 skip_pattern_review.txt）：" + e.Message);
+            return;
+        }
+        // 狀態一律從檔案讀回來，寫入失敗時畫面不會顯示成已切換
+        patternReviewEnabled = ReadPatternReviewEnabled();
+        UpdateModeButtons();
+        ShowMessage(patternReviewEnabled
+            ? "pattern審查開啟：下一個指令起，OpenAI 與 Gemini 各畫一張目標 bitmap、互相審查、投票（需要 GEMINI_API_KEY）。"
+            : "pattern審查關閉：下一個指令起，只請 OpenAI 畫一次目標 bitmap 就採用。");
+    }
+
     void UpdateModeButtons()
     {
+        if (patternReviewButton != null) patternReviewButton.text = PatternReviewButtonText();
         if (simModeButton != null) simModeButton.text = ModeButtonText();
         if (simSceneButton != null)
         {
@@ -276,13 +329,17 @@ public class UIManager : MonoBehaviour
         const float buttonWidth = 90f;
         const float modeWidth = 120f;
         const float sceneWidth = 150f;
+        const float reviewWidth = 130f;
         const float height = 38f;
         float y = Mathf.Max(margin, Screen.height - height - margin);
         GUI.Box(new Rect(0, y - 6f, Screen.width, height + 12f), GUIContent.none);
-        // 由右往左：執行、模式切換、（純模擬時）換場景，剩下的寬度給輸入框
+        // 由右往左：執行、pattern審查、模式切換、（純模擬時）換場景，剩下的寬度給輸入框
         float x = Screen.width - margin - buttonWidth;
         if (GUI.Button(new Rect(x, y, buttonWidth, height), "執行"))
             SubmitCommand(fallbackCommand);
+        x -= margin + reviewWidth;
+        if (GUI.Button(new Rect(x, y, reviewWidth, height), PatternReviewButtonText()))
+            TogglePatternReview();
         x -= margin + modeWidth;
         if (GUI.Button(new Rect(x, y, modeWidth, height), ModeButtonText()))
             OnToggleSimMode();
