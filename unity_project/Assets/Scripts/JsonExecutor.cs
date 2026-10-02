@@ -835,6 +835,18 @@ public class JsonExecutor : MonoBehaviour
                 yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
+            if (bitmapCheckErrors != null && bitmapCheckPassed)
+            {
+                if (robotArm != null) robotArm.followRealRobotFeedback = true;
+                RobotArm.FreezeVisualFeedback = false;
+                string message = $"成功：bitmap 重疊率 {bitmapOverlapRatio * 100f:F0}%，本次任務完成。";
+                Debug.Log("[Executor-preview] " + message);
+                var ui = FindObjectOfType<UIManager>();
+                if (ui != null) ui.ShowMessage(message);
+                WriteStepDone(batch.batch_id, true, null, 0f);
+                yield return StartCoroutine(SetPerceptionMode("idle"));
+                yield break;
+            }
         }
         else
         {
@@ -1570,11 +1582,14 @@ public class JsonExecutor : MonoBehaviour
 
         float centerQrX = (minQrX + maxQrX) / 2f;
         float centerQrY = (minQrY + maxQrY) / 2f;
-        Vector3 centerUnity = SceneSyncer.QRToUnity(centerQrX, centerQrY, 0f);
+        // QRToUnity produces coordinates local to the cube container. Render in
+        // the same world frame as the blocks, including the workspace offset.
+        Transform coverageFrame = SimBlockFrame();
+        Vector3 centerUnity = coverageFrame.TransformPoint(SceneSyncer.QRToUnity(centerQrX, centerQrY, 0f));
         // extentQrX 對應螢幕「垂直」方向（相機轉 90 度後 up = world +Z = QR +X）
         // extentQrY 對應螢幕「水平」方向（相機 right 不受 X 軸旋轉影響 = world +X = QR -Y）
-        float extentQrX = Mathf.Max(0.01f, maxQrX - minQrX);
-        float extentQrY = Mathf.Max(0.01f, maxQrY - minQrY);
+        float extentQrX = Mathf.Max(0.01f, (maxQrX - minQrX) * coverageFrame.TransformVector(Vector3.forward).magnitude);
+        float extentQrY = Mathf.Max(0.01f, (maxQrY - minQrY) * coverageFrame.TransformVector(Vector3.right).magnitude);
 
         int height = CoverageRenderPixels;
         int width = Mathf.Clamp(Mathf.RoundToInt(height * (extentQrY / extentQrX)), 64, 2048);
@@ -1588,12 +1603,56 @@ public class JsonExecutor : MonoBehaviour
         cam.farClipPlane = 3f;
         cam.clearFlags = CameraClearFlags.SolidColor;
         cam.backgroundColor = Color.black;
-        cam.transform.position = new Vector3(centerUnity.x, 1.0f, centerUnity.z);
-        cam.transform.rotation = Quaternion.Euler(90f, 0f, 0f);   // 往下看：forward = world -Y
+        cam.transform.position = centerUnity + coverageFrame.up;
+        cam.transform.rotation = coverageFrame.rotation * Quaternion.Euler(90f, 0f, 0f);
 
         var rt = new RenderTexture(width, height, 16);
         cam.targetTexture = rt;
-        cam.Render();
+        // Coverage measures blocks on the table. Exclude the arm and its shadows
+        // only for this synchronous render, then restore every renderer state.
+        var blockRenderers = new HashSet<Renderer>();
+        foreach (var block in sceneSyncer.GetCurrentCubes())
+            if (block != null)
+                foreach (var renderer in block.GetComponentsInChildren<Renderer>(true))
+                    blockRenderers.Add(renderer);
+        var armRenderers = new HashSet<Renderer>();
+        if (robotArm != null)
+        {
+            foreach (var renderer in robotArm.GetComponentsInChildren<Renderer>(true))
+                armRenderers.Add(renderer);
+            if (robotArm.Transforms != null)
+                foreach (var joint in robotArm.Transforms)
+                    if (joint != null)
+                        foreach (var renderer in joint.GetComponentsInChildren<Renderer>(true))
+                            armRenderers.Add(renderer);
+            if (robotArm.TCP != null)
+                foreach (var renderer in robotArm.TCP.GetComponentsInChildren<Renderer>(true))
+                    armRenderers.Add(renderer);
+        }
+        foreach (var gripper in FindObjectsOfType<SyncGripper>())
+            foreach (var renderer in gripper.GetComponentsInChildren<Renderer>(true))
+                armRenderers.Add(renderer);
+        armRenderers.ExceptWith(blockRenderers);
+        var rendererStates = armRenderers.Select(renderer => (
+            renderer, enabled: renderer.enabled, shadows: renderer.shadowCastingMode)).ToList();
+        try
+        {
+            foreach (var state in rendererStates)
+            {
+                state.renderer.enabled = false;
+                state.renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            }
+            cam.Render();
+        }
+        finally
+        {
+            foreach (var state in rendererStates)
+                if (state.renderer != null)
+                {
+                    state.renderer.enabled = state.enabled;
+                    state.renderer.shadowCastingMode = state.shadows;
+                }
+        }
 
         // 相機活著的時候先把每格中心點投影成畫面像素座標（正交投影下跟方塊高度無關）
         var cellPixel = new Vector2Int[rows, cols];
@@ -1601,8 +1660,8 @@ public class JsonExecutor : MonoBehaviour
             for (int c = 0; c < cols; c++)
             {
                 Vector2 qr = CellCenterQR(r, c);
-                Vector3 world = SceneSyncer.QRToUnity(qr.x, qr.y, 0f);
-                Vector3 screen = cam.WorldToScreenPoint(new Vector3(world.x, 1.0f, world.z));
+                Vector3 world = coverageFrame.TransformPoint(SceneSyncer.QRToUnity(qr.x, qr.y, 0f));
+                Vector3 screen = cam.WorldToScreenPoint(world);
                 cellPixel[r, c] = new Vector2Int(Mathf.RoundToInt(screen.x), Mathf.RoundToInt(screen.y));
             }
 
@@ -2631,7 +2690,10 @@ public class JsonExecutor : MonoBehaviour
                 yield return AnimateJointsTo(RadToDeg(target), 1.5f);
         }
 
-        // 模擬結束、復原場景之前比對 bitmap（復原之後落點就沒了）
+        // Finish arm travel first; the arranged blocks remain untouched until
+        // their coverage image and overlap report have both been saved.
+        yield return new WaitForEndOfFrame();
+        Debug.Log($"[Executor-preview] batch {batch.batch_id} 手臂收尾完成，拍照並比對 bitmap（積木尚未復原，拍攝排除手臂及其陰影）");
         RunBitmapCheck(batch);
 
         // 復原：手臂角度
@@ -3728,4 +3790,3 @@ public class JsonExecutor : MonoBehaviour
         File.WriteAllText(path, json);
     }
 }
-

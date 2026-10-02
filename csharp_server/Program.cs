@@ -183,7 +183,18 @@ while (true)
                 if (!sim) IsaacSimExecutor.SyncRealScene(before, camera);
                 trace.Add($"觀測到 {before.Count} 個物件");
                 stage = "拆解子任務";
+                llm.CanonicalBitmap = true;
                 var hierarchy = await llm.Decompose(goal, before, NoPriorFeedback, image, dir);
+                DualBitmapPlan? bitmapPlan = null;
+                if (hierarchy.Split('\n').Any(line => line.Trim() == "需要平面 bitmap"))
+                {
+                    stage = "雙 LLM bitmap 生成與交叉驗證";
+                    bitmapPlan = await DualBitmapPlan.Design(goal, before);
+                    Save(dir, "canonical_bitmap.json", bitmapPlan);
+                    trace.Add("bitmap 使用 ZIP 的 OpenAI/Gemini 獨立生成、交叉審查與 80/20 匿名評分");
+                }
+                llm.CanonicalBitmap = bitmapPlan != null;
+                if (bitmapPlan != null) hierarchy += "\n" + bitmapPlan.PlanningConstraint;
                 stage = "操作規劃";
                 plan = await llm.Plan(goal, before, hierarchy, NoPriorFeedback, image, dir);
                 stage = "轉譯成執行資料";
@@ -201,6 +212,11 @@ while (true)
                     throw new TranslationContractException("執行資料無效或超過單次 50 步上限。",
                         new InvalidOperationException("Invalid translated step count."));
                 trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
+                // Only translate the LLM-selected placement frame; Unity judges actual overlap.
+                var bitmapLayout = bitmapPlan?.ForUnity(plan);
+                if (bitmapPlan != null) Save(dir, "bitmap_layout.json", new {
+                    bitmap = bitmapLayout!.Value.Rows, expected_cells = bitmapLayout.Value.Cells,
+                    cell_size_x_m = bitmapLayout.Value.CellXM, cell_size_y_m = bitmapLayout.Value.CellYM });
                 // 依步驟順序檢查放置目標有沒有跟同一層的積木部分重疊（含同一批前面步驟剛放的），2D、3D 都檢查
                 stage = "執行前檢查（積木重疊）";
                 stageKind = "precheck";
@@ -388,7 +404,8 @@ while (true)
                             Comment = "2D 整批（Unity 預覽比對 bitmap 通過才執行）", RobotTarget = sim ? "ursim" : "" };
                         if (figure.Count > 0)
                         {
-                            var (rows, cells, cellX, cellY) = FigureBitmap.Build(figure.Values.ToList());
+                            var (rows, cells, cellX, cellY) = bitmapLayout
+                                ?? FigureBitmap.Build(figure.Values.ToList());
                             batch2d.Bitmap = rows;
                             batch2d.ExpectedCells = cells;
                             batch2d.CellSizeM = cellX;
@@ -397,7 +414,7 @@ while (true)
                             FigureBitmap.Print($"[Bitmap] 第 {attempt} 輪計畫的圖形（{figure.Count} 個物件，格距 X {cellX * 1000:F0} mm、" +
                                                $"Y {cellY * 1000:F0} mm，跟相機畫面同方向：上 = +Y、右 = +X）：", rows);
                             // 排字母時每個字母最多 5×5 格：超過就不送，算執行前檢查失敗
-                            var sizeProblem = FigureBitmap.LetterSizeProblem(FigureBitmap.LetterCount(goal), rows);
+                            var sizeProblem = bitmapPlan == null ? FigureBitmap.LetterSizeProblem(FigureBitmap.LetterCount(goal), rows) : null;
                             if (sizeProblem != null)
                             {
                                 stage = "執行前檢查（字母 bitmap 大小）";
@@ -420,6 +437,19 @@ while (true)
                         if (execution2d == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
                         if (simCheck is { Performed: true })
                             trace.Add($"Unity 預覽的 bitmap 比對{(simCheck.Passed ? "通過" : "未通過")}（重疊率 {simCheck.OverlapRatio * 100:F0}%）");
+                        if (execution2d.Completed && simCheck is { Performed: true, Passed: true })
+                        {
+                            success = true;
+                            status = "success";
+                            attemptOutcomes.Add("success");
+                            trace.Add("bitmap overlap 達標，本次任務結束");
+                            Save(dir, "attempt_result.json", new { attempt, success = true,
+                                success_basis = "unity_bitmap_overlap", overlap_ratio = simCheck.OverlapRatio,
+                                robot_operations = 0 });
+                            File.WriteAllText(Path.Combine(dir, "feedback.txt"), string.Join(" → ", trace));
+                            Console.WriteLine($"[實驗] 成功！第 {attempt} 輪 bitmap 重疊率 {simCheck.OverlapRatio * 100:F0}%，本次任務結束。");
+                            break;
+                        }
                         if (!execution2d.Completed)
                         {
                             if (simCheck is { Performed: true, Passed: false, VerificationEnabled: true })

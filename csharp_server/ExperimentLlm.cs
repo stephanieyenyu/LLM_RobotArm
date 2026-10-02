@@ -21,23 +21,23 @@ public sealed class ExperimentLlm
     const string CoordinateDirections = "QR 工作座標方向：+X=左、-X=右、+Y=後、-Y=前、+Z=上、-Z=下；方向詞一律依 QR 工作座標解讀，不依相機畫面方向。";
     // 夾爪幾何是設備事實，不是解法（2026-09-30 實測：張開時內側約 3.5 cm）
     const string GripperFacts = "夾爪為平行雙指，每根手指厚約 0.015 m、寬約 0.015 m；張開時兩指內側間距只有約 0.035 m：只跨得住物件 0.025 m 寬的邊，跨不住 domino 的 0.05 m 長邊。夾 cube 時兩指落在 cube 的 ±X 兩側；夾 domino 時系統會轉動夾爪讓兩指跨住短邊、落在長邊兩側（horizontal domino 在 ±Y 兩側，vertical domino 在 ±X 兩側）。descend 夾取或放置時，兩指會下降到物件在閉合方向上的兩側：每根手指內側離物件表面只有約 0.005 m、外側離物件中心約 0.0325 m，垂直閉合方向只佔物件中心線兩側各約 0.0075 m；旁邊物件的佔地碰到這兩塊手指範圍就會被撞到，例如閉合方向上相鄰的兩個 cube，中心要相距約 0.045 m 以上。只能夾取上方沒有其他物件的物件。";
-    // 桌面與手臂可達範圍是設備事實（2026-10-01 用 2D 規劃器掃整張桌面：目標離基座 0.20–0.48 m 全部規劃得到，
-    // 0.18 m 以內、0.50 m 以外到不了）
-    const string WorkspaceFacts = "桌面工作區是 QR1～QR4 標記圍成的矩形 X=0.000..0.805 m、Y=0.000..0.371 m，相機在這個範圍內量得到物件位置。手臂基座在 QR (0.393, 0.357)；物件中心離基座約 0.20～0.48 m 時手臂夾放得到，更近或更遠的位置手臂到不了，路徑檢查會退回。";
+    // 桌面座標資訊
+    const string WorkspaceFacts = "桌面工作區是 QR1～QR4 標記圍成的矩形 X=0.000..0.805 m、Y=0.000..0.371 m，相機在這個範圍內量得到物件位置。手臂基座在 QR 工作座標 (X=0.393 m, Y=0.357 m)。";
     // 排圖形的驗收條件（不劃擺放區，但圖形要排在空的地方）；規劃、反思與整體驗證看到的是同一句
     const string FigureAcceptance = "目標要求排出圖形（字母、形狀等）時，驗收條件是圖形排在桌面上空著的地方：組成圖形的物件要跟沒有用到的物件明顯分開，不能夾雜在其他物件之間，圖形要能單獨被辨認出來。本架構沒有跨輪次的記憶，每一輪都是從頭開始的獨立新嘗試，不會接續上一輪已經排好的部分；因此這個圖形需要的所有積木都必須在同一輪 operation plan 裡一次全部規劃、一次全部執行完，不能只規劃其中一部分、留到下一輪才排剩下的，否則永遠不會有一輪是完整的圖形。";
     // 純模擬沒開 Isaac Sim 時，附圖是 TopViewRenderer 依座標畫的示意圖（Program 每個任務開始時設定）
     public bool SchematicImage { get; set; }
-    const string SchematicImageNote = "附圖是程式依目前場景座標畫的俯視示意圖（純模擬沒開 Isaac Sim），不是相機照片：上方 = +Y、右方 = +X，方塊上的數字是場景 index，灰色圓弧是手臂可達範圍。";
+    public bool CanonicalBitmap { get; set; }
+    const string SchematicImageNote = "附圖是程式依目前場景座標畫的俯視示意圖（純模擬沒開 Isaac Sim），不是相機照片：上方 = +Y、右方 = +X，方塊上的數字是場景 index。";
     string ImageNote => SchematicImage ? SchematicImageNote : "";
     // 排字母的規範：每個字母最多 5×5 格、要能辨識；方向以相機畫面為準（跟 terminal 印的 bitmap、整體驗證看的畫面相同）
     const string LetterDesign = "在桌面上排字母時，每個字母設計在最多 5×5 的方格上（高最多 5 格、寬最多 5 格）：每個方向用固定的格距（相鄰格的中心距，格距要讓手指放得下，見夾爪事實），每一格放一個 cube，domino 佔同一排相鄰的兩格；筆畫要像 5×5 點陣字一樣足以辨識是哪個字母。字母是否正立直接用 X/Y 座標數值判斷，這跟前面方向詞（左右前後）的定義是分開的兩件事，不要混用：相機畫面上方對應 Y 值較大、下方對應 Y 值較小；畫面右方對應 X 值較大、左方對應 X 值較小。字母要在這個座標對應下正立，不能上下或左右顛倒——例如正立的大寫 L：直筆畫沿 Y 方向排列，橫筆畫接在直筆畫 Y 值最小（畫面最下方）的那一端，往 X 值變大（畫面右方）的方向延伸；橫筆畫不能接在 Y 值最大（畫面最上方）的那一端，否則會變成上下顛倒的字母。";
     static string SceneText(List<SceneObject> scene) => JsonSerializer.Serialize(scene.Select((item, index) => new { index, item }));
     public Task<string> Decompose(string goal, List<SceneObject> scene, string feedback, byte[]? image, string dir) => Call(Role,
-        $"目標：{goal}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n環境：{CoordinateDirections}{WorkspaceFacts}{FigureAcceptance}{LetterDesign}{ImageNote}\n注意：index 只代表這一張目前場景清單的位置，每次重新觀測都可能重排，不能當作跨輪次的物件身分。請自行拆解本輪的子任務，以自然語言描述。", image, dir, "decomposition");
+        $"目標：{goal}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n環境：{CoordinateDirections}{WorkspaceFacts}{FigureAcceptance}{(CanonicalBitmap ? "" : LetterDesign)}{ImageNote}\n注意：index 只代表這一張目前場景清單的位置，每次重新觀測都可能重排，不能當作跨輪次的物件身分。請自行拆解本輪的子任務，以自然語言描述。若本輪子任務需要在桌面排出平面字母、符號或圖形，另以獨立一行寫「需要平面 bitmap」，圖形會由雙 LLM 生成；其他任務不寫此行。", image, dir, "decomposition");
     public Task<string> Plan(string goal, List<SceneObject> scene, string hierarchy, string feedback, byte[]? image, string dir) => Call(Role,
         $"目標：{goal}\n子任務：{hierarchy}\n目前場景：{SceneText(scene)}\n上次結果：{feedback}\n" +
-        $"環境：QR 座標為公尺，X/Y 在桌面上，Z 向上；物件 Z 為頂面高度。{CoordinateDirections}cube 尺寸 0.025m，domino 為 0.05×0.025×0.025m。{WorkspaceFacts}{FigureAcceptance}{LetterDesign}{ImageNote}場景 index 只適用本輪目前清單，重新觀測後可能重排。\n" +
+        $"環境：QR 座標為公尺，X/Y 在桌面上，Z 向上；物件 Z 為頂面高度。{CoordinateDirections}cube 尺寸 0.025m，domino 為 0.05×0.025×0.025m。{WorkspaceFacts}{FigureAcceptance}{(CanonicalBitmap ? "" : LetterDesign)}{ImageNote}場景 index 只適用本輪目前清單，重新觀測後可能重排。\n" +
         "每一輪 operation plan 都必須在文字中完整列出每個 target 的實際 (x,y,z) 數值；不得只寫「沿用 P0~P4」、「維持既定目標點」或其他需要查舊輪上下文的代號。\n" +
         "執行介面提供 move_above(location,height_m)、descend(location)、grasp()、release()、lift(location,height_m)、wait(seconds)。location 可為 source 或 target；source 是本次操作所選的來源物件，target 是把來源物件放到的位置，target 的 Z 指來源物件放好後的頂面高度（與場景物件 Z 同一慣例）；height_m 是端點上方的距離。" +
         "參數範圍：height_m 0.05～0.15 m，seconds 0.1～3；單次最多 50 個操作，每個操作最多 20 個函式。同一個操作內的函式依序執行，中途不會重新感知；每個操作開始前系統會重新觀測來源物件位置。" +

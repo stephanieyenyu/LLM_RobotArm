@@ -1,10 +1,14 @@
-﻿# LLM_RobotArm
+# LLM_RobotArm
 
 以中文自然語言指令控制 UR3e 機械手臂的框架。RealSense D435i 即時偵測工作台物件 → OpenAI gpt-5 解析指令 → Unity 送 URScript 到手臂。
 
 目前採自由規劃與失敗反思實驗流程；每個任務以收到指令時的桌面為起點（設 `FIXED_BASELINE=1` 則要求每個任務先恢復同一個固定配置），任務內不重置，最多嘗試十次。操作方式、重置基準與評分限制見 [實驗協定](docs/experiment_protocol.md)。
 
 ## 系統流程
+
+2D 圖形的 bitmap 生成採用 `LLM_RobotArm.zip` 的 `PatternDesigner` 雙模型流程：OpenAI（gpt-5）與 Gemini 各自生成、互相審查並提供修正版，多個候選以 OpenAI 80% / Gemini 20% 匿名評分選出，最多兩輪。需設定 `OPENAI_API_KEY` 與 `GEMINI_API_KEY`；`GEMINI_MODEL` 可覆寫 zip 預設的 `gemini-3.1-flash-lite`。選出的圖形存於每輪的 `canonical_bitmap.json`。bitmap 最多 5 列 × 5 欄，生成候選與審查修正版均受尺寸檢查；庫存計算包含目前場景全部積木，不劃供料區，也不由程式預選顏色。
+
+後續 LLM 依目前場景自行找空位、選來源積木並決定原點、X/Y 格距與放置座標；以 `bitmap_grid(left_x, top_y, cell_x, cell_y, top_z)` 描述自行選出的座標系，記錄在 `bitmap_layout.json`。程式只將原始 bitmap 映射到該座標系供 Unity 比對，不再固定 target 或執行前強制對齊固定座標。Unity 跑完整批模擬及手臂收尾後，在還原積木之前拍攝覆蓋率照片；拍攝期間排除手臂模型與其陰影。模擬畫面轉成 bitmap，再與原始目標 bitmap 比較 overlap，公式與門檻維持原樣。比對通過就顯示成功並結束本次任務，不再送出手臂動作、不呼叫 global_validation、不進入下一輪；服務繼續等待新的使用者指令。
 
 ```
 Unity UI（輸入指令）

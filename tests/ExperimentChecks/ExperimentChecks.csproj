@@ -1,6 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="OpenAI" Version="2.11.0" />
+    <Compile Include="../../csharp_server/PatternDesigner.cs" Link="PatternDesigner.cs" />
+    <Compile Include="../../csharp_server/BitmapParser.cs" Link="BitmapParser.cs" />
+    <Compile Include="../../csharp_server/LayoutRealizer.cs" Link="LayoutRealizer.cs" />
+    <Compile Include="../../csharp_server/DualBitmapPlan.cs" Link="DualBitmapPlan.cs" />
     <Compile Include="../../csharp_server/ExperimentChecks.cs" Link="ExperimentChecks.cs" />
     <Compile Include="../../csharp_server/ExperimentMetrics.cs" Link="ExperimentMetrics.cs" />
     <Compile Include="../../csharp_server/NaturalLanguagePlanAdapter.cs" Link="NaturalLanguagePlanAdapter.cs" />

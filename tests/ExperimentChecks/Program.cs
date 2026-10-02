@@ -3,6 +3,26 @@ int passed = 0;
 void Check(bool condition, string name) { if (!condition) throw new Exception(name); Console.WriteLine("PASS " + name); passed++; }
 SceneObject Piece(double x) => new() { Name = "yellow_cube", Shape = "cube", X = x, Y = 0.1, Z = 0.025 };
 var baseline = new List<SceneObject> { Piece(0.1), Piece(0.15) };
+var canonicalPlan = new DualBitmapPlan { Rows = new() { "■□", "■■" } };
+var freeLayout = canonicalPlan.ForUnity("bitmap_grid(0.60, 0.15, 0.045, 0.035, 0.025)");
+Check(freeLayout.Cells.Count == 3 && freeLayout.Cells[0].X == 0.60 && freeLayout.Cells[0].Y == 0.15,
+    "bitmap placement uses the LLM-selected origin without a fixed placement zone");
+Check(Math.Abs(freeLayout.Cells[2].X - 0.645) < 1e-9 && Math.Abs(freeLayout.Cells[2].Y - 0.115) < 1e-9 &&
+    freeLayout.CellXM == 0.045 && freeLayout.CellYM == 0.035,
+    "LLM independently chooses X and Y spacing while canonical row orientation is preserved");
+Check(freeLayout.Rows.SequenceEqual(canonicalPlan.Rows) && !freeLayout.Cells.Any(c => c.Row == 0 && c.Col == 1),
+    "Unity receives the original bitmap including its empty cell, independently of operation targets");
+var otherLayout = canonicalPlan.ForUnity("bitmap_grid(0.1, 0.3, 0.06, 0.05, 0.025)");
+Check(otherLayout.Cells[0].X == 0.1 && otherLayout.Cells[0].Y == 0.3 && otherLayout.Rows.SequenceEqual(freeLayout.Rows),
+    "free placement accepts another location without changing selected bitmap");
+bool missingFrameRejected = false;
+try { canonicalPlan.ForUnity("no coordinate frame"); } catch (TranslationContractException) { missingFrameRejected = true; }
+Check(missingFrameRejected, "missing coordinate frame is reported instead of inventing placement");
+bool badSpacingRejected = false;
+try { canonicalPlan.ForUnity("bitmap_grid(0.1, 0.3, 0, 0.05, 0.025)"); } catch (TranslationContractException) { badSpacingRejected = true; }
+Check(badSpacingRejected, "invalid zero grid spacing is rejected as an interface error");
+Check(!canonicalPlan.PlanningConstraint.Contains("X <") && !canonicalPlan.PlanningConstraint.Contains("Targets:"),
+    "placement prompt does not impose supply zoning or fixed target coordinates");
 Check(ExperimentChecks.Matches(baseline, new[] { Piece(0.15), Piece(0.1) }), "reset matching ignores detection order");
 Check(!ExperimentChecks.Matches(baseline, new[] { Piece(0.1), Piece(0.1) }), "duplicate detection cannot satisfy two baseline pieces");
 Check(!ExperimentChecks.Matches(baseline, new[] { Piece(0.1), Piece(0.2) }), "changed state fails reset gate");
@@ -352,3 +372,5 @@ public sealed class TranslatedPlan
     public string Error { get; set; } = "";
     public List<TranslatedStep> Steps { get; set; } = new();
 }
+
+public sealed class TranslationContractException : Exception { public TranslationContractException(string message, Exception inner) : base(message, inner) {} }
