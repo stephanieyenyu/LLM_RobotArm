@@ -133,7 +133,8 @@ if (dominosNeeded > dominoBudget)
         };
     }
 
-    private static bool AreTargetsWithinSafeReach(
+    // 立體的 SpatialLayoutRealizer 也用同一套可達檢查
+    internal static bool AreTargetsWithinSafeReach(
         IReadOnlyList<TargetCell> targets, WorkspaceBounds ws)
     {
         const double qrToRobotX = -0.38824;

@@ -79,17 +79,41 @@ public class RobotArm : MonoBehaviour
             UnityEngine.Debug.Log($"[RobotArm] Startup Angles set to home: [{string.Join(", ", Angles)}]°");
         }
 
-        // 自動連線（若 Inspector 有填 autoConnectIP）
-        if (!string.IsNullOrWhiteSpace(autoConnectIP))
+        // 自動連線（若 Inspector 有填 autoConnectIP）；純模擬時改跟隨 URSim
+        string followIP = FollowIP();
+        if (!string.IsNullOrWhiteSpace(followIP))
         {
-            urListener.Connect(autoConnectIP);
-            UnityEngine.Debug.Log($"[RobotArm] Auto-connecting to {autoConnectIP}");
+            urListener.Connect(followIP);
+            UnityEngine.Debug.Log($"[RobotArm] Auto-connecting to {followIP}");
         }
+        RunMode.Changed += OnRunModeChanged;
     }
 
     private void OnDestroy()
     {
+        RunMode.Changed -= OnRunModeChanged;
         urListener?.Close();
+    }
+
+    // Unity 手臂跟隨的對象：實機模式是 autoConnectIP（留空 = 不跟隨），純模擬是 JsonExecutor 的 Ursim IP
+    string FollowIP()
+    {
+        if (string.IsNullOrWhiteSpace(autoConnectIP) || !RunMode.IsSim) return autoConnectIP;
+        var executor = FindObjectOfType<JsonExecutor>();
+        return executor != null && !string.IsNullOrWhiteSpace(executor.ursimIP) ? executor.ursimIP : autoConnectIP;
+    }
+
+    // 切換純模擬 / 實機：改跟隨對應的手臂
+    void OnRunModeChanged()
+    {
+        urListener?.Close();
+        urListener = new URPackageListener();
+        string followIP = FollowIP();
+        if (!string.IsNullOrWhiteSpace(followIP))
+        {
+            urListener.Connect(followIP);
+            UnityEngine.Debug.Log($"[RobotArm] 改跟隨 {followIP}");
+        }
     }
 
     // 決定 Angles=0 的基準姿態。
@@ -183,6 +207,13 @@ public class RobotArm : MonoBehaviour
         }
     }
 
+    // 依關節角算各節姿勢要用的基準（ArmMeshSelfCollision 用；只讀，不改動手臂本身）
+    public Quaternion RestRotation(int i)
+    {
+        EnsureBaseline();
+        return startRotations[i];
+    }
+    public static Vector3 AxisVector(Axis axis) => axisTovector3(axis);
     static Vector3 axisTovector3(Axis axis)
     {
         switch (axis)

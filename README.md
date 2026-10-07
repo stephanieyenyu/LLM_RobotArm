@@ -28,14 +28,19 @@ UR3e
 ## 檔案總覽
 
 **csharp_server/**
-- `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP
+- `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP（`/camera` 提供相機內參與位姿給 Isaac Sim）
 - `Program.cs` — 監聽 user_input.txt、路由任務、執行感知/規劃/驗證閉環
 - `CommandRouter.cs` — LLM 判斷排圖、相對移動或疊放
 - `PatternDesigner.cs` — OpenAI 與 Gemini 各自生成 bitmap、互審對方候選後選出結果
 - `SingleObjectTaskBuilder.cs` — 用確定性幾何計算相對移動與疊放座標
+- `SpatialPatternDesigner.cs` — 立體字的俯視高度圖（column_heights）：跟 2D 一樣 OpenAI 與 Gemini 各畫一張、互審正面圖、80/20 投票（只剩一張也要打分達 0.5）；pattern審查關閉時只用 OpenAI
+- `SimulationImageJudge.cs` — 3D 模擬驗證最後一關：LLM 看 Isaac 模擬畫面判 PASS / FAIL
+- `IsaacSimVerifier.cs` — 3D 模擬驗證：把場景投影到 Isaac Sim、URSim 跑完後取得幾何檢查結果
+- `SpatialLayoutRealizer.cs` — 立體的固定布局：高度圖 → 每一格每一層的 target（固定原點、固定格距、層高寫死），檢查庫存與可達範圍
 - `MotionPlanner.cs` — LLM 使用白名單 robot functions 規劃動作
 - `MotionPlanValidator.cs` — 執行前安全狀態機驗證
 - `RobotPlan.cs` — plan / SceneObject 資料類別
+- `RunModeConfig.cs` — 純模擬 / 實機切換（`run_mode.json`）與虛擬場景檔讀取
 - `models/pliers.pt`、`yolo11n.pt` — YOLO 權重
 - `QRcode/aruco_1~4.png` — 可列印定位碼
 
@@ -44,6 +49,52 @@ UR3e
 - `JsonExecutor.cs` — 解譯 LLM robot function sequence、送 URScript
 - `URPackageListener.cs` — UR TCP client（port 30002）
 - `URUtil.cs`、`Util.cs` — 封包型別工具
+- `RunMode.cs`、`SimSceneFile.cs` — 純模擬 / 實機按鈕的狀態檔與虛擬場景檔（載入 Isaac Sim）
+
+## 3D 排立體圖形（2026-10-07 補齊，跟 2D 同一套規則）
+
+CommandRouter 判斷為 `arrange_3d_pattern`（指令明確說立體、3D、upright、vertical）時：
+
+1. **Layer 1 設計**：`SpatialPatternDesigner` 在 1 列 × 3 欄 × 3 層的畫布上畫俯視高度圖（數字 = 那格疊幾層），雙模型互審與投票同 2D；庫存跟 2D 一樣只算補貨區（X 0.05..0.35、Y 0.02..0.25 m）內、安全可達的同色 cube。terminal 印高度圖與正面圖，存成 `outputs/pattern3d_<id>.json`。
+2. **Layer 2 布局**：`SpatialLayoutRealizer` 寫死位置：第 c 欄 X = `TargetOriginX` + c × `SpatialCellSize`（0.49 + c × 0.052），Y = `SpatialTargetOriginY`（0.08）；第 k 層頂面 = k × 0.025 m。超出畫布、層數、庫存或 UR 目標半徑 0.18..0.48 m 就停止，不自動平移。
+3. **Layer 3 分派與順序**：先鋪第 1 層，用 2D 的 `TaskAssigner`（遠端優先、補貨區裡離目標最近的 cube、不拿已規劃的格子）；第 2 層起整層疊完才疊下一層，同層也是遠端優先，來源與放開高度照 `SingleObjectTaskBuilder.BuildStackOntoLocation`（補貨區最低、最近的 cube；目標高度 = 累積塔頂 + 來源高度 + 0.008 m 放開間隙）。任何一格排不出來就整批取消，不送半成品。
+4. **Layer 4 動作**：每一步由 `MotionPlanner` 組白名單函式，`MotionPlanValidator` 檢查（疊放要有足夠的高度）。
+5. **Unity 比對**：整批附上每一層的預期格（格距用 `SpatialCellSize`），模擬結束逐塊比對位置、高度、是否在空中放開；同一格疊好幾塊時配對會把高度差算進去，結果印每格放對幾層。「Unity驗證：開」時不通過就不讓手臂動，「關」時只記錄。
+6. **3D 分層夾取**：3D 批次帶 `layered_grasp`，Unity 用實測指尖長度 179 mm、實測桌面高度（QR1_Z − 30 mm）規劃，夾取與放置時指尖停在積木真實頂面下 19 mm（頂面高度由 server 依固定布局給 `source_top_m` / `target_top_m`），碰撞模型的手指段只檢查指尖離桌 3 mm；數字在 `LayeredGraspGeometry.cs`，Unity 與 server 共用。
+7. **手臂自撞**：3D 批次規劃時自撞改用畫面上手臂與夾爪模型的外型（`ArmMeshSelfCollision.cs`，手臂與夾爪的 .dae/.obj 已開 Read/Write）；Isaac 驗證期間也用 USD 碰撞體檢查自撞。
+8. **模擬驗證（URSim + Isaac Sim）**：整批先以 `robot_target = "ursim"` 只在 URSim 執行（Unity 先預覽並比對，通過才讓 URSim 動），Isaac Sim 的手臂即時跟隨 URSim、積木用物理模擬；URSim 跑完 Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定、指尖撞桌、手臂自撞），通過後再讓 LLM 看 Isaac 的模擬畫面判定（`SimulationImageJudge.cs`，system prompt 是 main 的獨立結果驗證者原文，第一行 PASS 才算通過）。驗證開始時 server 讀 perception_server 的 `/camera`（相機內參與相機在 QR 座標系的位姿），Isaac 把模擬相機擺到跟實體相機同一個位置，畫面判定看到的角度才跟實體相機一致；讀不到時沿用 Isaac 上次的相機。全部通過才把同一批（同樣的步驟與高度、`skip_preview` 不再預覽）送實體手臂；任何一關沒過、或 Isaac / URSim 不可用，實體手臂都不動。Isaac 驗證不受「Unity驗證」開關影響。紀錄存在 `csharp_server/outputs/isaac_<時間>_<pattern>/`。
+
+3D 要先開 URSim（VirtualBox 裡開 URSim UR3，按開機、啟動）與 Isaac Sim（repo 根目錄）：
+```powershell
+D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui
+```
+Unity Inspector 的 JsonExecutor 有 `Ursim IP`（預設 192.168.50.221）；Isaac Sim 在別台電腦時，csharp_server 那邊 `setx ISAAC_SIM_URL "http://<IP>:6000/"`。
+
+## 純模擬（不用相機、實體手臂不動）
+
+Unity 指令列的「模式：實機 / 模式：純模擬」按鈕切換（寫 `unity_project/Assets/StreamingAssets/run_mode.json`），
+csharp_server 每個指令開始時讀一次，整個任務用同一個模式（2026-10-07 從 main 搬來）：
+
+- **場景**：不讀 perception_server，改讀 Isaac Sim 的 `/perception/scene`（格式相同）。每個指令開始時用虛擬場景檔重建 Isaac 世界
+  （`reset_each_task` 預設 true；false 時接續上一個任務的模擬結果）。
+- **動作**：每一批、每一步都標 `robot_target = "ursim"`，Unity 只送 URSim，Isaac 的手臂跟隨 URSim、積木用物理模擬；
+  手動按鈕（鬆開 / 夾緊 / 回 Home）也只動 URSim，Unity 的手臂跟隨 URSim。Unity 那邊切成純模擬時，就算 server 送來沒標的批次也只會送 URSim。
+- **規則不變**：2D、3D、相對移動、疊放都走跟實機一樣的流程（Unity 預覽與比對、MotionPlanValidator、每步之後重讀場景驗證）。
+- **3D 模擬驗證**：Isaac 本身就是世界，不重新投影（`use_current_world`）；驗證前記下積木位姿（`/sim/snapshot`），
+  驗證結束不論通過與否都放回去（`/sim/restore`），通過後「正式執行」也送 URSim。相機是載入場景時設定的（場景檔的 `camera`，
+  沒給就用 `sim_scenes/camera/default.json`，也就是實機相機的位姿）。
+- **虛擬場景檔**：repo 根目錄 `sim_scenes/*.json`，純模擬時 Unity 多一顆「場景：…」按鈕輪流切換。預設
+  `supply_cubes.json`：15 塊黃方塊排在供料區（X 0.05～0.35、Y 0.02～0.25，間距 6 cm），2D／3D 目標區留空；
+  另有 `two_cubes.json`、`domino_cubes.json`。座標是 QR 座標（公尺），`z` 是頂面高度。
+
+純模擬要開 URSim 與 Isaac Sim（`--ursim_ip` 一定要給，Isaac 才會跟隨 URSim），不用開 perception_server：
+```powershell
+D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui
+cd csharp_server
+dotnet run
+```
+csharp_server 啟動時連不上 perception_server 只會提示、不會結束；實機模式的指令才需要它。連不上 Isaac 時純模擬的指令不執行，
+console 會印原因。
 
 ## 前置
 
@@ -108,7 +159,7 @@ SAFE_Z_OFFSET = 0.08f // 抓取前後在物件上方留 8cm 安全空間
 
 ## 常見問題
 
-- **「無法連線 perception_server」** → Terminal 1 沒起或還在載入 model
+- **「無法連線 perception_server」** → Terminal 1 沒起或還在載入 model；不用相機時把 Unity 切成「模式：純模擬」（見上方純模擬）
 - **「場景中沒有帶有效座標的物件」** → QR1-3 沒都在鏡頭裡
 - **等待 robot_plan.json 逾時（120 秒）** → OpenAI API 慢
 - **手臂完全不動** → Teach Pendant 沒切 Remote Control、速度滑桿在 0、或 IP 錯

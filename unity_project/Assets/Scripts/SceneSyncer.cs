@@ -1,5 +1,7 @@
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using UnityEngine;
 using UnityEngine.Networking;
 
@@ -11,6 +13,12 @@ using UnityEngine.Networking;
 //   2. 若 mode == "executing" → 完全不動 cube（虛擬夾爪負責視覺）
 //   3. 若 mode == "idle" 且上次是 executing（或首次啟動）→ GET /scene 一次，refresh 所有 cube
 //   4. 否則什麼都不做（perception 端持續在更新，但 Unity 不覆蓋顯示）
+//
+// 切換實機 / 純模擬（RunMode.Changed，2026-10-07 從 main 搬來，沒有 main 的內建虛擬世界）：
+//   純模擬（切過去或換場景）：馬上顯示場景檔的積木，同時把場景檔載入 Isaac Sim（/sim/load，載入中不輪詢），
+//     載入完下一次輪詢改顯示 Isaac 回報的位置（/perception/scene）。Isaac 連不上就先留著場景檔的積木；
+//     之後連上時 Isaac 若還沒有積木（剛啟動）會自動載入一次。
+//   切回實機：先清掉模擬的積木，相機場景抓到之前畫面不留模擬的東西。
 //
 // 座標系轉換（跟 Unity UR3 base 目前朝向對齊）：
 //   Robot/QR 是右手系 Z-up（X 前伸、Y 左、Z 上）
@@ -86,17 +94,129 @@ public class SceneSyncer : MonoBehaviour
     private Transform cubeContainer;
     private List<GameObject> currentCubes = new List<GameObject>();
     private string previousMode = null;                          // 上次 poll 到的 mode（首次為 null）
+    private string lastUnreachableUrl = null;                    // 連不上的網址只提示一次
+    private bool lastIsSim;                                      // 上一次的模式，判斷是不是從純模擬切回實機
+    private int sourceGeneration = 0;                            // 每次切換模式 / 換場景 +1，舊來源晚到的回應直接丟掉
+    private int loadingGeneration = -1;                          // 正在把場景檔載入 Isaac 的那一次（載入中不輪詢）
+    private int emptyLoadGeneration = -1;                        // Isaac 沒有積木時自動載入，每次切換只試一次
 
     // 給 SyncGripper 讀，讓虛擬夾爪找最近的 cube
     public List<GameObject> GetCurrentCubes() { return currentCubes; }
     public Transform GetCubeContainer() { return cubeContainer; }
+
+    // 純模擬（RunMode.IsSim）時場景來自 Isaac Sim（格式同 perception_server）；實機模式用 Inspector 的網址
+    string EffectiveSceneUrl => RunMode.IsSim ? RunMode.SimPerceptionUrl + "scene" : sceneUrl;
+    string EffectiveSceneModeUrl => RunMode.IsSim ? RunMode.SimPerceptionUrl + "scene/mode" : sceneModeUrl;
 
     void Start()
     {
         if (autoCreateWorkspace)
             BuildWorkspaceVisuals();
 
+        lastIsSim = RunMode.IsSim;
+        RunMode.Changed += OnRunModeChanged;
+        // 純模擬下重開 Unity：桌面重置成場景檔，不沿用上次留下的模擬結果
+        if (RunMode.IsSim)
+            StartCoroutine(LoadSimWorld(sourceGeneration));
         StartCoroutine(PollLoop());
+    }
+
+    void OnDestroy()
+    {
+        RunMode.Changed -= OnRunModeChanged;
+    }
+
+    // 換了資料來源：下一次輪詢當成首次連線，重新抓一次場景（純模擬另外先載入場景檔，見檔頭說明）
+    void OnRunModeChanged()
+    {
+        bool wasSim = lastIsSim;
+        lastIsSim = RunMode.IsSim;
+        sourceGeneration++;
+        previousMode = null;
+        if (RunMode.IsSim)
+            StartCoroutine(LoadSimWorld(sourceGeneration));
+        else if (wasSim)
+            ApplyObjects(new SceneObjectInfo[0]);
+    }
+
+    // 把目前的場景檔載入 Isaac Sim：先顯示場景檔的積木，載入成功後讓下一次輪詢抓 Isaac 的場景（物理落定後的位置）。
+    // 從呼叫當下就標記載入中（StartCoroutine 會同步跑到第一個 yield），已經在等回應的舊輪詢也不會蓋掉畫面。
+    IEnumerator LoadSimWorld(int generation)
+    {
+        loadingGeneration = generation;
+        try
+        {
+            yield return null;   // 等 UI 先顯示切換訊息，載入結果的訊息才不會被蓋掉
+            if (generation != sourceGeneration) yield break;
+            string scene = RunMode.Scene;
+            string body;
+            List<SimSceneFile.Block> blocks;
+            try
+            {
+                body = SimSceneFile.BuildLoadRequest(RunMode.ScenePath, out blocks);
+            }
+            catch (System.Exception ex)
+            {
+                Report($"讀不了虛擬場景檔 {scene}：{ex.Message}");
+                yield break;
+            }
+            ApplyObjects(blocks.Select(ToSceneObject).ToArray());
+
+            string url = RunMode.SimServerUrl + "sim/load";
+            using (UnityWebRequest req = new UnityWebRequest(url, "POST"))
+            {
+                req.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
+                req.downloadHandler = new DownloadHandlerBuffer();
+                req.SetRequestHeader("Content-Type", "application/json");
+                req.timeout = 60;
+                yield return req.SendWebRequest();
+                if (generation != sourceGeneration) yield break;   // 載入途中又切換了
+
+                if (req.result == UnityWebRequest.Result.Success)
+                {
+                    var result = JsonUtility.FromJson<SimLoadResponse>(req.downloadHandler.text);
+                    string warnings = result.warnings != null && result.warnings.Length > 0
+                        ? " 注意：" + string.Join("；", result.warnings) : "";
+                    Report($"已把 {scene} 載入 Isaac Sim（{result.simulated} 塊積木）。{warnings}");
+                    previousMode = null;
+                }
+                else if (req.result == UnityWebRequest.Result.ConnectionError)
+                {
+                    Report($"連不上 Isaac Sim（{url}：{req.error}）。畫面先顯示場景檔 {scene}；純模擬要開 isaac_sim_server" +
+                           "（--ursim_ip <URSim IP>）與 URSim，開好後會自動載入。");
+                }
+                else
+                {
+                    string error = req.error;
+                    try { error = JsonUtility.FromJson<ErrorResponse>(req.downloadHandler.text).error ?? error; }
+                    catch (System.Exception) { }
+                    Report($"Isaac Sim 沒有載入 {scene}：{error}。畫面改顯示 Isaac 目前的世界。");
+                    previousMode = null;
+                }
+            }
+        }
+        finally
+        {
+            if (loadingGeneration == generation) loadingGeneration = -1;
+        }
+    }
+
+    static SceneObjectInfo ToSceneObject(SimSceneFile.Block b) => new SceneObjectInfo
+    {
+        name = b.name ?? "",
+        confidence = 1f,
+        source = "sim_scene_file",
+        shape = b.shape,
+        orientation = b.orientation,
+        position = new ScenePosition { source = "sim_scene_file", x = b.x, y = b.y, z = b.z },
+    };
+
+    // 切換結果顯示在 UI 的狀態列（UIManager），同時寫 Console
+    void Report(string message)
+    {
+        Debug.Log("[SceneSyncer] " + message);
+        var ui = FindObjectOfType<UIManager>();
+        if (ui != null) ui.ShowMessage(message);
     }
 
     // ==========================================================
@@ -170,6 +290,14 @@ public class SceneSyncer : MonoBehaviour
 
     }
 
+    // 桌面高度微調（公尺，負值 = 桌面往下）：JsonExecutor 在 3D 批次（layered_grasp）預覽與執行期間
+    // 把桌面、QR 標記與積木整組移到實測的高度，跑完傳 0 回到原位。只改畫面位置，積木的 QR 座標不變。
+    public void SetTableHeightOffset(float offsetM)
+    {
+        if (workspaceRoot == null) return;
+        workspaceRoot.localPosition = -QRToUnity(armBaseAtQrX, armBaseAtQrY, armBaseAtQrZ - offsetM);
+    }
+
     // 讓外部（JsonExecutor 模擬預覽）依 QR frame 座標找最近的 cube
     // qrPos: 感知/csharp_server 用的 QR frame (x=水平寬, y=水平深, z=高)
     public GameObject FindNearestCube(float qrX, float qrY, float qrZ, float maxDistM = 0.10f)
@@ -238,17 +366,27 @@ public class SceneSyncer : MonoBehaviour
 
     IEnumerator FetchModeAndMaybeRefresh()
     {
-        using (UnityWebRequest req = UnityWebRequest.Get(sceneModeUrl))
+        if (loadingGeneration == sourceGeneration)
+            yield break;   // 場景檔正在載入 Isaac，先不要抓到舊世界
+        int generation = sourceGeneration;
+        string modeUrl = EffectiveSceneModeUrl;
+        using (UnityWebRequest req = UnityWebRequest.Get(modeUrl))
         {
             req.timeout = 3;
             yield return req.SendWebRequest();
+            if (generation != sourceGeneration)
+                yield break;   // 等回應時切換了資料來源，這個回應屬於舊來源
 
             if (req.result != UnityWebRequest.Result.Success)
             {
-                if (previousMode == null)   // 完全連不上，第一次就 log
-                    Debug.LogWarning($"[SceneSyncer] 連不上 {sceneModeUrl}：{req.error}");
+                if (previousMode == null && modeUrl != lastUnreachableUrl)   // 完全連不上，每個網址只 log 一次
+                {
+                    lastUnreachableUrl = modeUrl;
+                    Debug.LogWarning($"[SceneSyncer] 連不上 {modeUrl}：{req.error}");
+                }
                 yield break;
             }
+            lastUnreachableUrl = null;
 
             string currentMode = ParseMode(req.downloadHandler.text);
             if (string.IsNullOrEmpty(currentMode))
@@ -262,12 +400,12 @@ public class SceneSyncer : MonoBehaviour
             bool shouldRefresh = firstPoll || executingToIdle;
 
             if (firstPoll)
-                Debug.Log($"[SceneSyncer] 首次連上 perception，mode={currentMode}，抓一次 /scene");
+                Debug.Log($"[SceneSyncer] 首次連上 {(RunMode.IsSim ? "Isaac Sim（純模擬）" : "perception")}，mode={currentMode}，抓一次 /scene");
 
             previousMode = currentMode;
 
             if (shouldRefresh)
-                yield return StartCoroutine(FetchAndApplyScene());
+                yield return StartCoroutine(FetchAndApplyScene(generation));
         }
     }
 
@@ -285,12 +423,14 @@ public class SceneSyncer : MonoBehaviour
         }
     }
 
-    IEnumerator FetchAndApplyScene()
+    IEnumerator FetchAndApplyScene(int generation)
     {
-        using (UnityWebRequest req = UnityWebRequest.Get(sceneUrl))
+        using (UnityWebRequest req = UnityWebRequest.Get(EffectiveSceneUrl))
         {
             req.timeout = 3;
             yield return req.SendWebRequest();
+            if (generation != sourceGeneration)
+                yield break;
 
             if (req.result != UnityWebRequest.Result.Success)
             {
@@ -311,6 +451,14 @@ public class SceneSyncer : MonoBehaviour
 
             if (scene == null || scene.objects == null)
                 yield break;
+
+            // 純模擬時 Isaac 還沒有積木（剛啟動、還沒載入過）：把目前的場景檔載入一次
+            if (RunMode.IsSim && scene.objects.Length == 0 && emptyLoadGeneration != generation)
+            {
+                emptyLoadGeneration = generation;
+                yield return StartCoroutine(LoadSimWorld(generation));
+                yield break;
+            }
 
             ApplyObjects(scene.objects);
         }
@@ -420,5 +568,18 @@ public class SceneSyncer : MonoBehaviour
     public class ModeResponse
     {
         public string mode;
+    }
+
+    [System.Serializable]
+    class SimLoadResponse
+    {
+        public int simulated;
+        public string[] warnings;
+    }
+
+    [System.Serializable]
+    class ErrorResponse
+    {
+        public string error;
     }
 }

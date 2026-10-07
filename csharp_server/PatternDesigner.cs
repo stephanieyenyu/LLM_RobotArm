@@ -14,7 +14,8 @@ public sealed class PatternDesigner
     // 旗標檔由 Unity 指令列的「pattern審查」按鈕寫入（"1" = 跳過審查），
     // 每次 DesignAsync 都重讀一次，切換後不需要重開 csharp_server。
     const string SkipReviewFlagPath = "../unity_project/Assets/StreamingAssets/skip_pattern_review.txt";
-    static bool SkipReview
+    // 3D 的 SpatialPatternDesigner 也看這個開關
+    internal static bool SkipReview
     {
         get
         {
@@ -206,7 +207,8 @@ public sealed class PatternDesigner
         => ParseBallot(await CallGemini(
             BallotPrompt(), BallotRequest(command, candidates), BallotSchema()));
 
-    async Task<string> CallGemini(string system, string user, string schemaJson)
+    // 3D 的 SpatialPatternDesigner 共用這裡的 Gemini 連線
+    internal async Task<string> CallGemini(string system, string user, string schemaJson)
     {
         var body = new
         {
@@ -274,7 +276,7 @@ public sealed class PatternDesigner
         Review this candidate without seeing the other candidate.
         """;
 
-    static string BallotPrompt() => """
+    internal static string BallotPrompt() => """
         Score anonymized binary matrices against the original request.
         Judge each actual matrix independently by human visual recognizability and fidelity to the requested target.
         Candidate order and identity carry no meaning. Do not infer authorship.
@@ -418,7 +420,7 @@ public sealed class PatternDesigner
         },
         required = new[] { "accept", "recognizable", "confidence", "observed_as", "structural_problems", "suggested_changes", "has_revision", "revised_bitmap" },
     });
-    static string BallotSchema() => JsonSerializer.Serialize(new
+    internal static string BallotSchema() => JsonSerializer.Serialize(new
     {
         type = "object", additionalProperties = false,
         properties = new Dictionary<string, object>

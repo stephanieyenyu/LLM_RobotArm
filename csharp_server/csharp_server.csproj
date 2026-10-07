@@ -16,4 +16,9 @@
     <PackageReference Include="ZXing.Net" Version="0.16.11" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- 3D 分層夾取的層高、指尖長度跟 Unity 共用同一份 -->
+    <Compile Include="../unity_project/Assets/Scripts/LayeredGraspGeometry.cs" Link="LayeredGraspGeometry.cs" />
+  </ItemGroup>
+
 </Project>

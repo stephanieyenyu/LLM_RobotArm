@@ -1,0 +1,8 @@
+{
+  "description": "黑、黃方塊各一，都平放在桌面上（跟 2026-09-30 實機的配置相同）。z 是頂面高度：桌上一層 0.025 m。",
+  "objects": [
+    { "name": "black_cube", "shape": "cube", "x": 0.150, "y": 0.045, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.216, "y": 0.133, "z": 0.025, "orientation": null }
+  ],
+  "camera": null
+}

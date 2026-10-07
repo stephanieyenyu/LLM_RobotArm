@@ -1,9 +1,9 @@
 using UnityEngine;
 using UnityEngine.UIElements;
 using System.Collections;
-using System.Collections.Generic;
 using System.IO;
 
+[DefaultExecutionOrder(100)]
 public class UIManager : MonoBehaviour
 {
     public UIDocument uiDocument;
@@ -15,15 +15,62 @@ public class UIManager : MonoBehaviour
 
     private TextField inputField;
     private Button sendButton;
-    private Button verificationButton;
-    private Button patternReviewButton;
+    // pattern審查開關的目前狀態（從 skip_pattern_review.txt 讀回來；OnGUI 每幀用，不每幀讀檔）
+    private bool patternReviewEnabled = true;
+    // Unity驗證開關的目前狀態（從 verification_enabled.txt 讀回來；OnGUI 每幀用，不每幀讀檔）
+    private bool verificationEnabled = true;
     private Label statusLabel;
+    private Coroutine uiMonitor;
+    private string fallbackCommand = "";
 
     void OnEnable()
     {
-        var root = uiDocument.rootVisualElement;
+        // 下方備用指令列（OnGUI）也顯示 pattern審查狀態，不能等 UI Toolkit 面板建好才讀
+        patternReviewEnabled = ReadPatternReviewEnabled();
+        verificationEnabled = ReadVerificationEnabled();
+        // UIDocument may rebuild its root after OnEnable (including domain
+        // reload in Play Mode). Build only after its panel has been attached.
+        uiMonitor = StartCoroutine(EnsureUiReady());
+    }
+
+    IEnumerator EnsureUiReady()
+    {
+        yield return null;
+        if (uiDocument == null) uiDocument = GetComponent<UIDocument>();
+        if (uiDocument == null)
+        {
+            Debug.LogError("[UI] UIManager 缺少 UIDocument，無法建立輸入框。", this);
+            yield break;
+        }
+        while (isActiveAndEnabled)
+        {
+            var root = uiDocument.rootVisualElement;
+            if (root != null && root.panel != null && root.Q<VisualElement>("robot-manual-controls") == null)
+                BuildUi(root);
+            yield return new WaitForSecondsRealtime(0.25f);
+        }
+    }
+
+    void OnDisable()
+    {
+        if (uiMonitor != null) StopCoroutine(uiMonitor);
+        StopAllCoroutines();
+        uiMonitor = null;
+        var root = uiDocument != null ? uiDocument.rootVisualElement : null;
+        root?.Q<VisualElement>("robot-command-bar")?.RemoveFromHierarchy();
+        root?.Q<Label>("robot-status")?.RemoveFromHierarchy();
+        root?.Q<VisualElement>("robot-manual-controls")?.RemoveFromHierarchy();
+    }
+
+    void BuildUi(VisualElement root)
+    {
+        root.Q<Label>("robot-status")?.RemoveFromHierarchy();
+        root.Q<VisualElement>("robot-manual-controls")?.RemoveFromHierarchy();
+        root.style.width = Length.Percent(100);
+        root.style.height = Length.Percent(100);
 
         var container = new VisualElement();
+        container.name = "robot-command-bar";
         container.style.position = UnityEngine.UIElements.Position.Absolute;
         container.style.bottom = 10;
         container.style.left = 10;
@@ -36,37 +83,24 @@ public class UIManager : MonoBehaviour
         container.style.paddingRight = 5;
         container.style.height = 50;
 
-        // 一鍵開關（實驗組 / 對照組）：只控制模擬動畫結束後的 bitmap 比對。放在指令列最左邊。
-        // 寫進跟 csharp_server 共用的旗標檔；server 每收到一個指令就重讀一次，
-        // 所以切換後「下一個」指令生效，已經在跑的那一批不受影響。
-        verificationButton = new Button(() => SetVerificationEnabled(!ReadVerificationEnabled()));
-        StyleToggleButton(verificationButton);
-        RefreshVerificationButton();
-
-        // pattern 審查開關：LLM 產生 bitmap 後要不要做雙模型交叉審查與投票。
-        // 關閉 = 只呼叫一次 OpenAI 就直接採用。跟驗證開關各自獨立。
-        patternReviewButton = new Button(() => SetPatternReviewEnabled(!ReadPatternReviewEnabled()));
-        StyleToggleButton(patternReviewButton);
-        RefreshPatternReviewButton();
-
+        // Unity驗證、pattern審查、模式與場景的開關都畫在下方指令列（OnGUI）。
         inputField = new TextField("");
+        inputField.name = "robot-command-input";
         inputField.style.flexGrow = 1;
         inputField.style.marginRight = 5;
         inputField.style.height = 40;
         inputField.focusable = true;
 
         sendButton = new Button(() => OnSendCommand());
+        sendButton.name = "robot-command-send";
         sendButton.text = "執行";
         sendButton.style.height = 40;
         sendButton.style.width = 80;
-
-        container.Add(verificationButton);
-        container.Add(patternReviewButton);
-        container.Add(inputField);
-        container.Add(sendButton);
-        root.Add(container);
+        // The command bar is rendered by OnGUI below. Keep these controls as
+        // callback objects only; do not depend on UIDocument for command input.
 
         statusLabel = new Label("");
+        statusLabel.name = "robot-status";
         statusLabel.style.position = UnityEngine.UIElements.Position.Absolute;
         statusLabel.style.bottom = 65;
         statusLabel.style.left = 10;
@@ -87,9 +121,11 @@ public class UIManager : MonoBehaviour
         }
 
         // ---------------------------------------------------------
-        // 右上角三個手動控制按鈕：鬆開 / 夾緊 / 回 Home
+        // 右上角只放三個手動控制按鈕：鬆開 / 夾緊 / 回 Home。
+        // 模式、場景與其他開關都在下方指令列（OnGUI），三個資料夾（main、zero-constraint、rulebased）同一套介面
         // ---------------------------------------------------------
         var controlPanel = new VisualElement();
+        controlPanel.name = "robot-manual-controls";
         controlPanel.style.position = UnityEngine.UIElements.Position.Absolute;
         controlPanel.style.top = 10;
         controlPanel.style.right = 10;
@@ -100,19 +136,27 @@ public class UIManager : MonoBehaviour
         controlPanel.style.paddingLeft = 6;
         controlPanel.style.paddingRight = 6;
 
-        var openBtn = new Button(() => { if (executor != null) executor.ReleaseGripper(); });
+        var openBtn = new Button(() => {
+            ResolveExecutor();
+            if (executor != null) executor.ReleaseGripper();
+            else ShowMessage("找不到 JsonExecutor，無法控制夾爪。");
+        });
         openBtn.text = "鬆開夾爪";
         openBtn.style.height = 36;
         openBtn.style.width = 120;
         openBtn.style.marginBottom = 4;
 
-        var gripBtn = new Button(() => { if (executor != null) executor.GripGripper(); });
+        var gripBtn = new Button(() => {
+            ResolveExecutor();
+            if (executor != null) executor.GripGripper();
+            else ShowMessage("找不到 JsonExecutor，無法控制夾爪。");
+        });
         gripBtn.text = "夾緊夾爪";
         gripBtn.style.height = 36;
         gripBtn.style.width = 120;
         gripBtn.style.marginBottom = 4;
 
-        var homeBtn = new Button(() => { if (executor != null) executor.GoHome(); });
+        var homeBtn = new Button(OnHomeRequested);
         homeBtn.text = "回 Home";
         homeBtn.style.height = 36;
         homeBtn.style.width = 120;
@@ -121,66 +165,94 @@ public class UIManager : MonoBehaviour
         controlPanel.Add(gripBtn);
         controlPanel.Add(homeBtn);
         root.Add(controlPanel);
+        Debug.Log("[UI] 輸入框、執行按鈕與手動控制已建立。", this);
     }
 
-    // ---------------------------------------------------------
-    // 一鍵開關（模擬結束比對 bitmap）：跟 csharp_server/VerificationSwitch.cs 共用
-    // StreamingAssets/verification_enabled.txt，寫 "1"/"0"。
-    // 檔案不存在或讀不到都算開啟 —— 預設永遠是實驗組，只有明確按成關閉才是對照組。
-    // ---------------------------------------------------------
-    string VerificationFlagPath => Path.Combine(SHARED_DIR, "verification_enabled.txt");
-
-    bool ReadVerificationEnabled()
+    void ResolveExecutor()
     {
+        if (executor == null) executor = FindObjectOfType<JsonExecutor>();
+    }
+
+    void OnHomeRequested()
+    {
+        Debug.Log("[UI] 已按下回 Home。", this);
+        ResolveExecutor();
+        if (executor == null)
+        {
+            ShowMessage("找不到 JsonExecutor，無法回 Home。");
+            return;
+        }
+        executor.TryGoHome(out string message);
+        ShowMessage(message);
+    }
+
+    string ModeButtonText() => RunMode.IsSim ? "模式：純模擬" : "模式：實機";
+    string SceneButtonText() => "場景：" + Path.GetFileNameWithoutExtension(RunMode.Scene);
+
+    void OnToggleSimMode()
+    {
+        ResolveExecutor();
+        if (executor != null && executor.IsBusy)
+        {
+            ShowMessage("手臂正在執行，執行完再切換模式。");
+            return;
+        }
         try
         {
-            return !File.Exists(VerificationFlagPath) ||
-                   File.ReadAllText(VerificationFlagPath).Trim() != "0";
+            RunMode.SetSim(!RunMode.IsSim);
         }
-        catch (IOException)
+        catch (System.Exception ex)
         {
-            return true;
+            ShowMessage("切換模式失敗（寫不了 run_mode.json）：" + ex.Message);
+            return;
         }
+        ShowMessage(RunMode.IsSim
+            ? $"已切成純模擬：正在把 {RunMode.Scene} 載入 Isaac Sim，畫面會顯示模擬的積木。下一個指令起場景來自 Isaac，" +
+              "動作只送 URSim（實體手臂不動）；要先開 URSim 與 isaac_sim_server（--ursim_ip），不需要 perception_server。"
+            : "已切成實機：畫面改顯示相機看到的積木，下一個指令起動作送實體手臂。要先開 perception_server。");
     }
 
-    void SetVerificationEnabled(bool enabled)
+    // 輪流切換 repo 根目錄 sim_scenes/ 裡的虛擬場景檔（SceneSyncer 會馬上重建 Isaac 世界，執行中不能換）
+    void OnCycleScene()
     {
+        ResolveExecutor();
+        if (executor != null && executor.IsBusy)
+        {
+            ShowMessage("手臂正在執行，執行完再換場景。");
+            return;
+        }
+        var scenes = RunMode.AvailableScenes();
+        if (scenes.Length == 0)
+        {
+            ShowMessage("找不到虛擬場景檔（repo 根目錄 sim_scenes/*.json）。");
+            return;
+        }
+        string next = scenes[(System.Array.IndexOf(scenes, RunMode.Scene) + 1) % scenes.Length];
         try
         {
-            File.WriteAllText(VerificationFlagPath, enabled ? "1" : "0");
-            Debug.Log(enabled
-                ? "[UI] Unity驗證開啟（實驗組）：模擬結束比對不通過就不送實體手臂，下一個指令生效"
-                : "[UI] Unity驗證關閉（對照組）：模擬結束比對只記錄，下一個指令生效");
+            RunMode.SetScene(next);
         }
-        catch (IOException e)
+        catch (System.Exception ex)
         {
-            Debug.LogWarning($"[UI] 寫入 verification_enabled.txt 失敗：{e.Message}");
+            ShowMessage("換場景失敗（寫不了 run_mode.json）：" + ex.Message);
+            return;
         }
-        RefreshVerificationButton();
-    }
-
-    // 按鈕狀態一律從檔案讀回來，寫入失敗時畫面不會顯示成已切換
-    void RefreshVerificationButton()
-    {
-        bool enabled = ReadVerificationEnabled();
-        verificationButton.text = enabled ? "Unity驗證：開" : "Unity驗證：關";
-        SetToggleColor(verificationButton, enabled);
+        ShowMessage($"虛擬場景：{next}，正在載入 Isaac Sim…");
     }
 
     // ---------------------------------------------------------
-    // pattern 審查開關：跟 csharp_server/PatternDesigner.cs 共用
-    // StreamingAssets/skip_pattern_review.txt。注意檔案記的是「跳過」：
-    // "1" = 跳過審查（按鈕顯示關），其他或檔案不存在 = 照常審查（按鈕顯示開）。
-    // server 每次設計 pattern 前都重讀，切換後下一個指令生效。
+    // pattern審查開關：跟 csharp_server/PatternDesigner 共用 StreamingAssets/skip_pattern_review.txt，
+    // 檔案記的是「跳過」："1" = 跳過交叉審查（只請 OpenAI 畫一次就採用），其他或檔案不存在 = OpenAI 與 Gemini
+    // 各畫一張、互相審查、投票。server 每個任務開始時重讀，下一個指令生效。
     // ---------------------------------------------------------
     string SkipPatternReviewFlagPath => Path.Combine(SHARED_DIR, "skip_pattern_review.txt");
+    string PatternReviewButtonText() => patternReviewEnabled ? "pattern審查：開" : "pattern審查：關";
 
     bool ReadPatternReviewEnabled()
     {
         try
         {
-            return !(File.Exists(SkipPatternReviewFlagPath) &&
-                     File.ReadAllText(SkipPatternReviewFlagPath).Trim() == "1");
+            return !(File.Exists(SkipPatternReviewFlagPath) && File.ReadAllText(SkipPatternReviewFlagPath).Trim() == "1");
         }
         catch (IOException)
         {
@@ -188,42 +260,23 @@ public class UIManager : MonoBehaviour
         }
     }
 
-    void SetPatternReviewEnabled(bool enabled)
+    void TogglePatternReview()
     {
+        bool enable = !ReadPatternReviewEnabled();
         try
         {
-            File.WriteAllText(SkipPatternReviewFlagPath, enabled ? "0" : "1");
-            Debug.Log(enabled
-                ? "[UI] pattern 審查開啟，下一個指令生效"
-                : "[UI] pattern 審查關閉（只呼叫一次 OpenAI 直接採用），下一個指令生效");
+            File.WriteAllText(SkipPatternReviewFlagPath, enable ? "0" : "1");
         }
         catch (IOException e)
         {
-            Debug.LogWarning($"[UI] 寫入 skip_pattern_review.txt 失敗：{e.Message}");
+            ShowMessage("切換 pattern審查失敗（寫不了 skip_pattern_review.txt）：" + e.Message);
+            return;
         }
-        RefreshPatternReviewButton();
-    }
-
-    void RefreshPatternReviewButton()
-    {
-        bool enabled = ReadPatternReviewEnabled();
-        patternReviewButton.text = enabled ? "pattern審查：開" : "pattern審查：關";
-        SetToggleColor(patternReviewButton, enabled);
-    }
-
-    static void StyleToggleButton(Button button)
-    {
-        button.style.height = 40;
-        button.style.width = 150;
-        button.style.marginRight = 5;
-        button.style.color = Color.white;
-    }
-
-    static void SetToggleColor(Button button, bool enabled)
-    {
-        button.style.backgroundColor = enabled
-            ? new Color(0.15f, 0.5f, 0.25f)
-            : new Color(0.7f, 0.2f, 0.2f);
+        // 狀態一律從檔案讀回來，寫入失敗時畫面不會顯示成已切換
+        patternReviewEnabled = ReadPatternReviewEnabled();
+        ShowMessage(patternReviewEnabled
+            ? "pattern審查開啟：下一個指令起，OpenAI 與 Gemini 各畫一張目標 bitmap（立體的是高度圖）、互相審查、投票（需要 GEMINI_API_KEY）。"
+            : "pattern審查關閉：下一個指令起，只請 OpenAI 畫一次目標 bitmap 就採用（立體的照 260917 再由 OpenAI 檢查正面方向）。");
     }
 
     public void ShowMessage(string message)
@@ -234,9 +287,91 @@ public class UIManager : MonoBehaviour
         statusLabel.style.display = DisplayStyle.Flex;
     }
 
+    // ---------------------------------------------------------
+    // Unity驗證開關（rulebased 才有：實驗組 / 對照組，只控制模擬動畫結束後的 bitmap 比對）：跟
+    // csharp_server/VerificationSwitch.cs 共用 StreamingAssets/verification_enabled.txt，寫 "1"/"0"。
+    // 檔案不存在或讀不到都算開啟 —— 預設永遠是實驗組，只有明確按成關閉才是對照組。server 每個指令開始時重讀。
+    // ---------------------------------------------------------
+    string VerificationFlagPath => Path.Combine(SHARED_DIR, "verification_enabled.txt");
+    string VerificationButtonText() => verificationEnabled ? "Unity驗證：開" : "Unity驗證：關";
+
+    bool ReadVerificationEnabled()
+    {
+        try
+        {
+            return !File.Exists(VerificationFlagPath) || File.ReadAllText(VerificationFlagPath).Trim() != "0";
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+    }
+
+    void ToggleVerification()
+    {
+        bool enable = !ReadVerificationEnabled();
+        try
+        {
+            File.WriteAllText(VerificationFlagPath, enable ? "1" : "0");
+        }
+        catch (IOException e)
+        {
+            ShowMessage("切換 Unity驗證失敗（寫不了 verification_enabled.txt）：" + e.Message);
+            return;
+        }
+        // 狀態一律從檔案讀回來，寫入失敗時畫面不會顯示成已切換
+        verificationEnabled = ReadVerificationEnabled();
+        ShowMessage(verificationEnabled
+            ? "Unity驗證開啟（實驗組）：下一個指令起，模擬結束比對不通過就不送手臂。"
+            : "Unity驗證關閉（對照組）：下一個指令起，模擬結束比對只記錄，手臂照常執行。");
+    }
+
+    void OnGUI()
+    {
+        // UI Toolkit can temporarily lose its runtime panel after a domain
+        // reload. Keep a separate immediate-mode command bar available so the
+        // experiment can still be started without editing the scene.
+        const float margin = 10f;
+        const float buttonWidth = 90f;
+        const float modeWidth = 120f;
+        const float sceneWidth = 150f;
+        const float reviewWidth = 130f;
+        const float verificationWidth = 130f;
+        const float height = 38f;
+        float y = Mathf.Max(margin, Screen.height - height - margin);
+        GUI.Box(new Rect(0, y - 6f, Screen.width, height + 12f), GUIContent.none);
+        // 由右往左：執行、pattern審查、Unity驗證、模式切換、（純模擬時）換場景，剩下的寬度給輸入框
+        float x = Screen.width - margin - buttonWidth;
+        if (GUI.Button(new Rect(x, y, buttonWidth, height), "執行"))
+            SubmitCommand(fallbackCommand);
+        x -= margin + reviewWidth;
+        if (GUI.Button(new Rect(x, y, reviewWidth, height), PatternReviewButtonText()))
+            TogglePatternReview();
+        x -= margin + verificationWidth;
+        if (GUI.Button(new Rect(x, y, verificationWidth, height), VerificationButtonText()))
+            ToggleVerification();
+        x -= margin + modeWidth;
+        if (GUI.Button(new Rect(x, y, modeWidth, height), ModeButtonText()))
+            OnToggleSimMode();
+        if (RunMode.IsSim)
+        {
+            x -= margin + sceneWidth;
+            if (GUI.Button(new Rect(x, y, sceneWidth, height), SceneButtonText()))
+                OnCycleScene();
+        }
+        GUI.SetNextControlName("RobotCommandFallback");
+        fallbackCommand = GUI.TextField(
+            new Rect(margin, y, Mathf.Max(100f, x - margin * 2f), height),
+            fallbackCommand ?? "");
+    }
+
     void OnSendCommand()
     {
-        string command = inputField.value;
+        SubmitCommand(inputField != null ? inputField.value : fallbackCommand);
+    }
+
+    void SubmitCommand(string command)
+    {
         Debug.Log("按鈕被按下");
         Debug.Log("輸入內容：" + command);
 
@@ -259,6 +394,8 @@ public class UIManager : MonoBehaviour
             Directory.CreateDirectory(Application.streamingAssetsPath);
 
             File.WriteAllText(inputPath, command);
+            fallbackCommand = "";
+            if (inputField != null) inputField.value = "";
 
             Debug.Log("寫入後讀回：" + File.ReadAllText(inputPath));
 

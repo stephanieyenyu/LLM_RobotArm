@@ -81,6 +81,8 @@ public class TargetCell
     // 若為 domino，第二個覆蓋格為 (row, col+1) 或 (row+1, col)。
     public int? SecondRow { get; set; }
     public int? SecondCol { get; set; }
+    // 立體（SpatialLayoutRealizer）：這一格的第幾層，1 = 直接放在桌面上；2D 一律是 1
+    public int Layer { get; set; } = 1;
 }
 
 /// <summary>
@@ -144,6 +146,21 @@ public class StepEnvelope
 
     [JsonPropertyName("action_sequence")]
     public List<RobotFunctionCall> ActionSequence { get; set; } = new();
+
+    // 3D 分層夾取（layered_grasp 批次）才有：來源積木頂面、放好後的頂面（QR 公尺，對齊 2.5 cm 層高）。
+    // 其他批次不寫出這兩個欄位，送給 Unity 的 JSON 跟以前相同
+    [JsonPropertyName("source_top_m")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public double SourceTopM { get; set; }
+    [JsonPropertyName("target_top_m")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public double TargetTopM { get; set; }
+
+    // 純模擬（run_mode.json 的 mode = sim）時逐步送的 step 標 "ursim"：只有 URSim 動，Isaac 跟隨做物理。
+    // 實機模式不寫出這個欄位，JSON 跟以前相同
+    [JsonPropertyName("robot_target")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? RobotTarget { get; set; }
 }
 
 /// <summary>
@@ -180,6 +197,21 @@ public class BatchEnvelope
 
     [JsonPropertyName("cell_size_m")]
     public double CellSizeM { get; set; }
+
+    // 3D 模擬驗證與純模擬：robot_target = "ursim" 的批次只在 URSim 執行（Isaac Sim 跟隨），實體手臂不動；
+    // layered_grasp = 3D 分層夾取；skip_preview = 軌跡在驗證批次已經預覽過，正式執行不再預覽。
+    // 其他批次不寫出這些欄位，送給 Unity 的 JSON 跟以前相同
+    [JsonPropertyName("robot_target")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? RobotTarget { get; set; }
+
+    [JsonPropertyName("layered_grasp")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool LayeredGrasp { get; set; }
+
+    [JsonPropertyName("skip_preview")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SkipPreview { get; set; }
 }
 
 /// <summary>

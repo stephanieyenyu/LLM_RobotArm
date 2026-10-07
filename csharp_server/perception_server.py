@@ -14,7 +14,8 @@ perception_server.py - 即時場景感知服務
 Endpoint：
     GET /scene         - 當下 detection JSON（含物件、QR、時間戳）
     GET /health        - 服務健康度、FPS、上次更新時間
-    GET /debug/frame   - 最新一幀原圖（JPEG，方便瀏覽器直接開起來對照）
+    GET /camera        - 相機內參 + 相機在 QR 座標系的位姿（Isaac Sim 對齊用）
+    GET /debug/frame   - 最新一幀原圖（JPEG，方便瀏覽器直接開起來對照；?raw=1 不畫標註）
 """
 
 import threading
@@ -571,6 +572,20 @@ def build_workspace_frame(p1, p2, p3):
     }
 
 
+def camera_pose_in_qr_frame(frame):
+    """
+    workspace frame 是「QR 座標系在相機座標系裡」的描述；反過來就是相機在 QR 座標系的位姿，
+    給 Isaac Sim 把模擬相機擺到跟 RealSense 同一個位置（2026-10-07 從 main 搬來）。
+    rotation 的三個欄 = 相機光學座標軸（x 右、y 下、z 朝前，OpenCV/ROS 慣例）在 QR 座標系的方向。
+    """
+    rotation = np.vstack([frame["x_axis"], frame["z_axis"], frame["normal"]])  # 相機座標 → QR 座標
+    position = -rotation @ frame["origin"]                                      # 相機光心在 QR 座標系的位置
+    return {
+        "position": [round(float(v), 6) for v in position],
+        "rotation": [[round(float(v), 6) for v in row] for row in rotation],
+    }
+
+
 def project_pixel_to_workspace(pixel, camera_matrix, frame, obj_top_z_m=OBJECT_HEIGHT_OFFSET_M):
     """
     像素 → 相機射線 → 「工作平面 + obj_top_z_m 高度」的平面交點 → 局部 (x, y) 座標（公尺）。
@@ -1118,6 +1133,41 @@ setInterval(async () => {
     return Response(html, mimetype="text/html")
 
 
+@app.route("/camera")
+def endpoint_camera():
+    """相機內參 + 相機在 QR 座標系的位姿（Isaac Sim 用來對齊模擬相機）。/scene 格式不變。"""
+    frame = _cached_workspace_frame
+    info = _cached_workspace_info
+    if frame is None:
+        return jsonify({"error": "workspace frame not available yet (QR1-3 not seen)"}), 503
+    intr = RS_INTRINSICS
+    intrinsics = {
+        "width": intr.width if intr is not None else CAMERA_WIDTH,
+        "height": intr.height if intr is not None else CAMERA_HEIGHT,
+        "fx": CAMERA_INTRINSICS["fx"], "fy": CAMERA_INTRINSICS["fy"],
+        "ppx": CAMERA_INTRINSICS["ppx"], "ppy": CAMERA_INTRINSICS["ppy"],
+        "model": str(intr.model) if intr is not None else "default_estimate",
+        "coeffs": [float(c) for c in intr.coeffs] if intr is not None else [0.0] * 5,
+    }
+    # 這一幀看得到的 QR 中心投影回 QR 平面（z=0），Isaac Sim 用來畫 QR1-4 範圍與桌面；被遮住的就不列
+    with state_lock:
+        qrcodes = list(latest_state["qrcodes"])
+    camera_matrix = build_camera_matrix(intrinsics["width"], intrinsics["height"])
+    qr_markers = {}
+    for qr in qrcodes:
+        pos = project_pixel_to_workspace(qr["center_pixel"], camera_matrix, frame, obj_top_z_m=0.0)
+        if pos is not None:
+            qr_markers[qr["id"]] = [pos["x"], pos["y"]]
+    return jsonify({
+        "timestamp": time.time(),
+        "intrinsics": intrinsics,
+        "pose_in_qr": camera_pose_in_qr_frame(frame),
+        "frame_source": (info or {}).get("source"),
+        "qr_markers": qr_markers,
+        "qr_size_m": QR_SIZE_M,
+    })
+
+
 @app.route("/debug/frame")
 def endpoint_frame():
     with state_lock:
@@ -1174,6 +1224,7 @@ def main():
     print(f"  GET /scene/mode       - 執行狀態（idle / executing）")
     print(f"  POST /scene/mode      - 由 Unity 切換執行狀態")
     print(f"  GET /health           - FPS / 上次更新時間")
+    print(f"  GET /camera           - 相機內參 + 相機在 QR 座標系的位姿（Isaac Sim 對齊用）")
     print(f"  GET /debug/frame      - 標好 bbox 的最新一幀 JPEG")
     print()
 
