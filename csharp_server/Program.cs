@@ -186,7 +186,18 @@ while (true)
                 llm.CanonicalBitmap = true;
                 var hierarchy = await llm.Decompose(goal, before, NoPriorFeedback, image, dir);
                 DualBitmapPlan? bitmapPlan = null;
-                if (hierarchy.Split('\n').Any(line => line.Trim() == "需要平面 bitmap"))
+                var hierarchyLines = hierarchy.Split('\n').Select(line => line.Trim()).ToList();
+                // 立體（2026-10-07）：拆解寫「需要立體 bitmap」就用 260917 的 SpatialPatternDesigner 畫俯視高度圖（同樣雙 LLM）
+                if (hierarchyLines.Contains("需要立體 bitmap"))
+                {
+                    stage = "雙 LLM 立體 bitmap 生成與交叉驗證";
+                    bitmapPlan = await DualBitmapPlan.DesignSpatial(goal, before);
+                    Save(dir, "canonical_bitmap.json", bitmapPlan);
+                    trace.Add("立體 bitmap（俯視高度圖）使用 260917 的 SpatialPatternDesigner，OpenAI/Gemini 獨立生成、交叉審查與 80/20 匿名評分");
+                    Console.WriteLine("[3D Layer 1] 目標立體 bitmap（俯視高度圖，數字 = 那格疊幾層，· = 空；上 = +Y、右 = +X）：");
+                    foreach (var row in bitmapPlan.Rows) Console.WriteLine("           " + string.Join(" ", row.Select(c => c == '0' ? '·' : c)));
+                }
+                else if (hierarchyLines.Contains("需要平面 bitmap"))
                 {
                     stage = "雙 LLM bitmap 生成與交叉驗證";
                     bitmapPlan = await DualBitmapPlan.Design(goal, before);
@@ -212,6 +223,9 @@ while (true)
                     throw new TranslationContractException("執行資料無效或超過單次 50 步上限。",
                         new InvalidOperationException("Invalid translated step count."));
                 trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
+                // 這一輪計畫放下的物件畫成圖，接著印設計階段雙 LLM 選出的目標，方便對照（2026-10-07 從 main 搬來）
+                PrintPlannedFigure(attempt, translated.Steps, before);
+                if (bitmapPlan != null) PrintDesignTarget(bitmapPlan);
                 foreach (var step in translated.Steps)
                     foreach (var action in step.Actions)
                         if (action.Function is "move_above" or "descend" or "lift")
@@ -237,7 +251,9 @@ while (true)
                 // 2D 平面移動不經過這裡（見下方 2D 整批）。存檔另開子資料夾，避免跟實機結果撞名。
                 // 3D 的每一批（URSim 與之後的實機）都帶 layered_grasp：Unity 用分層夾取深度，實機執行的就是
                 // Isaac 驗證過的同一套深度；2D 批次不帶這個欄位，Unity 照舊。
-                bool stacked3d = IsaacSimExecutor.RequiresCheck(translated.Steps, before);
+                // 目標是立體 bitmap 時一律走 3D（Unity 逐層比對 → URSim → Isaac）；計畫沒疊起來的話逐層比對會不吻合，
+                // 不會從 2D 的覆蓋率直接算成功
+                bool stacked3d = IsaacSimExecutor.RequiresCheck(translated.Steps, before) || bitmapPlan?.HeightMap == true;
                 if (stacked3d && sim && virtualWorld != null)
                     throw new SimulationUnavailableException("純模擬目前沒開 Isaac Sim：這個計畫是 3D 疊放，需要 Isaac 做物理驗證，" +
                         "內建的虛擬世界只支援 2D。開好 isaac_sim_server 後再下指令。", null);
@@ -273,10 +289,24 @@ while (true)
                         int ursimBatchId = ++stepId;
                         var ursimBatch = new BatchEnvelope { BatchId = ursimBatchId, Steps = ursimSteps,
                             Comment = "3D 疊放 URSim 驗證", RobotTarget = "ursim", LayeredGrasp = true };
+                        // 立體 bitmap：Unity 預覽結束逐層切開拍，跟 LLM 宣告座標系裡的高度圖比對，重疊率過門檻才讓 URSim 動
+                        if (bitmapLayout != null)
+                        {
+                            ursimBatch.Bitmap = bitmapLayout.Value.Rows;
+                            ursimBatch.ExpectedCells = bitmapLayout.Value.Cells;
+                            ursimBatch.CellSizeM = bitmapLayout.Value.CellXM;
+                            ursimBatch.CellSizeXM = bitmapLayout.Value.CellXM;
+                            ursimBatch.CellSizeYM = bitmapLayout.Value.CellYM;
+                        }
                         Save(isaacDir, "ursim_batch.json", ursimBatch);
+                        var simCheckPath3d = Path.Combine(assets, "sim_check.json");
+                        if (File.Exists(simCheckPath3d)) File.Delete(simCheckPath3d);
                         AtomicWrite(Path.Combine(assets, "current_step.json"), ursimBatch);
                         var ursimExecution = await Wait(attempt, ursimBatchId);
                         Save(isaacDir, "ursim_execution.json", ursimExecution);
+                        var simCheck3d = bitmapLayout != null ? ReadSimulationCheck(simCheckPath3d, ursimBatchId, isaacDir) : null;
+                        if (simCheck3d is { Performed: true })
+                            trace.Add($"Unity 預覽逐層比對立體 bitmap {(simCheck3d.Passed ? "通過" : "未通過")}（重疊率 {simCheck3d.OverlapRatio * 100:F0}%）");
                         if (ursimExecution == null || !ursimExecution.Completed)
                         {
                             string reason = ursimExecution?.Error ?? "沒有回報原因";
@@ -630,6 +660,54 @@ async Task<ExecutionResult?> Wait(int attempt, int id)
     }
 }
 // 圖形裡的一個物件：位置與方向照計畫的 target，頂面高度給 Unity 比對用
+// 這一輪計畫最後擺出來的圖形（key = 場景 index）：每塊只算最後放下的位置，Z 是放好後的頂面（LayeredHeights.ForSteps）。
+// withSupports：再加上沒被搬、但壓在放下的積木底下的場景積木（立體時支撐也是結構的一部分）
+static Dictionary<int, SceneObject> PlannedFigure(List<TranslatedStep> steps, List<SceneObject> scene, bool withSupports)
+{
+    var tops = LayeredHeights.ForSteps(steps, scene);
+    var placed = new Dictionary<int, SceneObject>();
+    for (int k = 0; k < steps.Count; k++)
+    {
+        var step = steps[k];
+        if (step.Target == null || step.SourceIndex < 0 || step.SourceIndex >= scene.Count) continue;
+        if (ClassifyOutcome(step.Actions) == ActionOutcome.Placed) placed[step.SourceIndex] = FigureObject(step.Target, tops[k].TargetTopM);
+        else placed.Remove(step.SourceIndex);
+    }
+    if (withSupports)
+        foreach (var (i, top) in LayeredHeights.UnmovedSupports(steps, scene, placed.Values))
+            placed[i] = FigureObject(scene[i], top);
+    return placed;
+}
+static int LayerOf(SceneObject o) => Math.Max(1, (int)Math.Round(o.Z / LayeredGraspGeometry.BlockLayerM));
+// 平面印 ■□ bitmap，疊放印俯視高度圖（數字 = 那格疊到第幾層，含壓在底下沒被搬的支撐）
+static void PrintPlannedFigure(int attempt, List<TranslatedStep> steps, List<SceneObject> scene)
+{
+    bool stacked = IsaacSimExecutor.RequiresCheck(steps, scene);
+    var figure = PlannedFigure(steps, scene, withSupports: stacked).Values.ToList();
+    if (figure.Count == 0)
+    {
+        Console.WriteLine($"[LLM] 第 {attempt} 輪計畫沒有放下任何物件，沒有 bitmap。");
+        return;
+    }
+    if (!stacked)
+    {
+        var (rows, _, cellX, cellY) = FigureBitmap.Build(figure);
+        FigureBitmap.Print($"[LLM] 第 {attempt} 輪計畫排出的 bitmap（{figure.Count} 個物件，格距 X {cellX * 1000:F0} mm、" +
+                           $"Y {cellY * 1000:F0} mm，上 = +Y、右 = +X）：", rows);
+        return;
+    }
+    var (heights, _, cell3dX, cell3dY) = FigureBitmap.HeightMap(figure, figure.Select(LayerOf).ToList());
+    FigureBitmap.PrintHeightMap($"[LLM] 第 {attempt} 輪計畫是 3D 疊放，俯視高度圖（數字 = 那格疊到第幾層，· = 空；{figure.Count} 個物件，" +
+                                $"含壓在底下沒被搬的支撐；格距 X {cell3dX * 1000:F0} mm、Y {cell3dY * 1000:F0} mm，上 = +Y、右 = +X）：", heights);
+}
+// 接在每一輪計畫的圖形後面印這一輪雙 LLM 選出的目標，方便對照
+static void PrintDesignTarget(DualBitmapPlan target)
+{
+    if (target.HeightMap)
+        FigureBitmap.PrintHeightMap("[LLM] 對照：這一輪雙 LLM 選出的目標高度圖（數字 = 那格疊幾層，· = 空）：", target.Rows);
+    else
+        FigureBitmap.Print("[LLM] 對照：這一輪雙 LLM 選出的目標 bitmap：", target.Rows);
+}
 static SceneObject FigureObject(SceneObject target, double topM) => new()
 {
     Name = target.Name, Shape = target.Shape, Orientation = target.Orientation,

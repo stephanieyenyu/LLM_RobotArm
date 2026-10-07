@@ -13,6 +13,8 @@ public sealed class PatternDesigner
     const int MaxRounds = 2;
     const double OpenAiVoteWeight = 0.80;
     const double GeminiVoteWeight = 0.20;
+    // 只剩一張候選時，兩個模型打分（0～1）80/20 加權後要達到這個分數才採用：分數範圍的中點（2026-10-07）
+    const double MinSingleCandidateScore = 0.50;
     readonly ChatClient openAi;
     static readonly HttpClient ModelHttpClient = new() { Timeout = Timeout.InfiniteTimeSpan };
     readonly HttpClient gemini;
@@ -80,21 +82,34 @@ public sealed class PatternDesigner
                 .ToList();
 
             Candidate? selected = null;
-            if (finalists.Count == 1)
+            double singleScore = 0;
+            if (finalists.Count > 0)
             {
-                selected = finalists[0];
-            }
-            else if (finalists.Count > 1)
-            {
-                Console.WriteLine($"[Layer 1 vote] anonymously scoring {finalists.Count} finalists...");
+                // 2026-10-07：只剩一張（另一張沒過互審，或兩張一樣被合併）也要兩個模型打分，加權達 MinSingleCandidateScore 才採用
+                Console.WriteLine(finalists.Count > 1
+                    ? $"[Layer 1 vote] anonymously scoring {finalists.Count} finalists..."
+                    : $"[Layer 1 vote] 只有一張候選，兩個模型仍要打分（加權達 {MinSingleCandidateScore:F2} 才採用）...");
                 var openBallotTask = BallotOpenAi(command, finalists);
                 var gemBallotTask = BallotGemini(command, finalists);
                 await Task.WhenAll(openBallotTask, gemBallotTask);
-                selected = SelectByWeightedScore(finalists, await openBallotTask, await gemBallotTask);
+                var openBallot = await openBallotTask;
+                var gemBallot = await gemBallotTask;
+                selected = SelectByWeightedScore(finalists, openBallot, gemBallot);
+                if (finalists.Count == 1)
+                {
+                    singleScore = NormalizeScores(openBallot, 1)[0] * OpenAiVoteWeight + NormalizeScores(gemBallot, 1)[0] * GeminiVoteWeight;
+                    if (singleScore < MinSingleCandidateScore)
+                    {
+                        Console.WriteLine($"[Layer 1 vote] 唯一的候選加權分數 {singleScore:F2}，未達 {MinSingleCandidateScore:F2}，不採用，下一輪重畫");
+                        selected = null;
+                    }
+                }
             }
             if (selected != null)
             {
-                Console.WriteLine($"[Layer 1 dual] selected={selected.Author} by anonymous dual-model vote");
+                Console.WriteLine(finalists.Count > 1
+                    ? $"[Layer 1 dual] selected={selected.Author} by anonymous dual-model vote"
+                    : $"[Layer 1 dual] selected={selected.Author}（唯一的候選，雙模型加權分數 {singleScore:F2}）");
                 return new CanonicalPattern
                 {
                     PatternId = string.IsNullOrWhiteSpace(selected.PatternId) ? command : selected.PatternId,
@@ -160,7 +175,8 @@ public sealed class PatternDesigner
         => ParseBallot(await CallGemini(
             BallotPrompt(), BallotRequest(command, candidates), BallotSchema()));
 
-    async Task<string> CallGemini(string system, string user, string schemaJson)
+    // 立體的 SpatialPatternDesigner 共用這裡的 Gemini 連線與投票 prompt
+    internal async Task<string> CallGemini(string system, string user, string schemaJson)
     {
         var body = new
         {
@@ -228,7 +244,7 @@ public sealed class PatternDesigner
         Review this candidate without seeing the other candidate.
         """;
 
-    static string BallotPrompt() => """
+    internal static string BallotPrompt() => """
         Score anonymized binary matrices against the original request.
         Judge each actual matrix independently by human visual recognizability and fidelity to the requested target.
         Candidate order and identity carry no meaning. Do not infer authorship.
@@ -372,7 +388,7 @@ public sealed class PatternDesigner
         },
         required = new[] { "accept", "recognizable", "confidence", "observed_as", "structural_problems", "suggested_changes", "has_revision", "revised_bitmap" },
     });
-    static string BallotSchema() => JsonSerializer.Serialize(new
+    internal static string BallotSchema() => JsonSerializer.Serialize(new
     {
         type = "object", additionalProperties = false,
         properties = new Dictionary<string, object>

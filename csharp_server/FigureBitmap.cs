@@ -48,6 +48,32 @@ public static class FigureBitmap
         return (grid.Select(r => new string(r)).ToList(), cells, cellX, cellY);
     }
 
+    /// <summary>
+    /// 3D 疊放的 bitmap：俯視的高度圖，每格是那格最上面的積木在第幾層（1 = 放在桌面上，0 = 空），
+    /// 例如站起來的 L 是一列 "311"（左邊疊 3 層、右邊兩格各 1 層）。layerOf[i] 是 placed[i] 的層數；
+    /// 格子跟 Build 相同，cells 一併回傳（Unity 比對的預期格，Z 是各自的頂面）。
+    /// </summary>
+    public static (List<string> Rows, List<ExpectedCell> Cells, double CellXM, double CellYM) HeightMap(
+        IReadOnlyList<SceneObject> placed, IReadOnlyList<int> layerOf)
+    {
+        var (rows, cells, cellX, cellY) = Build(placed);
+        var grid = rows.Select(r => new int[r.Length]).ToArray();
+        for (int i = 0; i < cells.Count; i++)
+        {
+            grid[cells[i].Row][cells[i].Col] = Math.Max(grid[cells[i].Row][cells[i].Col], layerOf[i]);
+            if (cells[i].SecondRow >= 0)
+                grid[cells[i].SecondRow][cells[i].SecondCol] = Math.Max(grid[cells[i].SecondRow][cells[i].SecondCol], layerOf[i]);
+        }
+        return (grid.Select(r => string.Concat(r.Select(l => (char)('0' + Math.Min(l, 9))))).ToList(), cells, cellX, cellY);
+    }
+
+    /// <summary>印高度圖：數字之間空一格，0 印成 ·（例如 "3 1 1"）。</summary>
+    public static void PrintHeightMap(string title, IEnumerable<string> rows)
+    {
+        Console.WriteLine(title);
+        foreach (var row in rows) Console.WriteLine("           " + string.Join(" ", row.Select(c => c == '0' ? '·' : c)));
+    }
+
     public static void Print(string title, IEnumerable<string> rows)
     {
         Console.WriteLine(title);

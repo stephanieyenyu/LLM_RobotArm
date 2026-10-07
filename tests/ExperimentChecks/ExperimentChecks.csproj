@@ -7,6 +7,7 @@
     <Compile Include="../../csharp_server/BitmapParser.cs" Link="BitmapParser.cs" />
     <Compile Include="../../csharp_server/LayoutRealizer.cs" Link="LayoutRealizer.cs" />
     <Compile Include="../../csharp_server/DualBitmapPlan.cs" Link="DualBitmapPlan.cs" />
+    <Compile Include="../../csharp_server/SpatialPatternDesigner.cs" Link="SpatialPatternDesigner.cs" />
     <Compile Include="../../csharp_server/ExperimentChecks.cs" Link="ExperimentChecks.cs" />
     <Compile Include="../../csharp_server/ExperimentMetrics.cs" Link="ExperimentMetrics.cs" />
     <Compile Include="../../csharp_server/NaturalLanguagePlanAdapter.cs" Link="NaturalLanguagePlanAdapter.cs" />

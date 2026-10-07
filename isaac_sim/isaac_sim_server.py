@@ -56,6 +56,7 @@ Endpoint：
 """
 
 import argparse
+import collections
 import queue
 import socket
 import struct
@@ -350,6 +351,204 @@ def link_positions():
     return {name: t[i] for i, name in enumerate(robot.body_names)}
 
 
+# ============================================================
+# 手臂自撞（3D 驗證）
+# ============================================================
+# 形狀直接取機器人 USD 裡每個連桿的碰撞體（collisions 底下的 Mesh、換上的實測手指方塊），用 physics 的連桿位姿擺好，
+# 兩兩做凸包相交測試（GJK），沒有手打的形狀或門檻。6 個手臂關節把機器人切成 7 段（底座、肩部、上臂、前臂、
+# 手腕 1、手腕 2、手腕 3 與夾爪）：同一段的連桿（夾爪本體與手指）、相鄰兩段（在關節處本來就接在一起）不檢查；
+# 手臂直立（UR_HOME）時就已經相交的連桿組合是凸包構造上的接觸，啟動時印出來並排除。
+SEGMENT_NAMES = ["底座", "肩部", "上臂", "前臂", "手腕 1", "手腕 2", "手腕 3／夾爪"]
+self_collision = {"links": {}, "pairs": [], "excluded": [], "error": "還沒建立"}
+
+
+def _gjk_support(a, b, d):
+    return a[np.argmax(a @ d)] - b[np.argmax(b @ -d)]
+
+
+def _gjk_line(pts):
+    a, b = pts
+    ab, ao = b - a, -a
+    if ab @ ao > 0:
+        return [a, b], np.cross(np.cross(ab, ao), ab)
+    return [a], ao
+
+
+def _gjk_triangle(pts):
+    a, b, c = pts
+    ab, ac, ao = b - a, c - a, -a
+    abc = np.cross(ab, ac)
+    if np.cross(abc, ac) @ ao > 0:
+        if ac @ ao > 0:
+            return [a, c], np.cross(np.cross(ac, ao), ac)
+        return _gjk_line([a, b])
+    if np.cross(ab, abc) @ ao > 0:
+        return _gjk_line([a, b])
+    if abc @ ao > 0:
+        return [a, b, c], abc
+    return [a, c, b], -abc
+
+
+def _gjk_tetrahedron(pts):
+    a, b, c, d = pts
+    ab, ac, ad, ao = b - a, c - a, d - a, -a
+    if np.cross(ab, ac) @ ao > 0:
+        return _gjk_triangle([a, b, c])
+    if np.cross(ac, ad) @ ao > 0:
+        return _gjk_triangle([a, c, d])
+    if np.cross(ad, ab) @ ao > 0:
+        return _gjk_triangle([a, d, b])
+    return None, None
+
+
+def convex_hulls_touch(a, b, max_iterations=64):
+    """兩組點的凸包是否相交（含剛好碰到）：GJK，看 Minkowski 差是否包含原點。沒收斂時當作相交（寧可誤報）。"""
+    d = a.mean(axis=0) - b.mean(axis=0)
+    if not d.any():
+        d = np.array([1.0, 0.0, 0.0])
+    p = _gjk_support(a, b, d)
+    simplex, d = [p], -p
+    for _ in range(max_iterations):
+        if d @ d < 1e-20:
+            return True
+        p = _gjk_support(a, b, d)
+        if p @ d <= 0:
+            return False
+        simplex = [p] + simplex
+        if len(simplex) == 2:
+            simplex, d = _gjk_line(simplex)
+        elif len(simplex) == 3:
+            simplex, d = _gjk_triangle(simplex)
+        else:
+            simplex, d = _gjk_tetrahedron(simplex)
+            if simplex is None:
+                return True
+    return True
+
+
+def collision_points(link_prim):
+    """連桿底下所有啟用中的碰撞體頂點（連桿自身座標）：Mesh 取頂點，Cube 取 8 個角，其他形狀不支援（略過）。"""
+    inverse = UsdGeom.Xformable(link_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+    pts = []
+    for prim in Usd.PrimRange(link_prim, Usd.TraverseInstanceProxies()):   # 碰撞 Mesh 在 instance 底下
+        if not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        enabled = prim.GetAttribute("physics:collisionEnabled")
+        if enabled and enabled.Get() is False:
+            continue
+        for shape in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
+            if shape.IsA(UsdGeom.Mesh):
+                raw = UsdGeom.Mesh(shape).GetPointsAttr().Get()
+                local = np.asarray(raw, dtype=np.float64) if raw is not None else np.zeros((0, 3))
+            elif shape.IsA(UsdGeom.Cube):
+                h = float(UsdGeom.Cube(shape).GetSizeAttr().Get()) / 2.0
+                local = np.array(np.meshgrid([-h, h], [-h, h], [-h, h])).T.reshape(-1, 3)
+            else:
+                continue
+            if not len(local):
+                continue
+            rel = np.array(UsdGeom.Xformable(shape).ComputeLocalToWorldTransform(Usd.TimeCode.Default()) * inverse)
+            pts.append((np.c_[local, np.ones(len(local))] @ rel)[:, :3])
+    return np.unique(np.vstack(pts), axis=0) if pts else np.zeros((0, 3))
+
+
+def touching_links(pairs):
+    """目前 physics 姿勢下第一組凸包相交的連桿 (a, b)，沒有回傳 None。先用外接球排除離很遠的組合。"""
+    poses, placed = link_positions(), {}
+
+    def place(name):
+        if name not in placed:
+            pose = poses[name].astype(np.float64)
+            rot = matrix_from_quat_wxyz([pose[6], pose[3], pose[4], pose[5]])   # physics 是 xyzw
+            link = self_collision["links"][name]
+            placed[name] = (rot, pose[:3], rot @ link["center"] + pose[:3])
+        return placed[name]
+
+    for a, b in pairs:
+        (ra, ta, ca), (rb, tb, cb) = place(a), place(b)
+        la, lb = self_collision["links"][a], self_collision["links"][b]
+        if np.linalg.norm(ca - cb) > la["radius"] + lb["radius"]:
+            continue
+        if convex_hulls_touch(la["points"] @ ra.T + ta, lb["points"] @ rb.T + tb):
+            return a, b
+    return None
+
+
+def build_self_collision_model():
+    """啟動時、手臂在 UR_HOME（夾爪張開）時呼叫：各連桿碰撞體的頂點、所屬的段，以及要檢查的連桿組合。"""
+    stage = omni.usd.get_context().get_stage()
+    root = stage.GetPrimAtPath(ROBOT_MOUNT_PATH)
+    group = {}
+
+    def find(name):
+        while group.setdefault(name, name) != name:
+            group[name] = group[group[name]]
+            name = group[name]
+        return name
+
+    # 手臂關節以外的關節（固定、夾爪滑軌）連在一起的連桿屬於同一段；手臂關節依序把段接起來
+    arm_joints = {}
+    for prim in Usd.PrimRange(root):
+        if not prim.IsA(UsdPhysics.Joint):
+            continue
+        joint = UsdPhysics.Joint(prim)
+        body0, body1 = joint.GetBody0Rel().GetTargets(), joint.GetBody1Rel().GetTargets()
+        if not body0 or not body1:
+            continue
+        if prim.GetName() in ARM_JOINT_NAMES:
+            arm_joints[prim.GetName()] = (body0[0].name, body1[0].name)
+        else:
+            group[find(body0[0].name)] = find(body1[0].name)
+    missing = [n for n in ARM_JOINT_NAMES if n not in arm_joints]
+    if missing:
+        raise RuntimeError(f"USD 裡找不到手臂關節 {missing}")
+    segment = {find(arm_joints[ARM_JOINT_NAMES[0]][0]): 0}
+    for k, name in enumerate(ARM_JOINT_NAMES):
+        segment[find(arm_joints[name][1])] = k + 1
+
+    links = {}
+    for name in robot.body_names:
+        prim = stage.GetPrimAtPath(f"{ROBOT_MOUNT_PATH}/{name}")
+        seg = segment.get(find(name))
+        if not prim or seg is None:
+            continue
+        pts = collision_points(prim)
+        if len(pts):
+            lo, hi = pts.min(axis=0), pts.max(axis=0)
+            center = (lo + hi) / 2
+            links[name] = {"segment": seg, "points": pts, "center": center,
+                           "radius": float(np.linalg.norm(pts - center, axis=1).max())}
+    if len({link["segment"] for link in links.values()}) < 3:
+        raise RuntimeError(f"有碰撞體的連桿太少（{sorted(links)}），無法檢查")
+    self_collision["links"] = links
+    names = sorted(links, key=lambda n: (links[n]["segment"], n))
+    pairs = [(a, b) for i, a in enumerate(names) for b in names[i + 1:]
+             if abs(links[a]["segment"] - links[b]["segment"]) > 1]
+    excluded = []
+    while True:
+        hit = touching_links([p for p in pairs if p not in excluded])
+        if hit is None:
+            break
+        excluded.append(hit)
+    self_collision["pairs"] = [p for p in pairs if p not in excluded]
+    self_collision["excluded"] = excluded
+    self_collision["error"] = None
+    calibration["self_collision"] = {
+        "links": {n: SEGMENT_NAMES[links[n]["segment"]] for n in names},
+        "checked_pairs": len(self_collision["pairs"]),
+        "excluded_at_home": [f"{a}↔{b}" for a, b in excluded],
+    }
+    log(f"[isaac_sim_server] 手臂自撞檢查：{len(links)} 個連桿有碰撞體，檢查 {len(self_collision['pairs'])} 組；"
+        + ("直立時就相交而排除的：" + "、".join(f"{a}↔{b}" for a, b in excluded) if excluded else "直立時沒有相交的組合"))
+
+
+def describe_self_collision(hit, q):
+    a, b = hit
+    links = self_collision["links"]
+    return (f"{SEGMENT_NAMES[links[a]['segment']]}（{a}）碰到 {SEGMENT_NAMES[links[b]['segment']]}（{b}），"
+            f"URSim 關節角 [{', '.join(f'{v:.1f}' for v in np.degrees(q))}]°")
+
+
 def full_target(arm_q, gripper_pos):
     target = current_full_q().copy()
     target[arm_indices] = arm_q
@@ -381,19 +580,17 @@ def teleport(arm_q, gripper_pos=GRIPPER_OPEN_POS, settle_steps=5):
 # 跟隨 URSim（唯讀 realtime 埠，只讀不寫）
 # ============================================================
 
-def recv_exact(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("連線中斷")
-        buf += chunk
-    return buf
+URSIM_GAP_LOG_S = 0.3   # 兩次收到 URSim 資料的間隔超過這個就記一筆並印出來
 
 
 class UrsimFollower:
     """背景執行緒持續讀 URSim realtime 封包：q_actual（第 252 byte 起 6 個 double）與
-    Digital outputs（第 1044 byte 的 double，位元 --gripper_do = 夾爪）。斷線會自動重連。"""
+    Digital outputs（第 1044 byte 的 double，位元 --gripper_do = 夾爪）。斷線會自動重連。
+    每次把 socket 裡累積的資料一次讀完、只留最新一包（2026-10-07）：URSim 每秒送 500 包，以前逐包讀，
+    這個執行緒搶不到 GIL（主執行緒在跑物理與畫面）時會越積越多，手臂跟得越來越慢、URSim 那端也可能因為送不出去而停住。
+    資料中斷（間隔超過 URSIM_GAP_LOG_S）時記下並印出：中斷期間 Isaac 的手臂停在原地，資料回來時會一口氣追上
+    URSim，夾著的積木會被甩掉。印出的「這次收到幾包」「控制器時鐘走了多久」用來分辨是哪一邊停住：
+    收到很多包 = Isaac 這邊太久沒讀；只收到一兩包、控制器時鐘也幾乎沒走 = URSim（VirtualBox）那邊停住。"""
 
     def __init__(self, ip, port):
         self.ip, self.port = ip, port
@@ -401,32 +598,74 @@ class UrsimFollower:
         self.q = None
         self.gripper_closed = False
         self.stamp = 0.0
+        self.ctrl_time = None
         self.packets = 0
+        self.gaps = 0
+        self.max_gap_s = 0.0
+        self.reconnects = 0
+        self.gap_log = collections.deque(maxlen=1000)   # (收到資料的時間, 中斷秒數)
         self.error = None
         threading.Thread(target=self._run, daemon=True, name="ursim_follower").start()
+
+    def gaps_since(self, t):
+        """t 之後的資料中斷（秒數清單），驗證結束時列在「URSim 資料完整」的說明裡。"""
+        with self.lock:
+            return [gap for stamp, gap in self.gap_log if stamp >= t]
 
     def _run(self):
         while True:
             try:
                 with socket.create_connection((self.ip, self.port), timeout=3) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
                     sock.settimeout(3)
+                    buf = bytearray()
                     while True:
-                        size = struct.unpack(">i", recv_exact(sock, 4))[0]
-                        if size < 300 or size > 10000:
-                            raise ValueError(f"realtime 封包長度異常：{size}")
-                        body = recv_exact(sock, size - 4)
-                        q = np.array(struct.unpack(">6d", body[248:296]), dtype=np.float64)
-                        closed = self.gripper_closed
-                        if len(body) >= 1048:
-                            bits = int(struct.unpack(">d", body[1040:1048])[0])
-                            closed = bool((bits >> args.gripper_do) & 1)
-                        with self.lock:
-                            self.q, self.gripper_closed, self.stamp, self.error = q, closed, time.time(), None
-                            self.packets += 1
+                        chunk = sock.recv(1 << 16)
+                        if not chunk:
+                            raise ConnectionError("連線中斷")
+                        buf += chunk
+                        latest, count = None, 0
+                        while len(buf) >= 4:
+                            size = struct.unpack_from(">i", buf, 0)[0]
+                            if size < 300 or size > 10000:
+                                raise ValueError(f"realtime 封包長度異常：{size}")
+                            if len(buf) < size:
+                                break
+                            latest = bytes(buf[4:size])   # 去掉開頭 4 byte 的長度（跟以前逐包讀到的 body 相同）
+                            del buf[:size]
+                            count += 1
+                        if latest is not None:
+                            self._accept(latest, count)
             except Exception as ex:
+                text = f"{type(ex).__name__}: {ex}"
                 with self.lock:
-                    self.error = f"{type(ex).__name__}: {ex}"
-                time.sleep(1.0)
+                    repeated = self.error == text   # URSim 沒開時一直重連，同樣的錯誤只印一次
+                    self.error = text
+                    self.reconnects += 1
+                if not repeated:
+                    log(f"[isaac_sim_server] URSim 連線中斷（{text}），重新連線")
+                time.sleep(0.5)
+
+    def _accept(self, body, count):
+        q = np.array(struct.unpack(">6d", body[248:296]), dtype=np.float64)
+        ctrl_time = struct.unpack(">d", body[0:8])[0]
+        now = time.time()
+        with self.lock:
+            closed = self.gripper_closed
+            if len(body) >= 1048:
+                bits = int(struct.unpack(">d", body[1040:1048])[0])
+                closed = bool((bits >> args.gripper_do) & 1)
+            gap = now - self.stamp if self.stamp else 0.0
+            ctrl_step = ctrl_time - self.ctrl_time if self.ctrl_time is not None else None
+            self.q, self.gripper_closed, self.stamp, self.ctrl_time, self.error = q, closed, now, ctrl_time, None
+            self.packets += count
+            if gap > URSIM_GAP_LOG_S:
+                self.gaps += 1
+                self.max_gap_s = max(self.max_gap_s, gap)
+                self.gap_log.append((now, gap))
+        if gap > URSIM_GAP_LOG_S:
+            ctrl_text = f"控制器時鐘走了 {ctrl_step:.2f} s" if ctrl_step is not None else "控制器時鐘不明"
+            log(f"[isaac_sim_server] URSim 資料中斷 {gap:.2f} s（這次收到 {count} 包，{ctrl_text}）")
 
     def latest(self):
         """回傳 (q 或 None（超過 URSIM_STALE_S 沒更新）, 夾爪是否夾緊)。"""
@@ -442,6 +681,9 @@ class UrsimFollower:
                 "connected": self.q is not None and age is not None and age < URSIM_STALE_S,
                 "last_update_s_ago": round(age, 2) if age is not None else None,
                 "packets": self.packets,
+                "gaps_over_0_3s": self.gaps,
+                "max_gap_s": round(self.max_gap_s, 2),
+                "reconnects": self.reconnects,
                 "joints_deg": np.degrees(self.q).round(2).tolist() if self.q is not None else None,
                 "gripper_closed": self.gripper_closed,
                 "error": self.error,
@@ -472,6 +714,17 @@ def follow_step(render):
                 verify_state["ready_reached"] = True
             if verify_state["ready_reached"]:
                 verify_state["min_tip_m"] = min(verify_state["min_tip_m"], tip)
+            # 手臂自撞：每一步都用 physics 目前的連桿位姿檢查；跟指尖最低點一樣分「到 Ready 之後」與「整段」記第一次
+            if self_collision["error"] is None and verify_state["self_hit"] is None:
+                hit = touching_links(self_collision["pairs"])
+                if hit is not None:
+                    text = describe_self_collision(hit, q)
+                    if verify_state["self_hit_all"] is None:
+                        verify_state["self_hit_all"] = text
+                        log(f"[isaac_sim_server] ✗ 手臂自撞：{text}" +
+                            ("" if verify_state["ready_reached"] else "（URSim 還沒到 Ready）"))
+                    if verify_state["ready_reached"]:
+                        verify_state["self_hit"] = text
         if verify_state["follow_steps"] % 6 == 0:       # 每 0.1 秒記一次每塊積木的最高頂面，判斷有沒有被夾起
             for b in blocks:
                 if b["cuboid"] is not None:
@@ -730,6 +983,11 @@ def build_world():
             f"{(asset_tip - args.fingertip_m) * 1000:.0f} mm：flange → 指尖 {TCP_OFFSET_M:.4f} m，"
             f"本體下緣 {body_bottom if body_bottom is not None else float('nan'):.4f} m")
     teleport(UR_HOME)
+    try:
+        build_self_collision_model()
+    except Exception as ex:
+        self_collision["error"] = f"{type(ex).__name__}: {ex}"
+        log(f"[isaac_sim_server] WARN: 手臂自撞檢查建不起來，3D 驗證會判不通過：{self_collision['error']}")
     apply_default_camera()
 
 
@@ -1098,6 +1356,8 @@ def do_verify_begin(scene, cam, steps, use_current_world=False):
         "min_tip_m": np.inf,        # URSim 到 Ready 之後
         "min_tip_all_m": np.inf,    # 整段（沒偵測到 Ready 時的備援）
         "ready_reached": False,
+        "self_hit": None,           # 手臂自撞（URSim 到 Ready 之後第一次）
+        "self_hit_all": None,       # 整段第一次（沒偵測到 Ready 時的備援）
         "max_top": {},
         "follow_steps": 0,
         "stale_steps": 0,
@@ -1219,9 +1479,19 @@ def do_verify_end():
     if np.isfinite(min_tip):
         check("指尖沒有撞到桌面", min_tip >= -VERIFY_TIP_TABLE_TOL_M,
               f"{tip_scope}指尖最低點在桌面{'上' if min_tip >= 0 else '下'} {abs(min_tip) * 1000:.1f} mm")
+    # 檢查本身建不起來時算不通過：看不到自撞就不能讓實機照這條軌跡動
+    if self_collision["error"] is not None:
+        check("手臂沒有自撞", False, f"自撞檢查無法執行（{self_collision['error']}）")
+    else:
+        self_hit = verify_state["self_hit"] if ready_reached else verify_state["self_hit_all"]
+        check("手臂沒有自撞", self_hit is None,
+              f"{tip_scope}手臂各段沒有互相碰到" if self_hit is None else f"{tip_scope}{self_hit}")
     total = verify_state["follow_steps"] + verify_state["stale_steps"]
+    # 中斷期間 Isaac 的手臂停住、資料回來時一口氣追上，夾著的積木可能被甩掉：列出次數與最長的一次方便對照
+    gaps = follower.gaps_since(verify_state["started"]) if follower is not None else []
+    gap_text = f"；資料中斷 {len(gaps)} 次，最長 {max(gaps):.1f} s" if gaps else "；沒有超過 0.3 s 的中斷"
     check("URSim 資料完整", verify_state["follow_steps"] > 0 and verify_state["stale_steps"] <= 0.05 * max(total, 1),
-          f"跟隨 {verify_state['follow_steps']} 步，其中 {verify_state['stale_steps']} 步讀不到 URSim")
+          f"跟隨 {verify_state['follow_steps']} 步，其中 {verify_state['stale_steps']} 步讀不到 URSim{gap_text}")
 
     passed = not reasons
     log(f"[isaac_sim_server] 驗證結果：{'PASS' if passed else 'FAIL'}" + ("" if passed else "；" + "；".join(reasons)))

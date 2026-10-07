@@ -8,9 +8,11 @@
 
 每個移動動作的 `tcp_pose`（x、y、z、rx、ry、rz）由 LLM 決定。位置使用 QR 工作座標公尺，方向使用 UR 基座的旋轉向量弧度。Unity 只套用校正座標平移，透過 URSim 30002 的 secondary URScript 查詢 `get_inverse_kin`，經 RTDE 30004 接收暫存器 24～29 的六軸解，以同一組解進行預覽和後續執行；本地運動學只作 FK 與關節碰撞檢查，不為這條路徑求 IK、不另補 TCP 點或方向。查詢程式不含移動指令，不替換 URSim 的主程式。控制器須支援外部 RTDE 暫存器及帶 tcp 參數的 `get_inverse_kin_has_solution`。查詢無逾時限制，可用手動中止或退出 Play 取消。原本的自動 Ready/Home 收尾不再附加到此路徑，最後位置由 LLM 的最後一個移動決定。
 
-2D 圖形的 bitmap 生成採用 `LLM_RobotArm.zip` 的 `PatternDesigner` 雙模型流程：OpenAI（gpt-5）與 Gemini 各自生成、互相審查並提供修正版，多個候選以 OpenAI 80% / Gemini 20% 匿名評分選出，最多兩輪。需設定 `OPENAI_API_KEY` 與 `GEMINI_API_KEY`；`GEMINI_MODEL` 可覆寫 zip 預設的 `gemini-3.1-flash-lite`。選出的圖形存於每輪的 `canonical_bitmap.json`。bitmap 最多 5 列 × 5 欄，生成候選與審查修正版均受尺寸檢查；庫存計算包含目前場景全部積木，不劃供料區，也不由程式預選顏色。
+2D 圖形的 bitmap 生成採用 `LLM_RobotArm.zip` 的 `PatternDesigner` 雙模型流程：OpenAI（gpt-5）與 Gemini 各自生成、互相審查並提供修正版，多個候選以 OpenAI 80% / Gemini 20% 匿名評分選出，最多兩輪。2026-10-07 起決選只剩一張（另一張沒過互審，或兩張一樣被合併）時，兩個模型仍要替它打分，OpenAI 80%、Gemini 20% 加權達 0.5 才採用，沒達到就進下一輪重畫；之前只剩一張時直接採用、不投票。需設定 `OPENAI_API_KEY` 與 `GEMINI_API_KEY`；`GEMINI_MODEL` 可覆寫 zip 預設的 `gemini-3.1-flash-lite`。選出的圖形存於每輪的 `canonical_bitmap.json`。bitmap 最多 5 列 × 5 欄，生成候選與審查修正版均受尺寸檢查；庫存計算包含目前場景全部積木，不劃供料區，也不由程式預選顏色。
 
 後續 LLM 依目前場景自行找空位、選來源積木並決定原點、X/Y 格距與放置座標；以 `bitmap_grid(left_x, top_y, cell_x, cell_y, top_z)` 描述自行選出的座標系，記錄在 `bitmap_layout.json`。程式只將原始 bitmap 映射到該座標系供 Unity 比對，不再固定 target 或執行前強制對齊固定座標。Unity 跑完整批模擬及手臂收尾後，在還原積木之前拍攝覆蓋率照片；拍攝期間排除手臂模型與其陰影。模擬畫面轉成 bitmap，再與原始目標 bitmap 比較 overlap，公式與門檻維持原樣。比對通過就顯示成功並結束本次任務，不再送出手臂動作、不呼叫 global_validation、不進入下一輪；服務繼續等待新的使用者指令。
+
+立體圖形（2026-10-07 從 main 搬來）：拆解的 LLM 判斷需要排出往上疊、立起來的圖形時，另寫一行「需要立體 bitmap」（平面仍是「需要平面 bitmap」），就用 release 260917 的 `SpatialPatternDesigner` 畫俯視高度圖（每格的數字 = 那格疊幾層；prompt 是 260917 原文，生成的 prompt 最後多一行說明 column_heights 的列、欄各對應哪個方向，畫布照 260917 的正面一排 × 3 欄 × 3 層），跟平面一樣 OpenAI／Gemini 各畫一張、互審對方的正面圖、80/20 匿名評分，最多兩輪。規劃一樣自己選位置並寫 `bitmap_grid`，`top_z` 是放在桌面那一層的頂面，往上每層加一塊積木高；每一格的每一層各是一個預期格。目標是立體時一律走 3D：Unity 預覽結束後逐層切開拍（第 1 張含桌面，第 k 張只留比第 k 層中間高的部分），量出每格疊到第幾層，重疊率 = Σ min(畫面層數, 預期層數) ÷ Σ max(…)，過門檻才送 URSim 給 Isaac 驗證；2D 那種「比對通過就結束」只適用平面，立體照舊由 Isaac 幾何、畫面判定與整體驗證決定成不成功。3D 批次的手臂自撞改用手臂模型外型（`ArmMeshSelfCollision.cs`，手臂與夾爪的模型檔要開 Read/Write），Isaac 驗證期間也用 USD 碰撞體檢查自撞，碰到就判驗證不通過、實機不動。
 
 ```
 Unity UI（輸入指令）
@@ -156,7 +158,7 @@ UR 基座 → Isaac 世界在啟動時用 FK 自動校正（本資產實測差 1
 
 ## 純模擬：不接相機與實體手臂
 
-Unity 右上角的「模式」按鈕一鍵切換實機 / 純模擬（寫 `unity_project/Assets/StreamingAssets/run_mode.json`），
+Unity 下方指令列的「模式」按鈕一鍵切換實機 / 純模擬（寫 `unity_project/Assets/StreamingAssets/run_mode.json`），
 csharp_server 每個任務開始時讀一次，整個任務都用同一個模式。LLM 的 prompt 與整個規劃、驗證流程兩種模式完全相同。
 
 | | 實機 | 純模擬 |
@@ -172,7 +174,7 @@ csharp_server 每個任務開始時讀一次，整個任務都用同一個模式
 1. URSim 虛擬機開機、切 Remote Control。
 2. `D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui`（3D 疊放才需要；2D 沒開 Isaac 時自動改用內建的虛擬世界）
 3. `cd csharp_server` 後 `dotnet run`
-4. Unity Play → 右上角「模式」切成純模擬 →「場景」按鈕輪流切換 `sim_scenes/` 裡的檔案 → 輸入指令。
+4. Unity Play → 下方指令列的「模式」切成純模擬 →「場景」按鈕輪流切換 `sim_scenes/` 裡的檔案 → 輸入指令。
 
 切到純模擬、按「場景」換檔，或在純模擬下重開 Unity 的當下，桌面都重置成場景檔：Unity 先畫出場景檔的積木，同時呼叫 Isaac 的 `/sim/load` 重建模擬世界（連不上 Isaac 時，作廢上次留下的內建虛擬世界 `sim_world.json`），
 載入完改顯示 Isaac 回報的位置（物理落定後）；結果顯示在狀態列。Isaac 還沒開時畫面先顯示場景檔，等 Isaac 開好、

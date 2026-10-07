@@ -135,6 +135,30 @@ public static class LayeredHeights
         return problems;
     }
 
+    /// <summary>
+    /// 沒被搬、但最後壓在這一輪放下的積木底下的場景積木（key = 場景 index，值 = 頂面，SceneTops 的算法）。
+    /// 它們也是 3D 結構的一部分，畫高度圖、給 Unity 比對時跟放下的積木一起算。placed 是最後的擺放（Z = 放好後的頂面）。
+    /// </summary>
+    public static Dictionary<int, double> UnmovedSupports(IReadOnlyList<TranslatedStep> steps, IReadOnlyList<SceneObject> scene,
+        IEnumerable<SceneObject> placed)
+    {
+        var moved = steps.Select(s => s.SourceIndex).ToHashSet();
+        var placedBlocks = placed.Select(o =>
+        {
+            var (halfX, halfY) = HalfExtents(o.Shape, o.Orientation);
+            return new Block { X = o.X, Y = o.Y, HalfX = halfX, HalfY = halfY, Top = o.Z };
+        }).ToList();
+        var supports = new Dictionary<int, double>();
+        foreach (var (i, top) in SceneTops(scene))
+        {
+            if (moved.Contains(i)) continue;
+            var (halfX, halfY) = HalfExtents(scene[i].Shape, scene[i].Orientation);
+            if (placedBlocks.Any(b => b.Top > top + LayeredGraspGeometry.BlockLayerM / 2 && Overlaps(b, scene[i].X, scene[i].Y, halfX, halfY)))
+                supports[i] = top;
+        }
+        return supports;
+    }
+
     // 這一步結束時已放開（最後一次 release 在最後一次 grasp 之後）；還夾著的積木不在桌上
     static bool EndsReleased(List<RobotFunctionCall> actions)
     {

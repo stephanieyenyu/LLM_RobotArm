@@ -54,6 +54,19 @@ try { canonicalPlan.ForUnity("bitmap_grid(0.1, 0.3, 0, 0.05, 0.025)"); } catch (
 Check(badSpacingRejected, "invalid zero grid spacing is rejected as an interface error");
 Check(!canonicalPlan.PlanningConstraint.Contains("X <") && !canonicalPlan.PlanningConstraint.Contains("Targets:"),
     "placement prompt does not impose supply zoning or fixed target coordinates");
+// 立體 bitmap（俯視高度圖）：每一格的每一層各一個預期格，Z = top_z + (層 - 1) × 積木高，位置一樣用 LLM 宣告的座標系
+var spatialPlan = new DualBitmapPlan { Rows = new() { "311" }, HeightMap = true };
+var spatialLayout = spatialPlan.ForUnity("bitmap_grid(0.50, 0.20, 0.05, 0.06, 0.025)");
+var leftColumn = spatialLayout.Cells.Where(c => c.Col == 0).OrderBy(c => c.Z).ToList();
+Check(spatialLayout.Cells.Count == 5 && leftColumn.Count == 3 &&
+      leftColumn.Select(c => Math.Round(c.Z, 4)).SequenceEqual(new[] { 0.025, 0.05, 0.075 }) &&
+      leftColumn.All(c => c.X == 0.50 && c.Y == 0.20) &&
+      spatialLayout.Cells.Where(c => c.Col > 0).All(c => c.Z == 0.025) &&
+      Math.Abs(spatialLayout.Cells.Single(c => c.Col == 2).X - 0.60) < 1e-9,
+      "a 3D height-map bitmap expands to one expected cell per layer in the LLM-selected frame");
+Check(spatialPlan.PlanningConstraint.Contains("俯視高度圖") && spatialPlan.PlanningConstraint.Contains("\n311\n") &&
+      !spatialPlan.PlanningConstraint.Contains("X <"),
+      "the 3D planning text shows the height map without supply zoning or fixed coordinates");
 Check(ExperimentChecks.Matches(baseline, new[] { Piece(0.15), Piece(0.1) }), "reset matching ignores detection order");
 Check(!ExperimentChecks.Matches(baseline, new[] { Piece(0.1), Piece(0.1) }), "duplicate detection cannot satisfy two baseline pieces");
 Check(!ExperimentChecks.Matches(baseline, new[] { Piece(0.1), Piece(0.2) }), "changed state fails reset gate");

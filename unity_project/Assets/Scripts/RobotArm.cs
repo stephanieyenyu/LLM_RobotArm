@@ -213,6 +213,13 @@ public class RobotArm : MonoBehaviour
         }
     }
 
+    // 依關節角算各節姿勢要用的基準（ArmMeshSelfCollision 用；只讀，不改動手臂本身）
+    public Quaternion RestRotation(int i)
+    {
+        EnsureBaseline();
+        return startRotations[i];
+    }
+    public static Vector3 AxisVector(Axis axis) => axisTovector3(axis);
     static Vector3 axisTovector3(Axis axis)
     {
         switch (axis)

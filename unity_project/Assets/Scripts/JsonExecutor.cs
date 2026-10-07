@@ -833,7 +833,8 @@ public class JsonExecutor : MonoBehaviour
                 yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
-            if (bitmapCheckErrors != null && bitmapCheckPassed)
+            // 2D：比對通過就是這次任務成功，不送手臂。3D（layered_grasp）通過後照常送 URSim，由 Isaac 驗證與整體驗證判定
+            if (bitmapCheckErrors != null && bitmapCheckPassed && !batch.layered_grasp)
             {
                 if (robotArm != null) robotArm.followRealRobotFeedback = true;
                 RobotArm.FreezeVisualFeedback = false;
@@ -1659,8 +1660,9 @@ public class JsonExecutor : MonoBehaviour
     const float CoverageMarginCells = 2.5f;                    // 畫面邊界外推幾格，確保四角落在圖案外面能當底色參考
     const float CoverageOccupiedColorDeltaThreshold = 0.12f;   // 跟底色的顏色距離超過這個就算「這格有方塊」
 
+    // sliceFloorM（立體逐層用）：只拍比這個 QR 高度高的部分（遠裁切面放在這裡、桌面被切掉），背景改洋紅；NaN = 照舊含桌面
     bool[,] CaptureCoverageGrid(int rows, int cols, float anchorX, float anchorY, float cellX, float cellY,
-        int anchorRow, int anchorCol, int batchId, out string savedImagePath)
+        int anchorRow, int anchorCol, int batchId, out string savedImagePath, float sliceFloorM = float.NaN, int layer = 1)
     {
         savedImagePath = null;
         Vector2 CellCenterQR(int r, int c) =>
@@ -1704,6 +1706,13 @@ public class JsonExecutor : MonoBehaviour
         cam.backgroundColor = Color.black;
         cam.transform.position = centerUnity + coverageFrame.up;
         cam.transform.rotation = coverageFrame.rotation * Quaternion.Euler(90f, 0f, 0f);
+        if (!float.IsNaN(sliceFloorM))
+        {
+            Vector3 floorWorld = coverageFrame.TransformPoint(SceneSyncer.QRToUnity(centerQrX, centerQrY, sliceFloorM));
+            cam.farClipPlane = Mathf.Max(cam.nearClipPlane + 0.001f,
+                Vector3.Dot(floorWorld - cam.transform.position, cam.transform.forward));
+            cam.backgroundColor = Color.magenta;   // 黃、黑方塊都跟洋紅背景分得開
+        }
 
         var rt = new RenderTexture(width, height, 16);
         cam.targetTexture = rt;
@@ -1778,7 +1787,8 @@ public class JsonExecutor : MonoBehaviour
 
         try
         {
-            savedImagePath = Path.Combine(Application.streamingAssetsPath, $"coverage_batch_{batchId}.jpg");
+            savedImagePath = Path.Combine(Application.streamingAssetsPath,
+                float.IsNaN(sliceFloorM) ? $"coverage_batch_{batchId}.jpg" : $"coverage_batch_{batchId}_layer{layer}.jpg");
             File.WriteAllBytes(savedImagePath, tex.EncodeToJPG(85));
         }
         catch (Exception e)
@@ -1865,7 +1875,9 @@ public class JsonExecutor : MonoBehaviour
             {
                 float d = Vector2.Distance(new Vector2(expected[e].x, expected[e].y),
                                            new Vector2(candidates[c].qr.x, candidates[c].qr.y));
-                if (d <= bitmapXYToleranceM) pairs.Add((e, c, d));
+                // 立體批次同一格疊了好幾塊：排序時高度差也算進距離，各層才配到對的那塊（2D 不變）
+                float dz = batch.layered_grasp ? candidates[c].qr.z - expected[e].z : 0f;
+                if (d <= bitmapXYToleranceM) pairs.Add((e, c, batch.layered_grasp ? Mathf.Sqrt(d * d + dz * dz) : d));
             }
         pairs.Sort((a, b) => a.d.CompareTo(b.d));
         var matchOf = Enumerable.Repeat(-1, expected.Count).ToArray();
@@ -1970,6 +1982,13 @@ public class JsonExecutor : MonoBehaviour
         }
 
         // ---- 渲染圖逐格比對：這才是送不送實機的依據 ----
+        // 立體批次（layered_grasp）改成逐層切開拍、比每格疊到第幾層（RunLayeredCoverage），2D 照舊
+        if (batch.layered_grasp)
+        {
+            RunLayeredCoverage(batch, expected, rows, cols, anchorX, anchorY, cellX, cellY, anchor,
+                errors, stateOverlap, correct, stateResultRows, matchLog);
+            return;
+        }
         var occupied = CaptureCoverageGrid(rows, cols, anchorX, anchorY, cellX, cellY,
             anchor.row, anchor.col, batch.batch_id, out string coverageImagePath);
 
@@ -2051,6 +2070,99 @@ public class JsonExecutor : MonoBehaviour
             overlap_ratio = overlap,
             overlap_threshold = bitmapOverlapThreshold,
             expected_rows = batch.bitmap ?? new List<string>(),
+            result_rows = resultRows,
+            errors = errors,
+            notes = new List<string>(simPlacementNotes),
+        });
+    }
+
+    // 立體 bitmap（2026-10-07 從 main 搬來）：逐層切開拍俯視畫面，得到每一格疊到第幾層，跟預期的層數比。
+    // 第 1 張照常拍（含桌面），第 k 張（k ≥ 2）把遠裁切面放在第 k 層中間的高度，只留比它高的部分。
+    // 重疊率 = Σ min(畫面層數, 預期層數) ÷ Σ max(畫面層數, 預期層數)；全部只有 1 層時跟 2D 的逐格比對相同。
+    // 預期層數 = 那一格的預期格數（server 每一層給一個預期格），不看 LLM 填的 top_z
+    void RunLayeredCoverage(BatchEnvelope batch, List<ExpectedCell> expected, int rows, int cols,
+        float anchorX, float anchorY, float cellX, float cellY, ExpectedCell anchor, List<string> errors,
+        float stateOverlap, int stateCorrect, List<string> stateResultRows, List<string> matchLog)
+    {
+        var want = new int[rows, cols];
+        foreach (var exp in expected)
+            if (exp.row >= 0 && exp.row < rows && exp.col >= 0 && exp.col < cols) want[exp.row, exp.col]++;
+        int maxWant = 0;
+        foreach (int h in want) maxWant = Mathf.Max(maxWant, h);
+        int slices = Mathf.Min(maxWant + 1, 9);   // 多拍一層，疊太高也看得出來
+        float layerM = (float)LayeredGraspGeometry.BlockLayerM;
+        var got = new int[rows, cols];
+        var images = new List<string>();
+        for (int k = 1; k <= slices; k++)
+        {
+            var occupied = CaptureCoverageGrid(rows, cols, anchorX, anchorY, cellX, cellY, anchor.row, anchor.col,
+                batch.batch_id, out string image, k == 1 ? float.NaN : (k - 0.5f) * layerM, k);
+            if (image != null) images.Add(image);
+            for (int r = 0; r < rows; r++)
+                for (int c = 0; c < cols; c++)
+                    if (occupied[r, c]) got[r, c] = Mathf.Max(got[r, c], k);
+        }
+
+        int sumMin = 0, sumMax = 0, wantCells = 0, correctCells = 0;
+        var imageErrors = new List<string>();
+        var wantRows = new List<string>();
+        var resultRows = new List<string>();
+        for (int r = 0; r < rows; r++)
+        {
+            var wantLine = new System.Text.StringBuilder();
+            var gotLine = new System.Text.StringBuilder();
+            for (int c = 0; c < cols; c++)
+            {
+                sumMin += Mathf.Min(want[r, c], got[r, c]);
+                sumMax += Mathf.Max(want[r, c], got[r, c]);
+                if (want[r, c] > 0)
+                {
+                    wantCells++;
+                    if (got[r, c] == want[r, c]) correctCells++;
+                }
+                if (want[r, c] != got[r, c])
+                    imageErrors.Add($"r{r}c{c}：預期 {want[r, c]} 層，畫面上 {got[r, c]} 層");
+                wantLine.Append(want[r, c]);
+                gotLine.Append(got[r, c]);
+            }
+            wantRows.Add(wantLine.ToString());
+            resultRows.Add(gotLine.ToString());
+        }
+        float overlap = sumMax > 0 ? (float)sumMin / sumMax : 0f;
+        bool passed = overlap > bitmapOverlapThreshold;
+        errors.InsertRange(0, imageErrors);
+
+        var report = new System.Text.StringBuilder();
+        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ 逐層渲染圖比對吻合" : "✗ 逐層渲染圖比對不吻合")}，" +
+                          $"重疊率 {overlap * 100f:F0}%（要大於 {bitmapOverlapThreshold * 100f:F0}%），" +
+                          $"層數正確 {correctCells}/{wantCells} 格，渲染圖：{(images.Count > 0 ? string.Join("、", images) : "存檔失敗")}");
+        report.AppendLine("  預期層數    渲染圖逐層量到的層數（0 = 空）");
+        for (int r = 0; r < rows; r++)
+            report.AppendLine($"  {wantRows[r].PadRight(cols)}          {resultRows[r]}");
+        report.AppendLine($"  （內部狀態比對僅供除錯參考，不影響過關與否：重疊率 {stateOverlap * 100f:F0}%，放對 {stateCorrect}）");
+        for (int r = 0; r < rows; r++)
+            report.AppendLine($"    {wantRows[r].PadRight(cols)}          {stateResultRows[r]}");
+        foreach (var error in errors) report.AppendLine("  - " + error);
+        foreach (var note in simPlacementNotes) report.AppendLine("  · " + note);
+        report.AppendLine("  配對明細（狀態比對）：");
+        foreach (var m in matchLog) report.AppendLine("    " + m);
+        if (passed) Debug.Log(report.ToString());
+        else Debug.LogWarning(report.ToString());
+
+        bitmapCheckErrors = errors;
+        bitmapOverlapRatio = overlap;
+        bitmapCheckPassed = passed;
+        WriteSimulationCheckReport(new SimulationCheckReport
+        {
+            batch_id = batch.batch_id,
+            performed = true,
+            passed = passed,
+            verification_enabled = verificationEnabled,
+            expected_count = wantCells,
+            correct_count = correctCells,
+            overlap_ratio = overlap,
+            overlap_threshold = bitmapOverlapThreshold,
+            expected_rows = wantRows,
             result_rows = resultRows,
             errors = errors,
             notes = new List<string>(simPlacementNotes),
@@ -2403,6 +2515,19 @@ public class JsonExecutor : MonoBehaviour
             }
         }
 
+        // 3D 批次的自撞改用手臂模型本身的外型（ArmMeshSelfCollision）：下面的膠囊沿 DH 骨架走，沒算到上臂實際往側邊偏，
+        // 夾爪貼著上臂下降時會漏掉（2026-10-07 從 main 搬來）。外型建不起來才退回膠囊。2D 照舊用膠囊
+        if (layeredCollisionModel && ArmMeshModel() is ArmMeshSelfCollision armMesh)
+        {
+            if (armMesh.Collides(q, out string hit))
+            {
+                error = $"{SelfCollisionText}：{hit}";
+                return false;
+            }
+            error = null;
+            return true;
+        }
+
         for (int a = 0; a < 6; a++)
         {
             for (int b = a + 2; b < 6; b++)
@@ -2429,6 +2554,27 @@ public class JsonExecutor : MonoBehaviour
         }
         error = null;
         return true;
+    }
+
+    // 3D 手臂自撞用的手臂外型：第一次用到時建一次（場景裡的方塊不算進手臂）；建不起來就印原因，之後退回膠囊
+    ArmMeshSelfCollision armMeshSelfCollision;
+    bool armMeshSelfCollisionTried;
+    ArmMeshSelfCollision ArmMeshModel()
+    {
+        if (armMeshSelfCollisionTried) return armMeshSelfCollision;
+        armMeshSelfCollisionTried = true;
+        var blocks = sceneSyncer != null
+            ? sceneSyncer.GetCurrentCubes().Where(b => b != null).Select(b => b.transform)
+            : Enumerable.Empty<Transform>();
+        var model = new ArmMeshSelfCollision(robotArm, blocks);
+        if (model.Error != null)
+            Debug.LogWarning($"[Executor] 3D 手臂自撞檢查用不了手臂模型外型（{model.Error}），退回膠囊近似");
+        else
+        {
+            armMeshSelfCollision = model;
+            Debug.Log("[Executor] 3D 手臂自撞檢查：" + model.Summary);
+        }
+        return armMeshSelfCollision;
     }
 
     static Vector3 ToVector3(double[] p) => new Vector3((float)p[0], (float)p[1], (float)p[2]);
