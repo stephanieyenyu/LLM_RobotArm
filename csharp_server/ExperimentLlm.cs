@@ -42,17 +42,7 @@ public sealed class ExperimentLlm
         "執行介面提供 move_above(location,height_m)、descend(location)、grasp()、release()、lift(location,height_m)、wait(seconds)。location 可為 source 或 target；source 是本次操作所選的來源物件，target 是把來源物件放到的位置，target 的 Z 指來源物件放好後的頂面高度（與場景物件 Z 同一慣例）；height_m 是端點上方的距離。" +
         "參數範圍：height_m 0.05～0.15 m，seconds 0.1～3；單次最多 50 個操作，每個操作最多 20 個函式。同一個操作內的函式依序執行，中途不會重新感知；每個操作開始前系統會重新觀測來源物件位置。" +
         GripperFacts +
-        "介面不提供任意 XY 偏移、條件分支或同輪失敗後續跑；每輪只能提交一條確定且可執行的動作路徑，執行失敗後由下一輪根據新觀測重規劃。整批動作完成後，執行器會在收尾路徑安全時回到 Ready/Home；若收尾路徑不安全，會留在最後的安全抬升位置，不會因此否定已完成的任務動作。規劃內不得自行加入 go_home。這只是設備能力說明，不規定任務拆解、動作順序或完成方式。\n" +
-        "低階操作範例（僅示範介面語意，不是固定解法）：\n" +
-        "若要將目前場景 index 0 的物件移到桌面位置 x=0.10、y=0.15、z=0.02：\n" +
-        "move_above(source, 0.12)\n" +
-        "descend(source)\n" +
-        "grasp()\n" +
-        "lift(source, 0.12)\n" +
-        "move_above(target, 0.12)\n" +
-        "descend(target)\n" +
-        "release()\n" +
-        "lift(target, 0.12)\n" +
+        "介面不提供任意 XY 偏移、條件分支或同輪失敗後續跑；每輪只能提交一條確定且可執行的動作路徑，執行失敗後由下一輪根據新觀測重規劃。整批動作完成後，執行器會在收尾路徑安全時回到 Ready/Home；若收尾路徑不安全，會留在最後的安全抬升位置，不會因此否定已完成的任務動作。規劃內不得自行加入 go_home。這只是設備能力說明，不規定任務拆解、動作順序或完成方式；抬升、移動、下降、抓取／放開要怎麼排序、高度怎麼選，由你自己決定。\n" +
         "請根據實際目標與目前觀測，自行規劃操作。迭代執行期間無法向使用者追問或等待補充資料；本輪計畫只能使用提示中已有的目標、場景與結果，每一輪都是獨立的新嘗試，不會沿用先前輪次的任何判斷。請以自然語言自行決定本輪操作與參數。為讓本地執行介面忠實辨識你的決定，每組抓放都必須在同一行寫出「source index N → target (x, y, z)」，並在「執行路徑開始」與「執行路徑結束」之間依相同順序逐行列出要執行的函式呼叫。", image, dir, "operation_plan");
     public Task<TranslatedPlan> Translate(string plan, List<SceneObject> scene, string dir)
     {
