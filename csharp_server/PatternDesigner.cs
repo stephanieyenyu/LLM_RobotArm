@@ -14,7 +14,7 @@ public sealed class PatternDesigner
     // 旗標檔由 Unity 指令列的「pattern審查」按鈕寫入（"1" = 跳過審查），
     // 每次 DesignAsync 都重讀一次，切換後不需要重開 csharp_server。
     const string SkipReviewFlagPath = "../unity_project/Assets/StreamingAssets/skip_pattern_review.txt";
-    public static bool SkipReview
+    static bool SkipReview
     {
         get
         {
@@ -34,19 +34,17 @@ public sealed class PatternDesigner
     readonly string geminiModel;
     readonly int maxRows, maxCols;
     readonly JsonSerializerOptions jsonOptions = new() { PropertyNameCaseInsensitive = true };
-    readonly bool geminiKeyMissing;
 
     public PatternDesigner(int maxRows, int maxCols, string openAiModel = "gpt-5", string? geminiModel = null)
     {
         var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
         var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY");
         if (string.IsNullOrWhiteSpace(openAiKey)) throw new InvalidOperationException("OPENAI_API_KEY is not set.");
-        // 2026-10-02：沒有 GEMINI_API_KEY 也能啟動（pattern審查關掉時只用 OpenAI）；要交叉審查時才回報缺 key
-        geminiKeyMissing = string.IsNullOrWhiteSpace(geminiKey);
+        if (string.IsNullOrWhiteSpace(geminiKey)) throw new InvalidOperationException("GEMINI_API_KEY is not set.");
         openAi = new ChatClient(openAiModel, openAiKey);
         this.geminiModel = geminiModel ?? Environment.GetEnvironmentVariable("GEMINI_MODEL") ?? "gemini-3.1-flash-lite";
         gemini = new HttpClient { Timeout = TimeSpan.FromSeconds(150) };
-        if (!geminiKeyMissing) gemini.DefaultRequestHeaders.Add("x-goog-api-key", geminiKey);
+        gemini.DefaultRequestHeaders.Add("x-goog-api-key", geminiKey);
         gemini.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         this.maxRows = maxRows;
         this.maxCols = maxCols;
@@ -74,9 +72,6 @@ public sealed class PatternDesigner
             };
         }
 
-        if (geminiKeyMissing)
-            throw new PatternDesignUnavailableException("沒有設定 GEMINI_API_KEY，不能做雙模型交叉審查：設定後重開 csharp_server，" +
-                                                        "或在 Unity 把「pattern審查」關掉（只用 OpenAI 畫一次）。");
         string openFeedback = layoutFeedback, geminiFeedback = layoutFeedback;
 
         for (int round = 1; round <= MaxRounds; round++)
@@ -170,7 +165,6 @@ public sealed class PatternDesigner
             new SystemChatMessage(GenerationPrompt(cubes, dominoes)),
             new UserChatMessage(GenerationRequest(command, color, feedback)),
         }, options);
-        DesignLog.Write("openai_generate", GenerationPrompt(cubes, dominoes), GenerationRequest(command, color, feedback), completion.Content[0].Text);
         return ParseCandidate(completion.Content[0].Text, "OpenAI");
     }
 
@@ -188,7 +182,6 @@ public sealed class PatternDesigner
             new SystemChatMessage(ReviewPrompt()),
             new UserChatMessage(ReviewRequest(command, candidate, localError)),
         }, options);
-        DesignLog.Write("openai_review", ReviewPrompt(), ReviewRequest(command, candidate, localError), completion.Content[0].Text);
         return ParseReview(completion.Content[0].Text);
     }
 
@@ -206,7 +199,6 @@ public sealed class PatternDesigner
             new SystemChatMessage(BallotPrompt()),
             new UserChatMessage(BallotRequest(command, candidates)),
         }, options);
-        DesignLog.Write("openai_ballot", BallotPrompt(), BallotRequest(command, candidates), completion.Content[0].Text);
         return ParseBallot(completion.Content[0].Text);
     }
 
@@ -237,10 +229,8 @@ public sealed class PatternDesigner
         using var doc = JsonDocument.Parse(responseBody);
         var candidates = doc.RootElement.GetProperty("candidates");
         if (candidates.GetArrayLength() == 0) throw new InvalidOperationException("Gemini response contains no candidate.");
-        string text = candidates[0].GetProperty("content").GetProperty("parts")[0].GetProperty("text").GetString()
+        return candidates[0].GetProperty("content").GetProperty("parts")[0].GetProperty("text").GetString()
             ?? throw new InvalidOperationException("Gemini response contains no text.");
-        DesignLog.Write("gemini", system, user, text);
-        return text;
     }
 
     string GenerationPrompt(int cubes, int dominoes) => $$"""

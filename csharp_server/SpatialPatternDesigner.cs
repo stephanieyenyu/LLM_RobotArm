@@ -88,7 +88,6 @@ public sealed class SpatialPatternDesigner
         string responseText = completion.Content.Count > 0
             ? completion.Content[0].Text
             : "";
-        DesignLog.Write("spatial_design", messages, responseText);
         if (string.IsNullOrWhiteSpace(responseText))
         {
             throw new InvalidOperationException(
@@ -165,7 +164,6 @@ public sealed class SpatialPatternDesigner
         string responseText = completion.Content.Count > 0
             ? completion.Content[0].Text
             : "";
-        DesignLog.Write("spatial_orientation_review", messages, responseText);
         var review = JsonSerializer.Deserialize<OrientationReview>(responseText)
                      ?? throw new InvalidOperationException(
                          "3D orientation review response parse failed.");

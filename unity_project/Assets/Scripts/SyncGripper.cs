@@ -145,38 +145,6 @@ public class SyncGripper : MonoBehaviour
         lastGripClosed = false;
     }
 
-    public void SetManualGrip(bool closed)
-    {
-        previewGripClosed = false;
-        previewOverrideActive = false;
-
-        if (robotArm != null)
-        {
-            if (robotArm.Outputs == null || digitalOutputIndex >= robotArm.Outputs.Length)
-                robotArm.Outputs = new bool[Mathf.Max(digitalOutputIndex + 1, 18)];
-            robotArm.Outputs[digitalOutputIndex] = closed;
-        }
-
-        if (closed)
-        {
-            if (!lastGripClosed)
-            {
-                wantingToGrab = true;
-                wantingToGrabStart = Time.time;
-                wantingToGrabMinDist = float.MaxValue;
-                wantingToGrabMinCube = "";
-                Debug.Log("[SyncGripper] manual grasp → 進入 wantingToGrab，等待 TCP 靠近 cube");
-            }
-        }
-        else
-        {
-            wantingToGrab = false;
-            ReleaseHeldCube();
-        }
-
-        lastGripClosed = closed;
-    }
-
     // Timeout 時印出最近 cube 距離，方便判斷 threshold 要不要調
     void LogNearestCubeOnTimeout()
     {

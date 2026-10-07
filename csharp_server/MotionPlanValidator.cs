@@ -36,16 +36,19 @@ public static class MotionPlanValidator
         var source = assignment.Source;
         var target = assignment.Target;
         if (!InsideWorkspace(source.X, source.Y) || !InsideWorkspace(target.WorldX, target.WorldY))
-            // 會進到 LLM 的回饋：只給座標、不給允許範圍（可達範圍不給 LLM，2026-10-02 起）
             return Fail(
                 $"source or target is outside the validated QR workspace " +
                 $"(source=({source.X:F3},{source.Y:F3}), " +
-                $"target=({target.WorldX:F3},{target.WorldY:F3}))",
+                $"target=({target.WorldX:F3},{target.WorldY:F3}), " +
+                $"allowed X={MinX - WorkspaceMeasurementToleranceM:F3}.." +
+                $"{MaxX + WorkspaceMeasurementToleranceM:F3}, " +
+                $"Y={MinY - WorkspaceMeasurementToleranceM:F3}.." +
+                $"{MaxY + WorkspaceMeasurementToleranceM:F3})",
                 out error);
 
         double transferDistance = Distance2D(source.X, source.Y, target.WorldX, target.WorldY);
         if (transferDistance > MaxTransferDistanceM)
-            return Fail($"transfer distance {transferDistance:F3} m is too long", out error);
+            return Fail($"transfer distance {transferDistance:F3} m exceeds {MaxTransferDistanceM:F2} m", out error);
 
         // Scene snapshots create new SceneObject instances, so ReferenceEquals cannot
         // identify the source. Exclude it by name and position instead.
@@ -83,8 +86,9 @@ public static class MotionPlanValidator
         if (plan.ActionSequence.Count > 20)
             return Fail("action_sequence exceeds 20 calls", out error);
 
+        string phase = "start";
         bool holding = false;
-        bool atContactHeight = false;
+        bool released = false;
 
         for (int i = 0; i < plan.ActionSequence.Count; i++)
         {
@@ -110,38 +114,47 @@ public static class MotionPlanValidator
             if (a.Function == "wait" && (a.Seconds is < 0.1 or > 3.0 || a.Seconds == null))
                 return Fail($"call {i}: seconds must be 0.1..3.0", out error);
 
-            // These checks enforce current hardware state only. They do not
-            // prescribe a task recipe or require a particular final state.
             switch (a.Function)
             {
-                case "move_above":
-                    atContactHeight = false;
+                case "move_above" when a.Location == "source" && !holding:
+                    phase = "above_source";
                     break;
-                case "descend":
-                    atContactHeight = true;
+                case "descend" when a.Location == "source" && phase == "above_source" && !holding:
+                    phase = "at_source";
                     break;
-                case "grasp" when !holding:
+                case "grasp" when phase == "at_source" && !holding:
                     holding = true;
+                    phase = "grasped";
                     break;
-                case "grasp":
-                    return Fail($"call {i}: grasp requested while gripper state already holds an object", out error);
-                case "release":
+                case "lift" when a.Location == "source" && phase == "grasped" && holding:
+                    phase = "carrying_safe";
+                    break;
+                case "move_above" when a.Location == "target" && phase == "carrying_safe" && holding:
+                    phase = "above_target";
+                    break;
+                case "descend" when a.Location == "target" && phase == "above_target" && holding:
+                    phase = "at_target";
+                    break;
+                case "release" when phase == "at_target" && holding:
                     holding = false;
+                    released = true;
+                    phase = "released";
                     break;
-                case "lift":
-                    atContactHeight = false;
+                case "lift" when a.Location == "target" && phase == "released" && !holding:
+                    phase = "retreated";
                     break;
-                case "go_home" when holding:
-                    return Fail($"call {i}: go_home while holding an object is unsafe", out error);
-                case "go_home" when atContactHeight:
-                    return Fail($"call {i}: go_home from contact height is unsafe; first move vertically clear", out error);
-                case "go_home":
-                    atContactHeight = false;
+                case "go_home" when phase == "retreated" && !holding:
+                    phase = "home";
                     break;
                 case "wait":
                     break;
+                default:
+                    return Fail($"call {i}: unsafe order for {a.Function}", out error);
             }
         }
+
+        if (!released || holding || phase is not ("retreated" or "home"))
+            return Fail("plan must release and retreat safely above the target", out error);
         return true;
     }
 

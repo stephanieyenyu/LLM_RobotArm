@@ -252,11 +252,8 @@ public static class Verifier
                              trackedHeightIncreaseEvidence != null ||
                              mergedStackSilhouetteEvidence != null;
 
-        bool sourceAndTargetOverlap = Distance2D(
-            step.Source.X, step.Source.Y, step.Target.WorldX, step.Target.WorldY) <= SOURCE_MATCH_M;
-
-        if (result.TargetOccupied && result.ShapeMatch && result.ColorMatch && heightMatches &&
-            (result.SourceRemoved || (!requireStackHeight && sourceAndTargetOverlap)))
+        if (result.SourceRemoved && result.TargetOccupied && result.ShapeMatch &&
+            result.ColorMatch && heightMatches)
         {
             result.OverallStatus = "ok";
             result.Note = requireStackHeight
@@ -269,9 +266,7 @@ public static class Verifier
                       $"XY error {result.PositionErrorMm:F1} mm. Commanded tower height remains cumulative."
                     : $"Stack verified from visible top/elevated height; lower object may be occluded. " +
                       $"XY error {result.PositionErrorMm:F1} mm, top Z {movedAtTarget!.Z:F3} m."
-                : !result.SourceRemoved
-                    ? $"Near-target placement verified in overlapping source/target area; XY error {result.PositionErrorMm:F1} mm."
-                    : $"Relative move verified; XY error {result.PositionErrorMm:F1} mm.";
+                : $"Relative move verified; XY error {result.PositionErrorMm:F1} mm.";
         }
         else if (!result.SourceRemoved && !result.TargetOccupied)
         {
@@ -296,57 +291,6 @@ public static class Verifier
         }
 
         return result;
-    }
-
-    public static VerifyResult CheckHoldingStep(
-        Assignment step, List<SceneObject> beforeSnapshot, List<SceneObject> afterSnapshot)
-    {
-        var result = new VerifyResult { StepId = step.StepId };
-        if (step.Source == null)
-        {
-            result.OverallStatus = "abort";
-            result.Note = "Holding assignment is missing source.";
-            return result;
-        }
-        result.SourceRemoved = !afterSnapshot.Any(o => o.Name == step.Source.Name &&
-            Distance2D(o.X, o.Y, step.Source.X, step.Source.Y) < SOURCE_MATCH_M);
-        int beforeCount = beforeSnapshot.Count(o => o.Name == step.Source.Name);
-        int afterCount = afterSnapshot.Count(o => o.Name == step.Source.Name);
-        var elevated = afterSnapshot.Where(o => o.Name == step.Source.Name)
-            .Where(o => o.Z >= step.Source.Z + 0.020).OrderByDescending(o => o.Z).FirstOrDefault();
-        bool countDropped = afterCount < beforeCount;
-        if (result.SourceRemoved && (countDropped || elevated != null))
-        {
-            result.OverallStatus = "ok";
-            result.TargetOccupied = elevated != null;
-            result.ShapeMatch = true;
-            result.ColorMatch = true;
-            result.Note = elevated != null
-                ? $"Holding verified by source removal and elevated observation at Z={elevated.Z:F3} m."
-                : "Holding provisionally verified by source removal and object-count decrease; global visual validation remains required.";
-        }
-        else
-        {
-            result.OverallStatus = "retry";
-            result.Note = "No sufficient evidence that the selected source was lifted and remains held.";
-        }
-        return result;
-    }
-
-    /// <summary>
-    /// A batch that only repositions the arm has no object-state outcome to
-    /// verify.  Record successful execution without pretending that the source
-    /// should already have moved or that the goal has been completed.  The
-    /// independent global validator still decides whether the user's goal is met.
-    /// </summary>
-    public static VerifyResult CheckExecutionOnly(Assignment step)
-    {
-        return new VerifyResult
-        {
-            StepId = step.StepId,
-            OverallStatus = "ok",
-            Note = "本批動作未形成可觀測的夾取或放置結果；僅確認執行器已完成，任務結果交由整體驗證判定。"
-        };
     }
 
     private static double Distance2D(double x1, double y1, double x2, double y2)

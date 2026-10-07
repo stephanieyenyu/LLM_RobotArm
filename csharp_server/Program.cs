@@ -1,891 +1,1556 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
 
-var assets = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../unity_project/Assets/StreamingAssets"));
-if (!Directory.Exists(assets)) assets = Path.GetFullPath("../unity_project/Assets/StreamingAssets");
-Directory.CreateDirectory(assets);
-var output = Path.GetFullPath("outputs/experiments");
-Directory.CreateDirectory(output);
-using var http = new HttpClient { BaseAddress = new Uri("http://localhost:5000/"), Timeout = TimeSpan.FromSeconds(5) };
-// 純模擬（Unity「模擬模式」按鈕）：場景與照片改由 Isaac Sim 提供，格式同 perception_server；紀錄另存，不跟實機成功率混在一起
-using var simPerception = new HttpClient { BaseAddress = IsaacSimExecutor.PerceptionBaseUri, Timeout = TimeSpan.FromSeconds(30) };
-var simOutput = Path.GetFullPath("outputs/experiments_sim");
-var perception = http;
-bool sim = false;
-string? loadedSimScene = null;
-// 純模擬沒開 Isaac Sim 時，2D 改用 csharp_server 內建的虛擬世界（VirtualSimWorld）；上次留下的世界檔先清掉
-VirtualSimWorld? virtualWorld = null;
-VirtualSimWorld.Delete(assets);
-// 3D 正式執行沿用驗證過的整批軌跡；驗證後來源積木位置變動超過這個距離（相機抖動以外）就不執行
-const double VerifiedSourceDriftM = 0.010;
-var json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true, WriteIndented = true };
-var model = Environment.GetEnvironmentVariable("ROBOT_MODEL") ?? "gpt-5";
-var llm = new ExperimentLlm(model);
-// release 260917 的 PatternDesigner（prompt 原封不動）：每個任務一開始都先畫目標 bitmap
-// （最多 5×5，OpenAI 與 Gemini 各畫一張、交叉審查、加權投票）；不分類指令
-var patternDesigner = new PatternDesigner(5, 5, model);
-var baselinePath = Path.Combine(output, "initial_scene.json");
-// 預設每個任務以收到指令時的桌面為起點；FIXED_BASELINE=1 才要求每個任務先恢復成同一個固定配置
-bool fixedBaseline = Environment.GetEnvironmentVariable("FIXED_BASELINE") == "1";
-var baseline = fixedBaseline && File.Exists(baselinePath)
-    ? JsonSerializer.Deserialize<List<SceneObject>>(File.ReadAllText(baselinePath), json) : null;
-int stepId = checked((int)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-if (fixedBaseline)
+// -----------------------------------------------------------------
+// 主 orchestrator（分層架構）
+// 每個使用者指令跑一次 5-layer 閉環：
+//   Layer 1 (PatternDesigner)  → CanonicalPattern
+//   Layer 2 (LayoutRealizer)   → List<TargetCell>
+//   Layer 3 (TaskAssigner)     → 每步 1 個 Assignment
+//   Layer 4A (MotionPlanner)   → LLM 組合 robot functions
+//   Layer 4B (Validator/Unity) → 安全驗證後由 Unity 轉成 URScript 並執行
+//   Layer 5 (Verifier)         → 檢查、決定 retry / replan / abort
+// -----------------------------------------------------------------
+
+using HttpClient httpClient = new()
 {
-    Console.WriteLine("自由規劃實驗：每任務最多 10 次；任務間恢復初始桌面，任務內不重置。");
-    Console.WriteLine($"初始配置：{baselinePath}；第一次任務建立。更換配置需停止服務後移除此檔。");
-}
-else
+    BaseAddress = new Uri("http://localhost:5000/"),
+    Timeout = TimeSpan.FromSeconds(5),
+};
+
+var jsonOptions = new JsonSerializerOptions
 {
-    Console.WriteLine("自由規劃實驗：每任務最多 10 次；每個任務以收到指令時的桌面為起點，任務內不重置。");
-    Console.WriteLine("（要求每個任務先恢復同一個固定配置：setx FIXED_BASELINE 1 後重開 terminal）");
+    PropertyNameCaseInsensitive = true,
+    WriteIndented = true,
+};
+
+// 啟動：確認 perception_server 已在執行
+try
+{
+    var health = await httpClient.GetFromJsonAsync<JsonElement>("health", jsonOptions);
+    string status = health.TryGetProperty("status", out var s) ? s.GetString() ?? "?" : "?";
+    Console.WriteLine($"[perception_server] 已連線 (status={status})");
 }
-Console.WriteLine("純模擬 / 實機用 Unity 的「模擬模式」按鈕切換（StreamingAssets/run_mode.json），每個任務開始時讀一次。");
+catch (Exception ex)
+{
+    Console.WriteLine($"[perception_server] 無法連線 → {ex.Message}");
+    return;
+}
+
+// 檔案路徑
+string unityStreamingAssets = "../unity_project/Assets/StreamingAssets";
+string inputPath = Path.Combine(unityStreamingAssets, "user_input.txt");
+string currentStepPath = Path.Combine(unityStreamingAssets, "current_step.json");
+string stepDonePath = Path.Combine(unityStreamingAssets, "step_done.json");
+// Unity 模擬結束比對 bitmap 的結果，印在這個 terminal
+string simCheckPath = Path.Combine(unityStreamingAssets, "sim_check.json");
+string localOutputDir = "outputs";
+Directory.CreateDirectory(localOutputDir);
+
+Console.WriteLine();
+Console.WriteLine("=== LLM Planner（分層架構）已啟動 ===");
+Console.WriteLine($"監聽：{Path.GetFullPath(inputPath)}");
+Console.WriteLine($"每步指令：{Path.GetFullPath(currentStepPath)}");
+Console.WriteLine($"執行回報：{Path.GetFullPath(stepDonePath)}");
+Console.WriteLine("等待 Unity 輸入指令...");
+Console.WriteLine();
+
+// 建立各 layer instance
+var workspace = new WorkspaceBounds();
+var patternDesigner = new PatternDesigner(workspace.MaxRows, workspace.MaxCols);
+var spatialPatternDesigner = new SpatialPatternDesigner(
+    workspace.SpatialRows, workspace.SpatialCols, workspace.SpatialLayers);
+var motionPlanner = new MotionPlanner();
+var commandRouter = new CommandRouter();
+
+// 清空 input 與舊檔案
+if (File.Exists(inputPath)) File.WriteAllText(inputPath, "");
+if (File.Exists(currentStepPath)) File.Delete(currentStepPath);
+if (File.Exists(stepDonePath)) File.Delete(stepDonePath);
+if (File.Exists(simCheckPath)) File.Delete(simCheckPath);
+
+// Keep step IDs unique when dotnet is restarted while Unity remains in Play
+// Mode; otherwise Unity can mistake a new Step 1/2/... for an old command.
+int globalStepId = checked((int)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+const double UNITY_STEP_TIMEOUT_SEC = 600;
+
+// 一鍵開關（實驗組 / 對照組），只控制 Unity「模擬結束比對 bitmap」。
+// 每個指令開頭從 Unity 的旗標檔讀一次，蓋在整批任務上，中途切換不會一半開、一半關。
+// 動作規劃檢查（MotionPlanValidator）一律開著，不受這個開關影響。
+bool verificationEnabled = true;
+
 while (true)
 {
-    var input = Path.Combine(assets, "user_input.txt");
-    if (!File.Exists(input) || string.IsNullOrWhiteSpace(File.ReadAllText(input))) { await Task.Delay(500); continue; }
-    var goal = File.ReadAllText(input).Trim();
-    File.WriteAllText(input, "");
-    RunModeConfig mode;
-    try { mode = RunModeConfig.Load(assets); }
-    catch (InvalidDataException ex)
-    {
-        Console.WriteLine($"[模式] {ex.Message}；不確定是模擬還是實機，這個指令不執行。");
-        continue;
-    }
-    sim = mode.IsSim;
-    perception = sim ? simPerception : http;
-    var root = sim ? simOutput : output;
-    Directory.CreateDirectory(root);
-    var run = Path.Combine(root, $"{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}");
-    Directory.CreateDirectory(run);
-    File.WriteAllText(Path.Combine(run, "task.txt"), goal);
-    if (sim) Console.WriteLine($"[純模擬] 2D 由 Unity 預覽與 bitmap 比對完成就算執行（不連 URSim）；3D 疊放送 URSim 由 Isaac Sim 驗證。" +
-                               $"場景與畫面來自 Isaac Sim，沒開 Isaac 時 2D 改用內建的虛擬世界；紀錄在 {simOutput}。");
-    Save(run, "config.json", new { model, max_attempts = 10, reset_between_tasks = !sim && fixedBaseline,
-        initial_scene_source = sim ? (mode.ResetEachTask ? "sim_scene_file" : "sim_continued")
-            : fixedBaseline ? "fixed_baseline" : "table_at_command",
-        run_mode = sim ? "sim" : "real", sim_scene = sim ? mode.Scene : null,
-        reset_within_task = false, reset_xy_m = ExperimentChecks.ResetXYToleranceM, reset_z_m = ExperimentChecks.ResetZToleranceM,
-        rule_scope = "task", evaluation = "independent_visual_model", started_utc = DateTime.UtcNow });
-    bool success = false;
-    bool executionPending = false;
-    string status = "failed";
-    int attempts = 0;
-    // 每一輪的結果：success 或失敗類型（見下方 stageKind），寫進 result.json 供分開統計轉譯與規劃／執行失敗
-    var attemptOutcomes = new List<string>();
-    var rules = new List<string>();
-    var feedback = "無前次結果。";
-    PatternDesign? design = null;
-    string? designError = null;
-    llm.TargetBitmap = null;
     try
     {
-        if (sim)
+        if (!File.Exists(inputPath))
         {
-            var scenePath = mode.ScenePath(assets);
-            if (mode.ResetEachTask || loadedSimScene != scenePath)
-            {
-                var simScene = SimScene.Load(scenePath);
-                try
-                {
-                    await IsaacSimExecutor.LoadSimSceneAsync(simScene.Objects, simScene.Camera);
-                    virtualWorld = null;
-                    VirtualSimWorld.Delete(assets);
-                    Console.WriteLine($"[純模擬] 用虛擬場景 {mode.Scene} 重建 Isaac Sim 世界（{SceneInventory(simScene.Objects)}）。");
-                }
-                catch (SimulationUnavailableException ex) when (ex.InnerException is HttpRequestException or TaskCanceledException)
-                {
-                    // 連不到 Isaac Sim（不是 Isaac 回報錯誤）：2D 用內建的虛擬世界，遇到 3D 疊放才回報需要 Isaac
-                    virtualWorld = new VirtualSimWorld(simScene.Objects);
-                    virtualWorld.Write(assets);
-                    Console.WriteLine($"[純模擬] 連不到 Isaac Sim，用內建的虛擬世界載入 {mode.Scene}（{SceneInventory(simScene.Objects)}）：" +
-                                      "只支援 2D，沒有物理，畫面是依座標畫的俯視示意圖；3D 疊放需要 Isaac Sim。");
-                }
-                loadedSimScene = scenePath;
-                File.Copy(scenePath, Path.Combine(run, "sim_scene.json"), true);
-            }
+            await Task.Delay(500);
+            continue;
+        }
+
+        string userCommand = File.ReadAllText(inputPath).Trim();
+        if (string.IsNullOrWhiteSpace(userCommand))
+        {
+            await Task.Delay(500);
+            continue;
+        }
+
+        File.WriteAllText(inputPath, "");
+        Console.WriteLine($"收到指令：{userCommand}");
+
+        await RunTaskAsync(userCommand);
+
+        Console.WriteLine();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"錯誤：{ex.Message}");
+        await Task.Delay(500);
+    }
+}
+
+// --- 主任務閉環 ---
+async Task RunTaskAsync(string userCommand)
+{
+    verificationEnabled = VerificationSwitch.ReadEnabled();
+    Console.WriteLine(verificationEnabled
+        ? "[Verification] 模擬結束比對開啟（實驗組）：比對不通過就不送實體手臂"
+        : "[Verification] 模擬結束比對關閉（對照組）：比對結果只記錄，實體手臂照常執行");
+
+    var initialScene = await FetchSceneAsync();
+    if (initialScene.Count == 0)
+    {
+        Console.WriteLine("[CommandRouter] Scene contains no objects with valid coordinates.");
+        return;
+    }
+
+    RoutedCommand routed;
+    try
+    {
+        routed = await commandRouter.RouteAsync(userCommand, initialScene);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[CommandRouter] Failed: {ex.Message}");
+        return;
+    }
+
+    Console.WriteLine($"[CommandRouter] action={routed.Action} — {routed.Reasoning}");
+    switch (routed.Action)
+    {
+        case "arrange_pattern":
+            await RunPatternTaskBatchAsync(userCommand, initialScene);
+            break;
+        case "arrange_3d_pattern":
+            await RunSpatialPatternTaskBatchAsync(userCommand, initialScene);
+            break;
+        case "move_relative":
+            await RunSingleObjectTaskBatchAsync(routed, initialScene);
+            break;
+        case "stack":
+            if (routed.StackSequence.Count > 2 || (routed.ObjectCount ?? 2) > 2)
+                await RunMultiStackTaskBatchAsync(routed, initialScene);
             else
-            {
-                Console.WriteLine("[純模擬] 接續目前的模擬世界（reset_each_task = false）。");
-                // 內建虛擬世界：重寫一次世界檔，Unity 重開或換過場景後畫面才跟接續的世界一致
-                virtualWorld?.Write(assets);
-            }
-            File.WriteAllText(Path.Combine(run, "sim_backend.txt"), virtualWorld != null ? VirtualSimWorld.Source : "isaac_sim");
-        }
-        // 純模擬沒開 Isaac 時，附圖是程式畫的俯視示意圖，提示 LLM 不要當成照片
-        llm.SchematicImage = sim && virtualWorld != null;
-        // 固定基準只用在實機；純模擬的起點是虛擬場景檔（或接續的模擬結果）
-        var fixedStart = !sim ? baseline : null;
-        bool waitForBaseline = fixedBaseline && !sim;
-        List<SceneObject> initial;
-        int stable = 0;
-        List<SceneObject>? previous = null;
-        int resetWaitSeconds = 0;
-        Console.WriteLine(waitForBaseline
-            ? "[任務重置] 將實體積木恢復初始配置後，相機確認桌面即開始；不會自動搬回積木。"
-            : "[任務開始] 以目前桌面為起點，相機連續 3 次看到桌面穩定就開始。");
-        while (true)
-        {
-            initial = await Scene();
-            var expected = fixedStart ?? previous;
-            if (initial.Count > 0 && expected != null && ExperimentChecks.Matches(expected, initial)) stable++;
-            else stable = 0;
-            previous = initial;
-            if (stable >= 3) break;
-            await Task.Delay(1000);
-            resetWaitSeconds++;
-            if (resetWaitSeconds % 15 == 0)
-            {
-                Console.WriteLine(waitForBaseline
-                    ? $"[任務重置] 仍在等待初始桌面，已等待 {resetWaitSeconds} 秒（無逾時限制）。"
-                    : $"[任務開始] 桌面還沒穩定（可能有東西在動或偵測不穩），已等待 {resetWaitSeconds} 秒。");
-                if (expected == null || initial.Count == 0)
-                {
-                    Console.WriteLine($"             目前：{SceneInventory(initial)}");
-                    continue;
-                }
-                // 還沒有基準（或不用固定基準）時是在等連續幾幀穩定，比的是上一幀
-                Console.WriteLine(fixedStart != null
-                    ? $"             基準：{SceneInventory(fixedStart)}；目前：{SceneInventory(initial)}"
-                    : "             等待桌面穩定，跟上一幀比：");
-                foreach (var line in ExperimentChecks.DescribeMismatch(expected, initial))
-                    Console.WriteLine($"             {line}");
-            }
-        }
-        if (waitForBaseline && baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
-        Save(run, "initial_scene.json", initial);
-        Console.WriteLine($"[任務開始] 初始桌面已確認（{SceneInventory(initial)}）；本任務內不再重置。");
-        // 目標 bitmap 設計（release 260917）：選出後每一輪都要把積木排成這張圖。
-        // 指令不是排圖形時沒有目標，照常自由規劃；設計不出可用的圖，任務記為失敗、不進入規劃
-        int maxAttempts = 10;
+                await RunSingleObjectTaskBatchAsync(routed, initialScene);
+            break;
+        default:
+            Console.WriteLine($"[CommandRouter] Unsupported action: {routed.Action}");
+            break;
+    }
+}
+
+async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initialSnap)
+{
+    string blockColor = GuessBlockColor(userCommand, initialSnap);
+    var colorSupplies = initialSnap
+        .Where(s => TaskAssigner.IsInSupplyZone(s) &&
+                    (s.Name == $"{blockColor}_cube" ||
+                     s.Name == $"{blockColor}_domino"))
+        .ToList();
+    var safeColorSupplies = colorSupplies
+        .Where(TaskAssigner.IsSourceReachSafe)
+        .ToList();
+    int cubeBudget = safeColorSupplies.Count(s => s.Name == $"{blockColor}_cube");
+    int dominoBudget = safeColorSupplies.Count(s => s.Name == $"{blockColor}_domino");
+
+    Console.WriteLine($"[Batch] 安全可用庫存：{cubeBudget} cube + {dominoBudget} domino; " +
+                      $"排除 {colorSupplies.Count - safeColorSupplies.Count} 顆不可安全到達的積木。");
+
+    Console.WriteLine($"[Batch] 使用任務開始時的單一 scene snapshot 規劃全部步驟。");
+    Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={blockColor})...");
+
+    CanonicalPattern pattern;
+    try
+    {
+        pattern = await patternDesigner.DesignAsync(
+            userCommand, blockColor, cubeBudget, dominoBudget);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Layer 1] pattern 設計失敗：{ex.Message}");
+        Console.WriteLine(ex.ToString());
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    var realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
+    for (int compactAttempt = 1; realize.Error != null && compactAttempt <= 2; compactAttempt++)
+    {
+        int span = compactAttempt == 1 ? 4 : 3;
+        string feedback = $"Physical placement failed: {realize.Error}. Keep the original target identity and " +
+            $"the same {workspace.MaxRows}x{workspace.MaxCols} canvas. Do not enlarge the canvas or change cell spacing " +
+            $"({workspace.CellSize:F3} m). Redraw a compact recognizable candidate whose occupied bounding box " +
+            $"is at most {span} rows by {span} columns; leave remaining cells empty. " +
+            "If exact recognizable identity cannot fit these constraints, report infeasible instead of forcing it.";
+        Console.WriteLine($"[Layer 2 compact retry] {compactAttempt}/2: 維持畫布與格距，佔用範圍最多 {span}x{span}；重新生成與評審。");
         try
         {
-            design = await DesignTarget(goal, initial, Path.Combine(run, "design"));
-            Save(run, "design.json", design);
-            llm.TargetBitmap = design.Bitmap;
+            pattern = await patternDesigner.DesignAsync(userCommand, blockColor, cubeBudget, dominoBudget,
+                feedback, span);
         }
-        catch (PatternDesignException ex)
-        {
-            designError = ex.Message;
-            maxAttempts = 0;
-            Console.WriteLine($"[Layer 1] pattern 設計失敗：{ex.Message}；這個任務記為失敗，不進入規劃。");
-        }
-        for (int attempt = 1; attempt <= maxAttempts; attempt++)
-        {
-            var dir = Path.Combine(run, $"attempt_{attempt:00}");
-            Directory.CreateDirectory(dir);
-            Console.WriteLine($"[實驗] 第 {attempt}/10 次規劃，保留目前場景。");
-            attempts = attempt;
-            string failure = "", failureKind = "", plan = "", translationText = "（沒有產生轉譯結果）";
-            var local = new List<VerifyResult>();
-            var isaacDir = Path.Combine(dir, "isaac_sim");
-            JsonElement? camera = null;
-            // 系統實際走過的流程，給下一輪規劃與反思當觀測事實；沒有記在這裡的步驟都沒有發生。
-            var trace = new List<string>();
-            string stage = "觀測場景";
-            // 在這個階段停止時記錄的失敗類型：planning（拆解或規劃階段）、translation_format（轉譯輸出讀不懂）、
-            // translation_rejected（轉譯器回報計畫無法忠實轉譯）、precheck、simulation（3D 的 URSim / Isaac Sim，
-            // 2D 的 Unity 預覽 bitmap 比對）、execution；流程跑完但整體判定未達標則是 global_validation。
-            // local_validation 只出現在 2026-10-01 之前逐步執行的 2D 紀錄
-            string stageKind = "planning";
-            int robotOperations = 0;
-            try
-            {
-                var before = await Scene();
-                if (before.Count == 0) throw new SceneUnavailableException("沒有有效場景觀測。");
-                Save(dir, "before_scene.json", before);
-                var image = await Frame(dir, "before.jpg");
-                camera = await CameraInfo();
-                // 收到指令就先把目前真實場景投影到 Isaac Sim（背景），不必等 LLM 規劃完才看得到積木。
-                // 純模擬時 Isaac 本身就是世界，重新投影會把歪掉的積木擺正，不投影。
-                if (!sim) IsaacSimExecutor.SyncRealScene(before, camera);
-                trace.Add($"觀測到 {before.Count} 個物件");
-                stage = "拆解子任務";
-                var hierarchy = await llm.Decompose(goal, before, rules, feedback, image, dir);
-                stage = "操作規劃";
-                plan = await llm.Plan(goal, before, hierarchy, rules, feedback, image, dir);
-                stage = "轉譯成執行資料";
-                stageKind = "translation_format";
-                var translated = await llm.Translate(plan, before, dir);
-                Save(dir, "translated_plan.json", translated);
-                translationText = JsonSerializer.Serialize(translated,
-                    new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
-                // 轉譯失敗也算一輪，照常進 Reflection
-                if (!string.IsNullOrWhiteSpace(translated.Error))
-                {
-                    stageKind = "translation_rejected";
-                    throw new TranslationContractException("轉譯失敗：" + translated.Error,
-                        new InvalidOperationException(translated.Error));
-                }
-                if (translated.Steps == null || translated.Steps.Count > 50)
-                    throw new TranslationContractException("執行資料無效或超過單次 50 步上限。",
-                        new InvalidOperationException("Invalid translated step count."));
-                trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
-                PrintPlannedFigure(attempt, translated.Steps, before);
-                // 有雙模型設計的目標時，計畫排出的圖形要跟它完全相同才往下走
-                if (llm.TargetBitmap != null && DesignMismatch(llm.TargetBitmap, translated.Steps, before) is string mismatch)
-                {
-                    stage = "執行前檢查（跟雙模型設計的 bitmap 比對）";
-                    stageKind = "precheck";
-                    throw new InvalidOperationException(mismatch);
-                }
-                // 依步驟順序檢查放置目標有沒有跟同一層的積木部分重疊（含同一批前面步驟剛放的），2D、3D 都檢查
-                stage = "執行前檢查（積木重疊）";
-                stageKind = "precheck";
-                var overlaps = LayeredHeights.SameLayerOverlaps(translated.Steps, before);
-                if (overlaps.Count > 0)
-                    throw new InvalidOperationException("執行前檢查：放置位置會跟其他積木重疊：" + string.Join("；", overlaps));
-                // 3D 疊放：整輪步驟先交給 Unity 在 URSim 執行（robot_target = "ursim"），Isaac Sim 的手臂
-                // 即時跟隨 URSim、積木用物理模擬；URSim 跑完由 Isaac 做幾何檢查，再讓 LLM 看模擬畫面，
-                // 都通過才把同一批整批送實體手臂。不通過就算這次 attempt 失敗、實機完全不動，照常進 Reflect。
-                // 2D 平面移動不經過這裡（見下方 2D 整批）。存檔另開子資料夾，避免跟實機結果撞名。
-                // 3D 的每一批（URSim 與之後的實機）都帶 layered_grasp：Unity 用分層夾取深度，實機執行的就是
-                // Isaac 驗證過的同一套深度；2D 批次不帶這個欄位，Unity 照舊。
-                bool stacked3d = IsaacSimExecutor.RequiresCheck(translated.Steps, before);
-                if (stacked3d && sim && virtualWorld != null)
-                    throw new SimulationUnavailableException("純模擬目前沒開 Isaac Sim：這個計畫是 3D 疊放，需要 Isaac 做物理驗證，" +
-                        "內建的虛擬世界只支援 2D。開好 isaac_sim_server 後再下指令。", null);
-                var ursimSteps = new List<StepEnvelope>();
-                if (stacked3d)
-                {
-                    trace.Add("判定為 3D 疊放，先在 URSim 執行並由 Isaac Sim 驗證");
-                    Directory.CreateDirectory(isaacDir);
-                    var heights = LayeredHeights.ForSteps(translated.Steps, before);
-                    for (int k = 0; k < translated.Steps.Count; k++)
-                    {
-                        var step = translated.Steps[k];
-                        stage = $"送 URSim 前第 {k + 1} 個操作的執行前檢查";
-                        stageKind = "precheck";
-                        if (!ExperimentChecks.Resolve(step, before, before, out var planned, out var error))
-                            throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
-                        planned.StepId = ++stepId;
-                        if (!MotionPlanValidator.TryValidate(new MotionPlan { ActionSequence = step.Actions, Reasoning = plan }, planned, before, out error))
-                            throw new InvalidOperationException($"第 {k + 1} 個操作執行前檢查：{error}");
-                        ursimSteps.Add(new StepEnvelope { StepId = planned.StepId, SourcePosition = planned.Source,
-                            TargetPosition = step.Target, ActionSequence = step.Actions, Comment = "3D 疊放 URSim 驗證",
-                            SourceTopM = heights[k].SourceTopM, TargetTopM = heights[k].TargetTopM });
-                    }
-                    Console.WriteLine($"[Isaac Sim] 3D 疊放：{ursimSteps.Count} 步先在 URSim 執行，Isaac Sim 跟隨驗證。");
-                    stage = "URSim 執行";
-                    stageKind = "simulation";
-                    // 純模擬：Isaac 就是世界，驗證會真的移動積木。先記下位姿，驗證結束（不論通過與否）放回去，
-                    // 正式執行才從驗證前的狀態開始，跟實機模式「驗證不動到真實積木」一致。
-                    if (sim) await IsaacSimExecutor.SnapshotWorldAsync();
-                    try
-                    {
-                        await IsaacSimExecutor.BeginVerifyAsync(before, translated.Steps, camera, image, isaacDir, useCurrentWorld: sim);
-                        int ursimBatchId = ++stepId;
-                        // 3D 也用 Unity 畫面比對：預覽結束逐層切開拍俯視畫面得到每一點的高度，跟計畫的高度圖
-                        // （含壓在底下的支撐）比，畫面重疊率大於門檻才讓 URSim 動；不通過 URSim、實機都不動
-                        var figure3d = PlannedFigure(translated.Steps, before, withSupports: true).Values.ToList();
-                        var (heightRows, heightCells, cell3dX, cell3dY) = FigureBitmap.HeightMap(figure3d, figure3d.Select(LayerOf).ToList());
-                        var ursimBatch = new BatchEnvelope { BatchId = ursimBatchId, Steps = ursimSteps,
-                            Comment = "3D 疊放 URSim 驗證", RobotTarget = "ursim", LayeredGrasp = true,
-                            Bitmap = heightRows, ExpectedCells = heightCells, CellSizeM = cell3dX, CellSizeXM = cell3dX, CellSizeYM = cell3dY };
-                        Save(isaacDir, "ursim_batch.json", ursimBatch);
-                        var simCheckPath3d = Path.Combine(assets, "sim_check.json");
-                        ClearSimulationCheckFiles();
-                        AtomicWrite(Path.Combine(assets, "current_step.json"), ursimBatch);
-                        var ursimExecution = await Wait(attempt, ursimBatchId);
-                        Save(isaacDir, "ursim_execution.json", ursimExecution);
-                        var simCheck3d = ReadSimulationCheck(simCheckPath3d, ursimBatchId, dir, heightCells);
-                        if (simCheck3d is { Performed: true })
-                            trace.Add($"Unity 預覽畫面跟 3D 高度圖的比對{(simCheck3d.Passed ? "通過" : "未通過")}（畫面重疊率 {simCheck3d.OverlapRatio * 100:F0}%）");
-                        if (ursimExecution == null || !ursimExecution.Completed)
-                        {
-                            if (simCheck3d is { Performed: true, Passed: false, VerificationEnabled: true })
-                            {
-                                stage = "3D 疊放 Unity 預覽畫面比對";
-                                throw new InvalidOperationException(
-                                    $"Unity 預覽的畫面跟計畫的 3D 高度圖不吻合（URSim、實機都未動）：畫面重疊率 {simCheck3d.OverlapRatio * 100:F0}%，" +
-                                    $"要大於 {simCheck3d.OverlapThreshold * 100:F0}%；" + string.Join("；", simCheck3d.Errors));
-                            }
-                            string reason = ursimExecution?.Error ?? "沒有回報原因";
-                            if (reason.Contains("未連線") || reason.Contains("未設定")) throw new SimulationUnavailableException("URSim 無法使用：" + reason, null);
-                            throw new InvalidOperationException("URSim 執行失敗（實機未動）：" + reason);
-                        }
-                        trace.Add("URSim 執行完成");
-                        stage = "Isaac Sim 幾何驗證";
-                        var report = await IsaacSimExecutor.EndVerifyAsync(isaacDir);
-                        if (!report.Pass)
-                            throw new InvalidOperationException("Isaac Sim 驗證未通過（實機未動）：" + string.Join("；", report.Reasons));
-                        trace.Add("Isaac Sim 幾何驗證通過");
-                        stage = "Isaac Sim 模擬畫面判定";
-                        var isaacVerdict = await llm.Validate(goal, before, report.Scene, report.Frame, isaacDir);
-                        if (isaacVerdict.Split('\n')[0].Trim() != "PASS")
-                            throw new InvalidOperationException("Isaac Sim 模擬畫面判定未通過（實機未動）：" + isaacVerdict);
-                        trace.Add("Isaac Sim 模擬畫面判定通過");
-                    }
-                    finally
-                    {
-                        // 還原失敗就不能從正確的狀態繼續，例外往外丟，這個任務記為基礎設施錯誤
-                        if (sim) await IsaacSimExecutor.RestoreWorldAsync();
-                    }
-                    Console.WriteLine(sim ? "[Isaac Sim] 3D 驗證通過，模擬世界已還原，開始正式執行（URSim）。"
-                                          : "[Isaac Sim] 3D 驗證通過，開始送實體手臂。");
-
-                    // 正式執行整批一次送：步驟、來源位置、積木高度都跟 URSim 驗證的那一批相同，實機跑的就是
-                    // Isaac 驗證過的同一條關節軌跡。逐步送的話每一步結束都要回 Ready，那些收尾路徑驗證時沒有，
-                    // 有些位置回不去（肘關節奇異點）。步驟之間不再重新觀測與局部驗證，最後由整體驗證判定。
-                    stage = "3D 疊放整批執行前檢查";
-                    stageKind = "precheck";
-                    var current = await Scene();
-                    for (int k = 0; k < translated.Steps.Count; k++)
-                    {
-                        if (!ExperimentChecks.Resolve(translated.Steps[k], before, current, out var now, out var error))
-                            throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
-                        var verified = ursimSteps[k].SourcePosition!;
-                        double driftM = Math.Sqrt(Math.Pow(now.Source!.X - verified.X, 2) + Math.Pow(now.Source.Y - verified.Y, 2));
-                        if (driftM > VerifiedSourceDriftM)
-                            throw new InvalidOperationException(
-                                $"第 {k + 1} 個操作的來源 {now.Source.Name} 在驗證後移動了 {driftM * 1000:F0} mm，不能沿用驗證過的軌跡。");
-                    }
-                    stage = "3D 疊放整批在實體手臂執行";
-                    stageKind = "execution";
-                    var executionSteps = ursimSteps.Select(s => new StepEnvelope { StepId = ++stepId, SourcePosition = s.SourcePosition,
-                        TargetPosition = s.TargetPosition, ActionSequence = s.ActionSequence, Comment = "自由規劃實驗",
-                        SourceTopM = s.SourceTopM, TargetTopM = s.TargetTopM }).ToList();
-                    int batchId3d = ++stepId;
-                    // 純模擬時「實機」就是 URSim：標 robot_target = "ursim"，Unity 不會連實體手臂。
-                    // 同一條軌跡在 URSim 驗證那批已經在 Unity 預覽過，這批不再預覽（SkipPreview）
-                    var batch3d = new BatchEnvelope { BatchId = batchId3d, Steps = executionSteps,
-                        Comment = "3D 疊放正式執行（整批，同驗證軌跡）", LayeredGrasp = true, RobotTarget = sim ? "ursim" : "",
-                        SkipPreview = true };
-                    Save(dir, $"batch_{batchId3d}.json", batch3d);
-                    AtomicWrite(Path.Combine(assets, "current_step.json"), batch3d);
-                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 3D 整批（{executionSteps.Count} 個操作）：batch {batchId3d}。");
-                    executionPending = true;
-                    var execution3d = await Wait(attempt, batchId3d);
-                    if (execution3d != null) executionPending = false;
-                    Save(dir, $"execution_{batchId3d}.json", execution3d);
-                    if (execution3d == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
-                    if (!execution3d.Completed)
-                    {
-                        var executionError = $"3D 疊放整批執行失敗：{execution3d.Error ?? "沒有回報原因"}";
-                        Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 退回：{executionError}");
-                        throw new InvalidOperationException(executionError);
-                    }
-                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 已完成 3D 整批 batch {batchId3d}。");
-                    robotOperations = executionSteps.Count;
-                    trace.Add($"3D 疊放 {executionSteps.Count} 個操作整批由實體手臂執行完成");
-                }
-                // 2D：整批一次送。Unity 先預覽整批，模擬結束拍 Unity 畫面跟計畫畫出的 bitmap 比對（畫面重疊率要大於門檻），
-                // 通過才整批送實機，不通過實機完全不動。步驟之間不重新觀測、不做局部驗證（跟 3D 相同），
-                // 最後由整體驗證判定。2D 的夾取深度與參數不變（不帶 layered_grasp）。
-                if (!stacked3d)
-                {
-                    trace.Add("判定為 2D 平面擺放，整批先在 Unity 預覽並比對 bitmap，通過才整批執行");
-                    var batchSteps = new List<StepEnvelope>();
-                    var operationOf = new Dictionary<int, string>();
-                    // 圖形裡的每個物件（含已經在目標上、不用搬的），畫 bitmap 與 Unity 比對用；
-                    // 同一塊被搬兩次時只算最後放下的位置（key = 場景 index）
-                    var figure = new Dictionary<int, SceneObject>();
-                    // 已在目標 2 公分內、不搬的物件實際停在哪裡（key = 場景 index）：Unity 畫面比對時預期佔地放在這裡，
-                    // 不放在 target，否則沒動的方塊會被算成偏移。bitmap 的格子仍照 target 畫
-                    var keptInPlace = new Dictionary<int, (double X, double Y)>();
-                    var heights2d = LayeredHeights.ForSteps(translated.Steps, before);
-                    for (int k = 0; k < translated.Steps.Count; k++)
-                    {
-                        var step = translated.Steps[k];
-                        stage = $"第 {k + 1} 個操作的執行前檢查";
-                        stageKind = "precheck";
-                        if (!ExperimentChecks.Resolve(step, before, before, out var assignment, out var error))
-                            throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
-                        assignment.StepId = ++stepId;
-                        var motion = new MotionPlan { ActionSequence = step.Actions, Reasoning = plan };
-                        if (!MotionPlanValidator.TryValidate(motion, assignment, before, out error))
-                            throw new InvalidOperationException($"第 {k + 1} 個操作執行前檢查：{error}");
-                        bool places = ClassifyOutcome(step.Actions) == ActionOutcome.Placed;
-                        if (places && ExperimentChecks.IsAlreadyAtTarget(assignment))
-                        {
-                            var satisfied = new VerifyResult
-                            {
-                                StepId = assignment.StepId,
-                                SourceRemoved = false,
-                                TargetOccupied = true,
-                                ShapeMatch = true,
-                                ColorMatch = true,
-                                PositionErrorMm = Math.Sqrt(
-                                    Math.Pow(assignment.Source!.X - assignment.Target!.WorldX, 2) +
-                                    Math.Pow(assignment.Source.Y - assignment.Target.WorldY, 2)) * 1000.0,
-                                OverallStatus = "ok",
-                                Note = "Selected source is already within the accepted 20 mm target tolerance; robot motion skipped."
-                            };
-                            local.Add(satisfied);
-                            Save(dir, "local_validation.json", local);
-                            Console.WriteLine($"[實驗] step {assignment.StepId} 來源已在目標 2 公分容差內，略過重複抓放。");
-                            trace.Add($"第 {k + 1} 個操作的來源已在目標 2 公分內，略過抓放（手臂未動）");
-                            // 不用搬的物件也是圖形的一部分；Unity 預覽裡它停在觀測到的高度
-                            figure[step.SourceIndex] = FigureObject(step.Target!, assignment.Source!.Z);
-                            keptInPlace[step.SourceIndex] = (assignment.Source.X, assignment.Source.Y);
-                            continue;
-                        }
-                        keptInPlace.Remove(step.SourceIndex);
-                        batchSteps.Add(new StepEnvelope { StepId = assignment.StepId, SourcePosition = assignment.Source,
-                            TargetPosition = step.Target, ActionSequence = step.Actions, Comment = "自由規劃實驗" });
-                        operationOf[assignment.StepId] = $"第 {k + 1} 個操作（{assignment.Source!.Name} " +
-                            $"({assignment.Source.X:F3}, {assignment.Source.Y:F3}) → target ({step.Target!.X:F3}, {step.Target.Y:F3})）";
-                        if (places) figure[step.SourceIndex] = FigureObject(step.Target!, heights2d[k].TargetTopM);
-                        else figure.Remove(step.SourceIndex);
-                    }
-                    if (batchSteps.Count == 0) trace.Add("所有操作的來源都已在目標 2 公分內，手臂不用動");
-                    else
-                    {
-                        int batchId2d = ++stepId;
-                        // 純模擬（PreviewOnly）：Unity 預覽與 bitmap 比對通過就是執行完成，不連 URSim、也不連實體手臂
-                        var batch2d = new BatchEnvelope { BatchId = batchId2d, Steps = batchSteps,
-                            Comment = "2D 整批（Unity 預覽比對 bitmap 通過才執行）", RobotTarget = sim ? "ursim" : "", PreviewOnly = sim };
-                        if (figure.Count > 0)
-                        {
-                            var (rows, cells, cellX, cellY) = FigureBitmap.Build(figure.Values.ToList());
-                            // Keys 跟 Values 的順序相同，cells[i] 對應 figure 的第 i 個物件
-                            var sources = figure.Keys.ToList();
-                            for (int i = 0; i < cells.Count; i++)
-                                if (keptInPlace.TryGetValue(sources[i], out var at)) { cells[i].X = at.X; cells[i].Y = at.Y; }
-                            batch2d.Bitmap = rows;
-                            batch2d.ExpectedCells = cells;
-                            batch2d.CellSizeM = cellX;
-                            batch2d.CellSizeXM = cellX;
-                            batch2d.CellSizeYM = cellY;
-                            // 圖形在轉譯完就印過了（PrintPlannedFigure，同一組物件畫出來相同），這裡不再印
-                            // 排字母時每個字母最多 5×5 格：超過就不送，算執行前檢查失敗
-                            var sizeProblem = FigureBitmap.LetterSizeProblem(FigureBitmap.LetterCount(goal), rows);
-                            if (sizeProblem != null)
-                            {
-                                stage = "執行前檢查（字母 bitmap 大小）";
-                                stageKind = "precheck";
-                                throw new InvalidOperationException("執行前檢查：" + sizeProblem);
-                            }
-                        }
-                        Save(dir, $"batch_{batchId2d}.json", batch2d);
-                        stage = sim ? "2D 整批：Unity 預覽與 bitmap 比對（純模擬，不接手臂）" : "2D 整批：Unity 預覽、bitmap 比對與實體手臂執行";
-                        stageKind = "execution";
-                        var simCheckPath = Path.Combine(assets, "sim_check.json");
-                        ClearSimulationCheckFiles();
-                        AtomicWrite(Path.Combine(assets, "current_step.json"), batch2d);
-                        Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 2D 整批（{batchSteps.Count} 個操作）：batch {batchId2d}。");
-                        executionPending = true;
-                        var execution2d = await Wait(attempt, batchId2d);
-                        if (execution2d != null) executionPending = false;
-                        Save(dir, $"execution_{batchId2d}.json", execution2d);
-                        var simCheck = ReadSimulationCheck(simCheckPath, batchId2d, dir);
-                        if (execution2d == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
-                        if (simCheck is { Performed: true })
-                            trace.Add($"Unity 預覽畫面跟 bitmap 的比對{(simCheck.Passed ? "通過" : "未通過")}（畫面重疊率 {simCheck.OverlapRatio * 100:F0}%）");
-                        if (!execution2d.Completed)
-                        {
-                            if (simCheck is { Performed: true, Passed: false, VerificationEnabled: true })
-                            {
-                                stage = "2D 整批 Unity 預覽的 bitmap 比對";
-                                stageKind = "simulation";
-                                throw new InvalidOperationException(
-                                    $"Unity 預覽的畫面跟計畫畫出的 bitmap 不吻合（實機未動）：畫面重疊率 {simCheck.OverlapRatio * 100:F0}%，" +
-                                    $"要大於 {simCheck.OverlapThreshold * 100:F0}%；" + string.Join("；", simCheck.Errors));
-                            }
-                            // Unity 的錯誤用內部 step_id，換成第幾個操作與它的來源、目標，反思才對得上計畫
-                            var executionError = $"2D 整批執行失敗：{execution2d.Error ?? "沒有回報原因"}" +
-                                $"\n（Unity 的 step_id：{string.Join("；", operationOf.Select(p => $"{p.Key} = {p.Value}"))}；座標只適用本輪觀測）";
-                            Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 退回：{executionError}");
-                            throw new InvalidOperationException(executionError);
-                        }
-                        if (sim)
-                        {
-                            // 純模擬：Unity 預覽與比對通過就是執行完成；模擬世界照預覽的實際落點更新（不是計畫的座標）
-                            int moved = await ApplyPreviewResult(execution2d.FinalBlocks, before);
-                            Console.WriteLine($"[實驗] 第 {attempt}/10 輪純模擬：Unity 預覽完成 2D 整批 batch {batchId2d}，" +
-                                              $"模擬世界照預覽落點更新了 {moved} 個物件（沒有連 URSim 或實體手臂）。");
-                            trace.Add($"純模擬：Unity 預覽完成 {batchSteps.Count} 個操作就當作執行完成，模擬世界照預覽落點更新了 {moved} 個物件" +
-                                      "（沒有連 URSim 或實體手臂，沒有物理模擬）");
-                        }
-                        else
-                        {
-                            Console.WriteLine($"[實驗] 第 {attempt}/10 輪 Unity/UR3 已完成 2D 整批 batch {batchId2d}。");
-                            robotOperations = batchSteps.Count;
-                            trace.Add($"2D {batchSteps.Count} 個操作整批由實體手臂執行完成");
-                        }
-                    }
-                }
-            }
-            catch (ExecutionUnknownException) { throw; }
-            catch (TranslationContractException ex)
-            {
-                failure = ex.Message;
-                failureKind = stageKind;
-                trace.Add($"在「{stage}」停止");
-                Console.WriteLine($"[實驗] 第 {attempt}/10 輪轉譯失敗，將進入 Reflection：{failure}");
-            }
-            catch (InvalidOperationException ex) { failure = ex.Message; failureKind = stageKind; trace.Add($"在「{stage}」停止"); }
-            trace.Add(sim ? $"純模擬沒有實體手臂；URSim 執行了 {robotOperations} 個操作" : $"實體手臂完整執行了 {robotOperations} 個操作");
-            var after = await Scene();
-            Save(dir, "after_scene.json", after);
-            // 跟 Unity SceneSyncer 執行後刷新場景對應：把這次嘗試的真實結果投影回 Isaac Sim（背景）。純模擬不投影。
-            if (!sim) IsaacSimExecutor.SyncRealScene(after, camera);
-            var afterImage = await Frame(dir, "after.jpg");
-            var verdict = await llm.Validate(goal, initial, after, afterImage, dir);
-            feedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n執行／局部觀察：{failure}\n整體觀察：{verdict}";
-            File.WriteAllText(Path.Combine(dir, "feedback.txt"), feedback);
-            success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
-            if (!success && string.IsNullOrEmpty(failureKind)) failureKind = "global_validation";
-            attemptOutcomes.Add(success ? "success" : failureKind);
-            Save(dir, "attempt_result.json", new { attempt, success, failure_kind = success ? null : failureKind,
-                failure_stage = string.IsNullOrEmpty(failure) ? null : stage, failure = string.IsNullOrEmpty(failure) ? null : failure });
-            if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
-            var reflection = await llm.Reflect(goal, plan, translationText, feedback, rules, after, dir);
-            File.WriteAllText(Path.Combine(dir, "rules_for_next_attempt.txt"), reflection);
-            var reflectionLines = reflection.Split('\n');
-            if (reflectionLines[0].Trim() == "GIVE_UP")
-            {
-                Console.WriteLine($"[實驗] LLM 判斷本任務無法達成，第 {attempt} 次後結束嘗試。");
-                break;
-            }
-            // 規則逐輪累積（由舊到新）；第一行的 CONTINUE 是判定，不是規則內容
-            rules.Add(reflectionLines[0].Trim() == "CONTINUE" ? string.Join('\n', reflectionLines.Skip(1)).Trim() : reflection);
-        }
-    }
-    catch (Exception ex)
-    {
-        if (executionPending) status = "execution_unknown";
-        else if (ex is TranslationContractException) status = "adapter_error";
-        else if (status != "execution_unknown") status = "infrastructure_error";
-        File.WriteAllText(Path.Combine(run, "error.txt"), ex.ToString());
-        Console.WriteLine("[實驗] " + ex.Message);
-    }
-    Save(run, "result.json", new { success, status, attempts, attempt_outcomes = attemptOutcomes,
-        counts_toward_success_rate = status is "success" or "failed",
-        design, design_error = designError,
-        final_rules = rules, finished_utc = DateTime.UtcNow });
-    ExperimentMetrics.Write(root);
-    if (status == "execution_unknown") { Console.WriteLine("執行狀態未知，服務停止。確認手臂停止後再重新啟動。"); break; }
-    AtomicWrite(Path.Combine(assets, "current_step.json"), new StepEnvelope { StepId = ++stepId, Done = true });
-    Console.WriteLine($"[實驗] {status}；紀錄：{run}。" +
-        (sim ? (mode.ResetEachTask ? "下個純模擬任務會重建虛擬場景。" : "下個純模擬任務接續目前的模擬世界。")
-             : fixedBaseline ? "下個任務需恢復初始桌面。" : "下個任務以當時的桌面為起點。"));
-}
-void Save(string dir, string name, object? value) => File.WriteAllText(Path.Combine(dir, name), JsonSerializer.Serialize(value, json));
-void AtomicWrite(string path, object value)
-{
-    File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(value, json));
-    File.Move(path + ".tmp", path, true);
-}
-// Unity 預覽結束比對 bitmap 的報告（StreamingAssets/sim_check.json，Unity 在送實機之前寫）：印在 terminal，存進這一輪
-// 純模擬的 2D：把 Unity 預覽結束時方塊的落點寫回模擬世界，回傳更新了幾個物件。Unity 回報每塊被放下的方塊
-// 預覽前、後的位置，依預覽前的位置對回場景 index（2 cm 內最近的那塊）。內建虛擬世界直接改位置；
-// 開著 Isaac 時 Isaac 就是世界，用同樣的物件清單重新載入（方塊直接放到落點，沒有物理過程）
-async Task<int> ApplyPreviewResult(List<PreviewBlock>? blocks, List<SceneObject> scene)
-{
-    var updated = scene.Select(o => new SceneObject { Name = o.Name, Shape = o.Shape, Orientation = o.Orientation,
-        X = o.X, Y = o.Y, Z = o.Z, SkewDeg = o.SkewDeg }).ToList();
-    var changed = new HashSet<int>();
-    foreach (var b in blocks ?? new List<PreviewBlock>())
-    {
-        double Distance(int i) => Math.Sqrt(Math.Pow(scene[i].X - b.FromX, 2) + Math.Pow(scene[i].Y - b.FromY, 2));
-        int index = Enumerable.Range(0, scene.Count).Where(i => !changed.Contains(i) && Distance(i) <= 0.02)
-            .OrderBy(Distance).DefaultIfEmpty(-1).First();
-        if (index < 0) continue;
-        updated[index].X = b.X;
-        updated[index].Y = b.Y;
-        updated[index].Z = b.Z;
-        updated[index].SkewDeg = 0;
-        if (!string.IsNullOrEmpty(b.Orientation)) updated[index].Orientation = b.Orientation;
-        changed.Add(index);
-    }
-    if (changed.Count == 0) return 0;
-    if (virtualWorld != null)
-    {
-        foreach (int i in changed) virtualWorld.Place(i, updated[i], updated[i].Z);
-        virtualWorld.Write(assets);
-    }
-    else await IsaacSimExecutor.LoadSimSceneAsync(updated, null);
-    return changed.Count;
-}
-SimulationCheckReport? ReadSimulationCheck(string path, int batchId, string dir, IReadOnlyList<ExpectedCell>? cells = null)
-{
-    if (!File.Exists(path)) return null;
-    SimulationCheckReport? report;
-    try { report = JsonSerializer.Deserialize<SimulationCheckReport>(File.ReadAllText(path), json); }
-    catch (Exception ex) when (ex is IOException or JsonException) { return null; }
-    if (report == null || report.BatchId != batchId) return null;
-    File.Copy(path, Path.Combine(dir, "sim_check.json"), true);
-    // 比對圖跟 sim_check.json 放在同一個 StreamingAssets；加上重疊率與說明後存進這一輪的資料夾，加註失敗就存原圖
-    string? image = null;
-    var imageSource = string.IsNullOrEmpty(report.ImageFile) ? null : Path.Combine(Path.GetDirectoryName(path)!, report.ImageFile);
-    if (imageSource != null && File.Exists(imageSource))
-    {
-        image = Path.Combine(dir, report.ImageFile!);
-        try { SimCheckImage.Annotate(imageSource, image, report, cells); }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Bitmap 比對] 比對圖加註失敗，存原圖：{ex.Message}");
-            File.Copy(imageSource, image, true);
+            Console.WriteLine($"[Layer 1 compact] 無可接受候選：{ex.Message}");
+            continue;
         }
+        realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
     }
-    // Unity 拍的照片原樣存進這一輪的資料夾
-    var photos = new List<string>();
-    foreach (var name in new[] { report.PhotoFile, report.ViewFile })
+
+    int br = pattern.Bitmap!.GetLength(0), bc = pattern.Bitmap.GetLength(1);
+    var rows = new List<string>();
+    Console.WriteLine($"[Layer 1] pattern={pattern.PatternId}, bitmap={br}x{bc}");
+    for (int r = 0; r < br; r++)
     {
-        if (string.IsNullOrEmpty(name)) continue;
-        var source = Path.Combine(Path.GetDirectoryName(path)!, name);
-        if (!File.Exists(source)) continue;
-        File.Copy(source, Path.Combine(dir, name), true);
-        photos.Add(Path.Combine(dir, name));
+        var sb = new System.Text.StringBuilder();
+        for (int c = 0; c < bc; c++) sb.Append(pattern.Bitmap[r, c] == 1 ? "■" : "□");
+        rows.Add(sb.ToString());
+        Console.WriteLine("           " + sb);
     }
-    PrintSimulationCheck(report, image);
-    if (photos.Count > 0) Console.WriteLine($"           Unity 照片（正上方 / 主相機）：{string.Join("、", photos)}");
-    return report;
-}
-// 送出要比對的批次前，刪掉上一批留下的比對結果與照片，免得讀到舊的
-void ClearSimulationCheckFiles()
-{
-    foreach (var name in new[] { "sim_check.json", "sim_check.png", "unity_top.png", "unity_view.png" })
+
+    File.WriteAllText(
+        Path.Combine(localOutputDir, $"pattern_{pattern.PatternId}.json"),
+        JsonSerializer.Serialize(new
+        {
+            pattern_id = pattern.PatternId,
+            block_color = pattern.BlockColor,
+            bitmap = rows,
+            rows = br,
+            cols = bc,
+            timestamp = DateTime.Now.ToString("s"),
+        }, jsonOptions));
+
+    if (realize.Error != null || realize.Targets == null)
     {
-        var file = Path.Combine(assets, name);
-        if (File.Exists(file)) File.Delete(file);
+        Console.WriteLine($"[Layer 2] {realize.Error}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
     }
-}
-// 場景、照片：實機來自相機（perception_server），純模擬來自 Isaac Sim（同格式）
-async Task<List<SceneObject>> Scene()
-{
-    if (sim && virtualWorld != null) return virtualWorld.Snapshot();
-    using var doc = JsonDocument.Parse(await perception.GetStringAsync("scene"));
-    if (!doc.RootElement.TryGetProperty("timestamp", out var ts) || ts.ValueKind != JsonValueKind.Number ||
-        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 - ts.GetDouble() > 5)
-        throw new HttpRequestException("相機觀測未更新或已超過 5 秒，不能使用舊場景。");
-    return doc.RootElement.GetProperty("objects").EnumerateArray()
-        .Where(o => o.TryGetProperty("position", out var p) && p.ValueKind == JsonValueKind.Object)
-        .Select(o => {
-            var p = o.GetProperty("position");
-            return new SceneObject { Name = o.GetProperty("name").GetString() ?? "",
-                X = p.GetProperty("x").GetDouble(), Y = p.GetProperty("y").GetDouble(), Z = p.GetProperty("z").GetDouble(),
-                Shape = o.TryGetProperty("shape", out var s) ? s.GetString() ?? "cube" : "cube",
-                Orientation = o.TryGetProperty("orientation", out var r) ? r.GetString() : null,
-                SkewDeg = o.TryGetProperty("skew_deg", out var k) ? k.GetDouble() : 0 };
-        }).Where(o => double.IsFinite(o.X) && double.IsFinite(o.Y) && double.IsFinite(o.Z)).ToList();
-}
-async Task<byte[]?> Frame(string dir, string name)
-{
-    if (sim && virtualWorld != null)
+
+    Console.WriteLine($"[Layer 2] 展開成 {realize.Targets.Count} 個 target cells "
+                      + $"({realize.Targets.Count(t => t.ExpectedShape == "domino")} domino + "
+                      + $"{realize.Targets.Count(t => t.ExpectedShape == "cube")} cube)");
+    Console.WriteLine($"[Layer 2] Placement shift: X={realize.PlacementShiftX:+0.000;-0.000;0.000} m, " +
+                      $"Y={realize.PlacementShiftY:+0.000;-0.000;0.000} m (CellSize={workspace.CellSize:F3} m)");
+
+    var virtualScene = CloneScene(initialSnap);
+    var remainingTargets = new List<TargetCell>(realize.Targets);
+    var plannedTargets = new List<TargetCell>();
+    var steps = new List<StepEnvelope>();
+
+    while (remainingTargets.Count > 0)
     {
-        var schematic = TopViewRenderer.Render(virtualWorld.Snapshot());
-        File.WriteAllBytes(Path.Combine(dir, name), schematic);
-        return schematic;
+        int stepId = ++globalStepId;
+        var assignment = TaskAssigner.Assign(
+            remainingTargets, virtualScene, stepId,
+            recoveryMode: false, protectedTargets: plannedTargets);
+        if (assignment == null)
+        {
+            Console.WriteLine("[Batch Layer 3] 沒有可執行的 assignment（supply 用完或不足）");
+            Console.WriteLine("[Batch] 未排完全部 target，取消送出，避免只執行半成品。");
+            foreach (var t in remainingTargets)
+            {
+                Console.WriteLine(
+                    $"        missing r{t.Row}c{t.Col} {t.ExpectedColor}_{t.ExpectedShape} " +
+                    $"at ({t.WorldX:F3},{t.WorldY:F3})");
+            }
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+
+        Console.WriteLine($"[Batch Layer 3] {assignment.Reasoning}");
+        var envelope = await BuildStepEnvelopeAsync(assignment, virtualScene);
+        if (envelope == null)
+        {
+            Console.WriteLine("[Batch] 規劃中止；尚未送給 Unity 執行。");
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+
+        steps.Add(envelope);
+        UpdateVirtualSceneAfterPlannedStep(virtualScene, assignment);
+        plannedTargets.Add(assignment.Target!);
+        remainingTargets.RemoveAll(t => t.Row == assignment.Target!.Row && t.Col == assignment.Target.Col);
     }
-    try { var bytes = await perception.GetByteArrayAsync("debug/frame"); File.WriteAllBytes(Path.Combine(dir, name), bytes); return bytes; }
-    catch (Exception ex)
-    {
-        File.WriteAllText(Path.Combine(dir, name + ".error.txt"), ex.Message);
-        throw new SceneUnavailableException("相機影像不可取得，不能作為任務失敗進行 Reflection。");
-    }
+
+    await ExecuteBatchAsync($"arrange pattern {pattern.PatternId}", steps, realize.Targets, rows);
 }
-// 相機內參與位姿只用來對齊 Isaac Sim 的模擬相機；取不到時模擬端沿用上次的相機，不中斷實驗。
-// 純模擬沒有真實相機，模擬相機由虛擬場景檔決定。
-async Task<JsonElement?> CameraInfo()
+
+async Task RunSingleObjectTaskBatchAsync(RoutedCommand routed, List<SceneObject> initialScene)
 {
-    if (sim) return null;
+    Assignment assignment;
     try
     {
-        using var doc = JsonDocument.Parse(await http.GetStringAsync("camera"));
-        return doc.RootElement.Clone();
+        assignment = SingleObjectTaskBuilder.Build(routed, initialScene, ++globalStepId);
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[Isaac Sim] 取不到 perception /camera，模擬相機沿用上次位置：{ex.Message}");
-        return null;
+        Console.WriteLine($"[SingleObject Batch] Cannot build task: {ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
     }
+
+    Console.WriteLine($"[SingleObject Batch] {assignment.Reasoning}");
+    var envelope = await BuildStepEnvelopeAsync(assignment, initialScene);
+    if (envelope == null)
+    {
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    await ExecuteBatchAsync(routed.Action, new List<StepEnvelope> { envelope });
 }
-async Task<ExecutionResult?> Wait(int attempt, int id)
+
+async Task RunMultiStackTaskBatchAsync(RoutedCommand routed, List<SceneObject> initialScene)
 {
-    var path = Path.Combine(assets, "step_done.json");
-    var started = DateTime.UtcNow;
-    int lastReportedSeconds = 0;
-    // No experiment-level timeout: a slow Unity/robot execution remains pending
-    // until Unity returns this exact batch id or the process is stopped manually.
+    List<string> sequence = routed.StackSequence.Count >= 2
+        ? routed.StackSequence
+        : Enumerable.Repeat(routed.ObjectName ?? "", routed.ObjectCount ?? 2).ToList();
+    if (sequence.Count < 2 || sequence.Any(string.IsNullOrWhiteSpace))
+    {
+        Console.WriteLine("[MultiStack Batch] Invalid stack sequence.");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    if (sequence.Any(name => !name.EndsWith("_cube", StringComparison.Ordinal)))
+    {
+        Console.WriteLine("[MultiStack Batch] Multi-layer stacking currently supports cubes only.");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    var virtualScene = CloneScene(initialScene);
+    string baseName = sequence[0];
+    SceneObject towerBase = virtualScene
+        .Where(o => o.Name == baseName)
+        .OrderByDescending(o => o.X >= 0.30)
+        .ThenByDescending(o => o.X)
+        .FirstOrDefault()
+        ?? throw new InvalidOperationException($"Base object '{baseName}' was not found.");
+
+    double towerX = towerBase.X;
+    double towerY = towerBase.Y;
+    double towerTopZ = towerBase.Z;
+    var failedStackSources = new List<SceneObject>();
+    var steps = new List<StepEnvelope>();
+
+    Console.WriteLine(
+        $"[MultiStack Batch] Planning {sequence.Count}-cube tower at " +
+        $"({towerX:F3}, {towerY:F3}); sequence={string.Join(" -> ", sequence)}.");
+
+    for (int layer = 2; layer <= sequence.Count; layer++)
+    {
+        Assignment assignment;
+        try
+        {
+            assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
+                sequence[layer - 1], virtualScene, towerX, towerY, towerTopZ,
+                ++globalStepId, failedStackSources);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MultiStack Batch] Cannot build layer {layer}: {ex.Message}");
+            break;
+        }
+
+        Console.WriteLine($"[MultiStack Batch] Layer {layer}/{sequence.Count}: {assignment.Reasoning}");
+        var envelope = await BuildStepEnvelopeAsync(assignment, virtualScene);
+        if (envelope == null)
+        {
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+        steps.Add(envelope);
+        UpdateVirtualSceneAfterPlannedStep(virtualScene, assignment);
+        towerTopZ += assignment.Source!.Z;
+    }
+
+    await ExecuteBatchAsync("multi-stack", steps);
+}
+
+async Task RunSpatialPatternTaskBatchAsync(string userCommand, List<SceneObject> initialScene)
+{
+    string color = GuessBlockColor(userCommand, initialScene);
+    string cubeName = $"{color}_cube";
+    int cubeBudget = initialScene.Count(o =>
+        o.Name == cubeName && TaskAssigner.IsInSupplyZone(o));
+
+    Console.WriteLine(
+        $"[3D Batch Layer 1] Asking LLM for a self-supporting voxel glyph " +
+        $"(color={color}, cubes={cubeBudget}, volume=" +
+        $"{workspace.SpatialRows}x{workspace.SpatialCols}x{workspace.SpatialLayers})...");
+
+    SpatialPattern pattern;
+    try
+    {
+        pattern = await spatialPatternDesigner.DesignAsync(userCommand, color, cubeBudget);
+    }
+    catch (SpatialPatternInfeasibleException ex)
+    {
+        Console.WriteLine($"[3D Batch Layer 1] 不可執行：{ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[3D Batch Layer 1] 設計服務失敗：{ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    int[,] heights = pattern.ColumnHeights!;
+    int rows = heights.GetLength(0), cols = heights.GetLength(1);
+    var columns = new List<(int Row, int Col, int Height, double X, double Y)>();
+    for (int r = 0; r < rows; r++)
+    for (int c = 0; c < cols; c++)
+        if (heights[r, c] > 0)
+        {
+            double targetX = workspace.TargetOriginX + c * workspace.SpatialCellSize;
+            double targetY = workspace.SpatialTargetOriginY + (rows - 1 - r) * workspace.SpatialCellSize;
+            columns.Add((r, c, heights[r, c], targetX, targetY));
+        }
+    columns = columns.OrderByDescending(x => x.Y).ThenByDescending(x => x.X).ToList();
+
+    var virtualScene = CloneScene(initialScene);
+    var steps = new List<StepEnvelope>();
+    var placedColumns = new List<(int Row, int Col, int Height, double X, double Y, double TopZ)>();
+
+    foreach (var column in columns)
+    {
+        var target = new TargetCell
+        {
+            Row = column.Row,
+            Col = column.Col,
+            WorldX = column.X,
+            WorldY = column.Y,
+            WorldZ = workspace.DefaultBlockZ,
+            ExpectedShape = "cube",
+            ExpectedColor = color,
+        };
+        var assignment = TaskAssigner.Assign(
+            new List<TargetCell> { target }, virtualScene, ++globalStepId);
+        if (assignment == null)
+        {
+            Console.WriteLine($"[3D Batch base] No {cubeName} remains for r{column.Row}c{column.Col}.");
+            break;
+        }
+
+        var envelope = await BuildStepEnvelopeAsync(assignment, virtualScene);
+        if (envelope == null)
+        {
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+        steps.Add(envelope);
+        UpdateVirtualSceneAfterPlannedStep(virtualScene, assignment);
+        placedColumns.Add((column.Row, column.Col, column.Height,
+            column.X, column.Y, assignment.Source!.Z));
+    }
+
+    for (int layer = 2; layer <= workspace.SpatialLayers; layer++)
+    {
+        foreach (var column in placedColumns.Where(c => c.Height >= layer).ToList())
+        {
+            int index = placedColumns.FindIndex(c => c.Row == column.Row && c.Col == column.Col);
+            Assignment assignment;
+            try
+            {
+                assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
+                    cubeName, virtualScene, column.X, column.Y, column.TopZ,
+                    ++globalStepId, sourceZoneXMax: workspace.SupplyZoneXMax);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[3D Batch layer {layer}] {ex.Message}");
+                continue;
+            }
+
+            var envelope = await BuildStepEnvelopeAsync(assignment, virtualScene);
+            if (envelope == null)
+            {
+                WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+                return;
+            }
+            steps.Add(envelope);
+            UpdateVirtualSceneAfterPlannedStep(virtualScene, assignment);
+            placedColumns[index] = (column.Row, column.Col, column.Height,
+                column.X, column.Y, column.TopZ + assignment.Source!.Z);
+        }
+    }
+
+    await ExecuteBatchAsync($"3D pattern {pattern.PatternId}", steps);
+}
+
+#pragma warning disable CS8321 // Legacy closed-loop mode kept as a fallback while batch mode is active.
+async Task RunPatternTaskAsync(string userCommand)
+{
+    // 先掃一次，取得 supplies 與 block color 的決策依據
+    var initialSnap = await FetchSceneAsync();
+    string blockColor = GuessBlockColor(userCommand, initialSnap);
+    
+    var safeColorSupplies = initialSnap.Where(s =>
+        TaskAssigner.IsInSupplyZone(s) &&
+        (s.Name == $"{blockColor}_cube" || s.Name == $"{blockColor}_domino") &&
+        TaskAssigner.IsSourceReachSafe(s)).ToList();
+    int cubeBudget = safeColorSupplies.Count(s => s.Name == $"{blockColor}_cube");
+    int dominoBudget = safeColorSupplies.Count(s => s.Name == $"{blockColor}_domino");
+
+    int maxCoveredCells = cubeBudget + dominoBudget * 2;
+    Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={blockColor})...");
+
+    CanonicalPattern pattern;
+    try
+    {
+        pattern = await patternDesigner.DesignAsync(
+            userCommand, blockColor, cubeBudget, dominoBudget);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Layer 1] pattern 設計失敗：{ex.Message}");
+        Console.WriteLine(ex.ToString());
+        return;
+    }
+    Console.WriteLine($"[Layer 1] pattern={pattern.PatternId}, bitmap={pattern.Bitmap!.GetLength(0)}x{pattern.Bitmap.GetLength(1)}");
+    // 印出 ASCII 圖，並存到 outputs/pattern_XX.json 方便 debug
+    int br = pattern.Bitmap.GetLength(0), bc = pattern.Bitmap.GetLength(1);
+    var rows = new List<string>();
+    for (int r = 0; r < br; r++)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int c = 0; c < bc; c++) sb.Append(pattern.Bitmap[r, c] == 1 ? "■" : "□");
+        rows.Add(sb.ToString());
+        Console.WriteLine("           " + sb.ToString());
+    }
+    var patternDump = new
+    {
+        pattern_id = pattern.PatternId,
+        block_color = pattern.BlockColor,
+        bitmap = rows,
+        rows = br,
+        cols = bc,
+        timestamp = DateTime.Now.ToString("s"),
+    };
+    File.WriteAllText(
+        Path.Combine(localOutputDir, $"pattern_{pattern.PatternId}.json"),
+        JsonSerializer.Serialize(patternDump, jsonOptions)
+    );
+
+    // Layer 2：計算所有 target（cubeBudget / dominoBudget 已在上方算好）
+    var realize = LayoutRealizer.Realize(pattern, workspace, cubeBudget, dominoBudget);
+    if (realize.Error != null || realize.Targets == null)
+    {
+        Console.WriteLine($"[Layer 2] {realize.Error}");
+        return;
+    }
+    Console.WriteLine($"[Layer 2] 展開成 {realize.Targets.Count} 個 target cells "
+                      + $"({realize.Targets.Count(t => t.ExpectedShape == "domino")} domino + "
+                      + $"{realize.Targets.Count(t => t.ExpectedShape == "cube")} cube)");
+    Console.WriteLine($"[Layer 2] Placement shift: X={realize.PlacementShiftX:+0.000;-0.000;0.000} m, " +
+                      $"Y={realize.PlacementShiftY:+0.000;-0.000;0.000} m (CellSize={workspace.CellSize:F3} m)");
+
+    var remainingTargets = new List<TargetCell>(realize.Targets);
+    var placedTargets = new List<TargetCell>();
+    var failureCounts = new Dictionary<(int Row, int Col), int>();
+    var skippedTargets = new HashSet<(int Row, int Col)>();
+    var failedSources = new List<SceneObject>();
+    string? motionFeedback = null;
+    const int MAX_RETRY = 1;
+    const int MAX_NO_PROGRESS_ROUNDS = 5;
+    int noProgressRounds = 0;
+    int previousMatchedCount = -1;
+    int recoveryRound = 0;
+    bool recoveryMode = false;
+
+    bool RegisterStepFailure(
+        Assignment failedAssignment,
+        string reason,
+        bool blacklistSource,
+        IReadOnlyList<SceneObject>? latestScene = null)
+    {
+        var key = (failedAssignment.Target!.Row, failedAssignment.Target.Col);
+        int failures = failureCounts.GetValueOrDefault(key) + 1;
+        failureCounts[key] = failures;
+        motionFeedback = reason;
+
+        if (blacklistSource && failedAssignment.Source != null &&
+            !failedSources.Any(s => s.Name == failedAssignment.Source.Name &&
+                Math.Pow(s.X - failedAssignment.Source.X, 2) +
+                Math.Pow(s.Y - failedAssignment.Source.Y, 2) <= Math.Pow(0.035, 2)))
+        {
+            failedSources.Add(failedAssignment.Source);
+            Console.WriteLine(
+                $"       記錄失敗積木：{failedAssignment.Source.Name} " +
+                $"({failedAssignment.Source.X:F3}, {failedAssignment.Source.Y:F3})");
+        }
+
+        if (failures <= MAX_RETRY)
+        {
+            Console.WriteLine($"       同一目標將重試第 {failures}/{MAX_RETRY} 次");
+            return false;
+        }
+
+        // A retry limit applies to the current source choice, not to every block
+        // that could satisfy this target. Before skipping, look for a same-type
+        // piece that has never failed. Search the full QR workspace so a valid
+        // spare outside the normal supply-zone cutoff is not overlooked.
+        string expectedName = $"{failedAssignment.Target.ExpectedColor}_" +
+                              failedAssignment.Target.ExpectedShape;
+        bool HasFailedBefore(SceneObject candidate) => failedSources.Any(f =>
+            candidate.Name == f.Name &&
+            Math.Pow(candidate.X - f.X, 2) + Math.Pow(candidate.Y - f.Y, 2)
+                <= Math.Pow(0.035, 2));
+        bool OccupiesPlacedTarget(SceneObject candidate) => placedTargets.Any(t =>
+            Math.Pow(candidate.X - t.WorldX, 2) + Math.Pow(candidate.Y - t.WorldY, 2)
+                <= Math.Pow(0.025, 2));
+        var untriedAlternatives = blacklistSource && latestScene != null
+            ? latestScene
+                .Where(o => o.Name == expectedName)
+                .Where(o => !HasFailedBefore(o))
+                .Where(o => !OccupiesPlacedTarget(o))
+                .ToList()
+            : new List<SceneObject>();
+
+        if (untriedAlternatives.Count > 0)
+        {
+            failureCounts[key] = 0;
+            recoveryMode = true; // allow TaskAssigner to use the full QR workspace
+            motionFeedback = reason + "；改用尚未嘗試的同色同形積木。";
+            Console.WriteLine(
+                $"       已達目前積木的重試上限，但仍有 " +
+                $"{untriedAlternatives.Count} 顆未嘗試的 {expectedName}，改抓其他積木");
+            return false;
+        }
+
+        Console.WriteLine($"       同一目標重試 {MAX_RETRY} 次仍失敗，跳過 r{key.Row}c{key.Col}");
+        skippedTargets.Add(key);
+        remainingTargets.RemoveAll(t => t.Row == key.Row && t.Col == key.Col);
+        failureCounts.Remove(key);
+        motionFeedback = null;
+        return true;
+    }
+
+    // Layer 3/4/5 閉環。每一輪執行完都做全局驗證；若仍有未匹配
+    // target，就用最新場景重建待辦並進入 recovery。
     while (true)
     {
-        if (File.Exists(path))
+      while (remainingTargets.Count > 0)
+      {
+        globalStepId++;
+        Console.WriteLine();
+        Console.WriteLine($"─── Step {globalStepId} ───");
+
+        // 每步重新掃描一次（Layer 3 需要最新 supply 狀況）
+        var beforeSnap = await FetchSceneAsync();
+
+        var assignment = TaskAssigner.Assign(
+            remainingTargets,
+            beforeSnap,
+            globalStepId,
+            recoveryMode,
+            placedTargets,
+            failedSources);
+        if (assignment == null)
         {
-            try { var result = JsonSerializer.Deserialize<ExecutionResult>(File.ReadAllText(path), json);
-                if (result?.StepId == id) { File.Delete(path); return result; } }
-            catch (IOException) { }
-            catch (JsonException) { }
+            Console.WriteLine("[Layer 3] 沒有可執行的 assignment（supply 用完或不足）");
+            break;
         }
-        int elapsedSeconds = (int)(DateTime.UtcNow - started).TotalSeconds;
-        if (elapsedSeconds >= lastReportedSeconds + 15)
+        Console.WriteLine($"[Layer 3] {assignment.Reasoning}");
+
+        // Layer 4A：由 LLM 使用白名單 robot functions 規劃動作。
+        // 最多要求 LLM 修正三次；通過 deterministic validator 後才交給 Unity。
+        MotionPlan? motionPlan = null;
+        string validationError = "";
+        for (int planAttempt = 1; planAttempt <= 3; planAttempt++)
         {
-            lastReportedSeconds = elapsedSeconds;
-            Console.WriteLine($"[Unity/UR3] 第 {attempt}/10 輪，batch {id} 仍在執行，已等待 {elapsedSeconds} 秒（無逾時限制）...");
+            string feedback = string.Join("; ", new[] { motionFeedback, validationError }
+                .Where(s => !string.IsNullOrWhiteSpace(s)));
+            try
+            {
+                motionPlan = await motionPlanner.PlanAsync(assignment, beforeSnap, feedback);
+            }
+            catch (Exception ex)
+            {
+                validationError = "Motion Planner call failed: " + ex.Message;
+                Console.WriteLine($"[Layer 4A] 第 {planAttempt} 次規劃呼叫失敗：{ex.Message}");
+                motionPlan = null;
+                continue;
+            }
+            if (MotionPlanValidator.TryValidate(motionPlan, assignment, beforeSnap, out validationError)) break;
+            Console.WriteLine($"[Layer 4A] 第 {planAttempt} 次規劃未通過安全驗證：{validationError}");
+            motionPlan = null;
         }
-        await Task.Delay(200);
+        if (motionPlan == null)
+        {
+            Console.WriteLine("[Layer 4A] 無法取得安全的動作規劃");
+            RegisterStepFailure(
+                assignment, validationError, blacklistSource: false, latestScene: beforeSnap);
+            continue;
+        }
+        Console.WriteLine($"[Layer 4A] LLM motion plan：{motionPlan.ActionSequence.Count} functions — {motionPlan.Reasoning}");
+
+        // Layer 4B：將已驗證的 function sequence 交給 Unity，不再固定展開成 12 步。
+        var envelope = new StepEnvelope
+        {
+            StepId = assignment.StepId,
+            Done = false,
+            SourcePosition = assignment.Source,
+            TargetPosition = new SceneObject
+            {
+                Name = $"grid_{assignment.Target!.ExpectedShape}_r{assignment.Target.Row}_c{assignment.Target.Col}",
+                X = assignment.Target.WorldX,
+                Y = assignment.Target.WorldY,
+                Z = assignment.Target.WorldZ,
+                Shape = assignment.Target.ExpectedShape,
+                Orientation = assignment.Target.ExpectedOrientation,
+            },
+            Comment = assignment.Reasoning + " | Motion: " + motionPlan.Reasoning,
+            ActionSequence = motionPlan.ActionSequence,
+        };
+        WriteStepFile(envelope);
+
+        Console.WriteLine($"[Layer 4] 送出 step {assignment.StepId}，等待 Unity 執行...");
+        var execResult = await WaitForStepDoneAsync(
+            assignment.StepId, timeoutSec: UNITY_STEP_TIMEOUT_SEC);
+        if (execResult == null || !execResult.Completed)
+        {
+            Console.WriteLine($"[Layer 4] 執行 timeout 或失敗：{execResult?.Error}");
+            RegisterStepFailure(
+                assignment,
+                execResult?.Error ?? "Unity execution timeout",
+                blacklistSource: true,
+                latestScene: beforeSnap);
+            continue;
+        }
+        Console.WriteLine($"[Layer 4] 執行完成 ({execResult.DurationSec:F1}s)");
+
+        // Layer 5：驗證
+        var afterSnap = await FetchSceneAsync();
+        var verify = Verifier.CheckStep(assignment, beforeSnap, afterSnap);
+        Console.WriteLine($"[Layer 5] {verify.OverallStatus} — {verify.Note}");
+
+        int keyRow = assignment.Target!.Row;
+        int keyCol = assignment.Target.Col;
+
+        switch (verify.OverallStatus)
+        {
+            case "ok":
+                placedTargets.Add(assignment.Target);
+                remainingTargets.RemoveAll(t => t.Row == keyRow && t.Col == keyCol);
+                failureCounts.Remove((keyRow, keyCol));
+                motionFeedback = null;
+                break;
+            case "retry":
+                RegisterStepFailure(
+                    assignment, verify.Note, blacklistSource: true, latestScene: afterSnap);
+                break;
+            case "replan":
+                RegisterStepFailure(
+                    assignment, verify.Note, blacklistSource: true, latestScene: afterSnap);
+                break;
+            case "abort":
+                Console.WriteLine("       abort：終止目前任務");
+                goto TaskDone;
+        }
+
+        Console.WriteLine($"       剩餘 targets: {remainingTargets.Count}");
+      }
+
+      // 一輪結束後不直接宣告任務完成；重新掃描整個場景，僅保留未匹配目標。
+      var roundSnap = await FetchSceneAsync();
+      var roundResults = Verifier.CheckOverall(realize.Targets, roundSnap);
+      int roundMatched = roundResults.Count(r => r.matched);
+
+      Console.WriteLine();
+      Console.WriteLine(recoveryMode
+          ? $"=== Recovery {recoveryRound} 驗證：{roundMatched}/{roundResults.Count} ==="
+          : $"=== 第一輪全局驗證：{roundMatched}/{roundResults.Count} ===");
+
+      if (roundMatched == roundResults.Count)
+      {
+          Console.WriteLine("所有目標位置均已匹配。");
+          break;
+      }
+
+      if (roundMatched > previousMatchedCount)
+          noProgressRounds = 0;
+      else
+          noProgressRounds++;
+      previousMatchedCount = roundMatched;
+
+      if (noProgressRounds >= MAX_NO_PROGRESS_ROUNDS)
+      {
+          Console.WriteLine(
+              $"連續 {MAX_NO_PROGRESS_ROUNDS} 輪沒有進展，停止自動恢復；" +
+              "請檢查積木是否掉出視野、辨識錯誤或供應不足。");
+          break;
+      }
+
+      placedTargets.Clear();
+      placedTargets.AddRange(roundResults.Where(r => r.matched).Select(r => r.target));
+      remainingTargets = roundResults
+          .Where(r => !r.matched && !skippedTargets.Contains((r.target.Row, r.target.Col)))
+          .Select(r => r.target)
+          .ToList();
+
+      if (remainingTargets.Count == 0)
+      {
+          Console.WriteLine("所有未匹配目標都已達重試上限並跳過，不再重新加入 recovery。");
+          break;
+      }
+
+      recoveryMode = true;
+      recoveryRound++;
+      motionFeedback = "全局驗證未匹配；重新掃描並回收放偏或掉落的同色同形積木。";
+
+      Console.WriteLine(
+          $"[Recovery {recoveryRound}] 將重新處理 {remainingTargets.Count} 個未匹配位置；" +
+          $"連續無進展 {noProgressRounds}/{MAX_NO_PROGRESS_ROUNDS} 輪。");
+      await Task.Delay(1000);
     }
-}
-// 圖形裡的一個物件：位置與方向照計畫的 target，頂面高度給 Unity 比對用
-static SceneObject FigureObject(SceneObject target, double topM) => new()
-{
-    Name = target.Name, Shape = target.Shape, Orientation = target.Orientation,
-    X = target.X, Y = target.Y, Z = topM, SkewDeg = target.SkewDeg
-};
-// 這一輪計畫最後擺出來的圖形（key = 場景 index）：每塊只算最後放下的位置（同一塊搬兩次只算最後一次，最後還夾著的不算），
-// Z 是放好後的頂面（LayeredHeights.ForSteps）。withSupports：再加上沒被搬、但壓在放下的積木底下的場景積木
-// （3D 疊放時支撐也是結構的一部分，位置是觀測到的、Z 是它的頂面）。3D 的高度圖與給 Unity 比對的預期格都用這一組。
-static Dictionary<int, SceneObject> PlannedFigure(List<TranslatedStep> steps, List<SceneObject> scene, bool withSupports)
-{
-    var tops = LayeredHeights.ForSteps(steps, scene);
-    var placed = new Dictionary<int, SceneObject>();
-    for (int k = 0; k < steps.Count; k++)
+
+    TaskDone:
+    // 寫入 done，讓 Unity 停止 polling
+    WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+
+    // 最終驗證
+    var finalSnap = await FetchSceneAsync();
+    var overallResults = Verifier.CheckOverall(realize.Targets, finalSnap);
+    int matched = overallResults.Count(r => r.matched);
+    Console.WriteLine();
+    Console.WriteLine("=== 任務結束 ===");
+    Console.WriteLine($"最終驗證：{matched}/{overallResults.Count} 個位置正確");
+    foreach (var (t, ok) in overallResults.Where(x => !x.matched))
     {
-        var step = steps[k];
-        if (step.Target == null || step.SourceIndex < 0 || step.SourceIndex >= scene.Count) continue;
-        if (ClassifyOutcome(step.Actions) == ActionOutcome.Placed) placed[step.SourceIndex] = FigureObject(step.Target, tops[k].TargetTopM);
-        else placed.Remove(step.SourceIndex);
+        Console.WriteLine($"  × r{t.Row}c{t.Col} ({t.ExpectedShape}) 未匹配");
     }
-    if (withSupports)
-        foreach (var (i, top) in LayeredHeights.UnmovedSupports(steps, scene, placed.Values))
-            placed[i] = FigureObject(scene[i], top);
-    return placed;
 }
-// 目標 bitmap 設計：每個任務都先用 release 260917 的 PatternDesigner 畫一張（prompt 原封不動，不分類指令）。
-// 顏色照舊版 GuessBlockColor；庫存是桌上那個顏色的所有 cube / domino（現在沒有補貨區）
-async Task<PatternDesign> DesignTarget(string goal, List<SceneObject> scene, string logDir)
+
+async Task RunSpatialPatternTaskAsync(string userCommand, List<SceneObject> initialScene)
 {
-    DesignLog.Start(logDir);
-    string color = GuessBlockColor(goal, scene);
-    int cubes = scene.Count(o => o.Name == $"{color}_cube"), dominoes = scene.Count(o => o.Name == $"{color}_domino");
-    Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={color}, {cubes} cube + {dominoes} domino)...");
+    string color = GuessBlockColor(userCommand, initialScene);
+    string cubeName = $"{color}_cube";
+    int cubeBudget = initialScene.Count(o =>
+        o.Name == cubeName && TaskAssigner.IsInSupplyZone(o));
+    Console.WriteLine(
+        $"[3D Layer 1] Asking LLM for a self-supporting voxel glyph " +
+        $"(color={color}, cubes={cubeBudget}, volume=" +
+        $"{workspace.SpatialRows}x{workspace.SpatialCols}x{workspace.SpatialLayers})...");
+
+    SpatialPattern pattern;
     try
     {
-        int[,] grid = (await patternDesigner.DesignAsync(goal, color, cubes, dominoes)).Bitmap!;
-        var rows = Enumerable.Range(0, grid.GetLength(0)).Select(r => string.Concat(
-            Enumerable.Range(0, grid.GetLength(1)).Select(c => grid[r, c] == 1 ? '1' : '0'))).ToList();
-        FigureBitmap.Print("[Layer 1] 目標 bitmap（第一列 = 相機畫面最上方）：", rows.Select(r => r.Replace('0', '□').Replace('1', '■')));
-        return new PatternDesign { BlockColor = color, Bitmap = rows, Reviewed = !PatternDesigner.SkipReview };
+        pattern = await spatialPatternDesigner.DesignAsync(
+            userCommand, color, cubeBudget);
     }
-    // 舊版設計器畫不出可用的圖時丟 InvalidOperationException；Gemini 的 HTTP 錯誤、缺 key 照基礎設施錯誤處理
-    catch (InvalidOperationException ex) when (!ex.Message.StartsWith("Gemini API"))
+    catch (SpatialPatternInfeasibleException ex)
     {
-        throw new PatternDesignException(ex.Message);
+        Console.WriteLine($"[3D Layer 1] 不可執行：{ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[3D Layer 1] 設計服務失敗：{ex.Message}");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    int[,] heights = pattern.ColumnHeights!;
+    int rows = heights.GetLength(0), cols = heights.GetLength(1);
+    int total = 0;
+    Console.WriteLine($"[3D Layer 1] pattern={pattern.PatternId}, column heights={rows}x{cols}");
+    for (int r = 0; r < rows; r++)
+    {
+        var line = new System.Text.StringBuilder();
+        for (int c = 0; c < cols; c++)
+        {
+            line.Append(heights[r, c]);
+            if (c + 1 < cols) line.Append(' ');
+            total += heights[r, c];
+        }
+        Console.WriteLine("             " + line);
+    }
+    Console.WriteLine($"[3D deterministic] support=pass (contiguous columns), cubes={total}/{cubeBudget}");
+
+    var columns = new List<(int Row, int Col, int Height, double X, double Y)>();
+    for (int r = 0; r < rows; r++)
+    for (int c = 0; c < cols; c++)
+        if (heights[r, c] > 0)
+        {
+            double targetX = workspace.TargetOriginX + c * workspace.SpatialCellSize;
+            double targetY = workspace.TargetOriginY + (rows - 1 - r) * workspace.SpatialCellSize;
+            if (targetX < workspace.TargetZoneXMin)
+                throw new InvalidOperationException(
+                    $"3D target r{r}c{c} X={targetX:F3} is outside the target zone " +
+                    $"(X >= {workspace.TargetZoneXMin:F2} m).");
+            columns.Add((r, c, heights[r, c], targetX, targetY));
+        }
+    columns = columns.OrderByDescending(x => x.Y).ThenByDescending(x => x.X).ToList();
+
+    var failedSources = new List<SceneObject>();
+    var placedBases = new List<(int Row, int Col, int Height, double X, double Y, double TopZ)>();
+    var baseRoute = new RoutedCommand { Action = "move_relative" };
+    var stackRoute = new RoutedCommand { Action = "stack" };
+
+    // Build every table-supported base before adding upper layers.
+    foreach (var column in columns)
+    {
+        var scene = await FetchSceneAsync();
+        Assignment BuildBase(List<SceneObject> snap, int id)
+        {
+            SceneObject source = snap
+                .Where(o => o.Name == cubeName && TaskAssigner.IsInSupplyZone(o))
+                .Where(o => !failedSources.Any(f => f.Name == o.Name &&
+                    Math.Pow(f.X - o.X, 2) + Math.Pow(f.Y - o.Y, 2) < Math.Pow(0.035, 2)))
+                .OrderBy(o => Math.Pow(o.X - column.X, 2) + Math.Pow(o.Y - column.Y, 2))
+                .FirstOrDefault()
+                ?? throw new InvalidOperationException($"No untried {cubeName} remains for 3D base.");
+            double z = Math.Max(source.Z, workspace.DefaultBlockZ);
+            return new Assignment
+            {
+                StepId = id,
+                Source = source,
+                Target = new TargetCell
+                {
+                    Row = column.Row, Col = column.Col,
+                    WorldX = column.X, WorldY = column.Y, WorldZ = z,
+                    ExpectedShape = "cube", ExpectedColor = color,
+                },
+                Reasoning = $"3D base r{column.Row}c{column.Col} at ({column.X:F3},{column.Y:F3})",
+            };
+        }
+
+        Assignment assignment;
+        try { assignment = BuildBase(scene, ++globalStepId); }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[3D base] " + ex.Message);
+            goto SpatialDone;
+        }
+        bool ok = await RunSingleObjectTaskAsync(
+            baseRoute, scene, assignment, writeDoneWhenFinished: false,
+            rebuildForRetry: BuildBase);
+        if (!ok)
+        {
+            failedSources.Add(assignment.Source!);
+            Console.WriteLine($"[3D base] Failed r{column.Row}c{column.Col}; stopping.");
+            goto SpatialDone;
+        }
+        placedBases.Add((column.Row, column.Col, column.Height,
+            column.X, column.Y, assignment.Source!.Z));
+    }
+
+    // Add upper cubes bottom-up. Every target is supported by its own column.
+    for (int layer = 2; layer <= workspace.SpatialLayers; layer++)
+    {
+        foreach (var column in placedBases.Where(c => c.Height >= layer).ToList())
+        {
+            int index = placedBases.FindIndex(c => c.Row == column.Row && c.Col == column.Col);
+            var scene = await FetchSceneAsync();
+            Assignment assignment;
+            try
+            {
+                assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
+                    cubeName, scene, column.X, column.Y, column.TopZ,
+                    ++globalStepId, failedSources, workspace.SupplyZoneXMax);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[3D layer {layer}] {ex.Message}");
+                goto SpatialDone;
+            }
+            bool ok = await RunSingleObjectTaskAsync(
+                stackRoute, scene, assignment, writeDoneWhenFinished: false,
+                rebuildForRetry: (latest, retryId) =>
+                    SingleObjectTaskBuilder.BuildStackOntoLocation(
+                        cubeName, latest, column.X, column.Y, column.TopZ,
+                        retryId, failedSources, workspace.SupplyZoneXMax),
+                failedStackSources: failedSources);
+            if (!ok)
+            {
+                Console.WriteLine($"[3D layer {layer}] Failed r{column.Row}c{column.Col}; stopping.");
+                goto SpatialDone;
+            }
+            placedBases[index] = (column.Row, column.Col, column.Height,
+                column.X, column.Y, column.TopZ + assignment.Source!.Z);
+        }
+    }
+
+    Console.WriteLine("[3D] 所有立體字柱已完成。");
+
+    SpatialDone:
+    WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+}
+
+// --- 輔助函式 ---
+async Task<bool> RunSingleObjectTaskAsync(
+    RoutedCommand routed,
+    List<SceneObject> initialScene,
+    Assignment? preparedAssignment = null,
+    bool writeDoneWhenFinished = true,
+    Func<List<SceneObject>, int, Assignment>? rebuildForRetry = null,
+    List<SceneObject>? failedStackSources = null)
+{
+    if (preparedAssignment == null)
+        globalStepId++;
+    Assignment assignment;
+    try
+    {
+        assignment = preparedAssignment ??
+            SingleObjectTaskBuilder.Build(routed, initialScene, globalStepId);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[SingleObject] Cannot build task: {ex.Message}");
+        if (writeDoneWhenFinished)
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return false;
+    }
+
+    Console.WriteLine($"[SingleObject] {assignment.Reasoning}");
+    string? feedback = null;
+    const int maxRetries = 1;
+    bool succeeded = false;
+
+    void RememberFailedStackSource(Assignment failedAssignment)
+    {
+        if (routed.Action != "stack" || failedStackSources == null ||
+            failedAssignment.Source == null)
+            return;
+        SceneObject source = failedAssignment.Source;
+        bool alreadyRecorded = failedStackSources.Any(f =>
+            f.Name == source.Name &&
+            Math.Sqrt(Math.Pow(f.X - source.X, 2) + Math.Pow(f.Y - source.Y, 2)) < 0.035);
+        if (alreadyRecorded) return;
+        failedStackSources.Add(source);
+        Console.WriteLine(
+            $"[MultiStack] Blacklisted failed source {source.Name} " +
+            $"({source.X:F3}, {source.Y:F3}); retry will choose another block.");
+    }
+
+    for (int retry = 0; retry <= maxRetries; retry++)
+    {
+        var beforeSnap = await FetchSceneAsync();
+        if (retry > 0)
+        {
+            int retryStepId = ++globalStepId;
+            try
+            {
+                if (rebuildForRetry != null)
+                {
+                    assignment = rebuildForRetry(beforeSnap, retryStepId);
+                }
+                else if (routed.Action == "stack")
+                {
+                    assignment = SingleObjectTaskBuilder.Build(
+                        routed, beforeSnap, retryStepId);
+                }
+                else
+                {
+                    assignment.StepId = retryStepId;
+                }
+                Console.WriteLine(
+                    $"[Retry] Recomputed source and stack target from latest scene: " +
+                    assignment.Reasoning);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Retry] Cannot rebuild assignment: {ex.Message}");
+                break;
+            }
+        }
+        MotionPlan? motionPlan = null;
+        string validationError = "";
+
+        for (int planAttempt = 1; planAttempt <= 3; planAttempt++)
+        {
+            string plannerFeedback = string.Join("; ", new[] { feedback, validationError }
+                .Where(s => !string.IsNullOrWhiteSpace(s)));
+            try
+            {
+                motionPlan = await motionPlanner.PlanAsync(assignment, beforeSnap, plannerFeedback);
+            }
+            catch (Exception ex)
+            {
+                validationError = "Motion Planner call failed: " + ex.Message;
+                motionPlan = null;
+                continue;
+            }
+
+            if (MotionPlanValidator.TryValidate(motionPlan, assignment, beforeSnap, out validationError))
+                break;
+            Console.WriteLine($"[MotionPlanner] Attempt {planAttempt} rejected: {validationError}");
+            motionPlan = null;
+        }
+
+        if (motionPlan == null)
+        {
+            Console.WriteLine("[MotionPlanner] Could not produce a safe plan.");
+            break;
+        }
+
+        var envelope = new StepEnvelope
+        {
+            StepId = assignment.StepId,
+            Done = false,
+            SourcePosition = assignment.Source,
+            TargetPosition = new SceneObject
+            {
+                Name = routed.Action == "stack" ? "stack_target" : "relative_target",
+                X = assignment.Target!.WorldX,
+                Y = assignment.Target.WorldY,
+                Z = assignment.Target.WorldZ,
+                Shape = assignment.Target.ExpectedShape,
+                Orientation = assignment.Target.ExpectedOrientation,
+            },
+            Comment = assignment.Reasoning + " | Motion: " + motionPlan.Reasoning,
+            ActionSequence = motionPlan.ActionSequence,
+        };
+
+        WriteStepFile(envelope);
+        Console.WriteLine($"[Executor] Sent step {assignment.StepId}; waiting for Unity...");
+        var execResult = await WaitForStepDoneAsync(
+            assignment.StepId, timeoutSec: UNITY_STEP_TIMEOUT_SEC);
+        if (execResult == null || !execResult.Completed)
+        {
+            feedback = execResult?.Error ?? "Unity execution timeout";
+            Console.WriteLine($"[Executor] Failed: {feedback}");
+            // Execution state is unknown; do not blindly return to the old source coordinate.
+            break;
+        }
+
+        // Give the multi-frame perception stabilizer time to replace the
+        // pre-motion detections, especially when one block occludes another.
+        if (routed.Action == "stack")
+            await Task.Delay(1200);
+        var afterSnap = await FetchSceneAsync();
+        var verify = Verifier.CheckSingleObjectStep(
+            assignment, beforeSnap, afterSnap, requireStackHeight: routed.Action == "stack");
+        Console.WriteLine($"[Verifier] {verify.OverallStatus} — {verify.Note}");
+        if (verify.OverallStatus == "ok")
+        {
+            succeeded = true;
+            break;
+        }
+        RememberFailedStackSource(assignment);
+        if (retry >= maxRetries)
+            break;
+        if (verify.OverallStatus is not ("retry" or "replan" or "abort"))
+            break;
+        feedback = verify.Note;
+    }
+
+    if (writeDoneWhenFinished)
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+    return succeeded;
+}
+
+async Task RunMultiStackTaskAsync(RoutedCommand routed, List<SceneObject> initialScene)
+{
+    List<string> sequence = routed.StackSequence.Count >= 2
+        ? routed.StackSequence
+        : Enumerable.Repeat(routed.ObjectName ?? "", routed.ObjectCount ?? 2).ToList();
+    int requestedCount = sequence.Count;
+    if (requestedCount < 2 || sequence.Any(string.IsNullOrWhiteSpace))
+    {
+        Console.WriteLine("[MultiStack] Invalid stack sequence.");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+    if (sequence.Any(name => !name.EndsWith("_cube", StringComparison.Ordinal)))
+    {
+        Console.WriteLine("[MultiStack] Multi-layer stacking currently supports cubes only.");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    foreach (var requirement in sequence.GroupBy(name => name))
+    {
+        int visible = initialScene.Count(o => o.Name == requirement.Key);
+        if (visible < requirement.Count())
+        {
+            Console.WriteLine(
+                $"[MultiStack] Sequence needs {requirement.Count()} {requirement.Key}, " +
+                $"but only {visible} are visible.");
+            WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+            return;
+        }
+    }
+
+    // Prefer a base outside the supply zone; otherwise use the farthest-X cube.
+    string baseName = sequence[0];
+    SceneObject towerBase = initialScene
+        .Where(o => o.Name == baseName)
+        .OrderByDescending(o => o.X >= 0.30)
+        .ThenByDescending(o => o.X)
+        .First();
+    double towerX = towerBase.X;
+    double towerY = towerBase.Y;
+    double towerTopZ = towerBase.Z;
+    var failedStackSources = new List<SceneObject>();
+    Console.WriteLine(
+        $"[MultiStack] Building {requestedCount}-cube tower at " +
+        $"({towerX:F3}, {towerY:F3}); sequence=" +
+        $"{string.Join(" -> ", sequence)}.");
+
+    for (int layer = 2; layer <= requestedCount; layer++)
+    {
+        await Task.Delay(1200);
+        var scene = await FetchSceneAsync();
+        Assignment assignment;
+        try
+        {
+            assignment = SingleObjectTaskBuilder.BuildStackOntoLocation(
+                sequence[layer - 1], scene, towerX, towerY, towerTopZ,
+                ++globalStepId, failedStackSources);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MultiStack] Cannot build layer {layer}: {ex.Message}");
+            break;
+        }
+
+        Console.WriteLine($"[MultiStack] Layer {layer}/{requestedCount}: {assignment.Reasoning}");
+        bool ok = await RunSingleObjectTaskAsync(
+            routed,
+            scene,
+            assignment,
+            writeDoneWhenFinished: false,
+            rebuildForRetry: (latestScene, retryStepId) =>
+                SingleObjectTaskBuilder.BuildStackOntoLocation(
+                    sequence[layer - 1], latestScene, towerX, towerY,
+                    towerTopZ, retryStepId, failedStackSources),
+            failedStackSources: failedStackSources);
+        if (!ok)
+        {
+            Console.WriteLine($"[MultiStack] Layer {layer} failed; stopping tower construction.");
+            break;
+        }
+        towerTopZ += assignment.Source!.Z;
+        Console.WriteLine(
+            $"[MultiStack] Accumulated tower top Z after layer {layer}: " +
+            $"{towerTopZ:F3} m");
+    }
+
+    WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+}
+
+#pragma warning restore CS8321
+
+async Task<List<SceneObject>> FetchSceneAsync()
+{
+    try
+    {
+        var world = await httpClient.GetFromJsonAsync<ObjectsWorld>("scene", jsonOptions);
+        if (world?.Objects == null) return new List<SceneObject>();
+        return world.Objects
+            .Where(o => o.Position != null)
+            .Select(o => new SceneObject
+            {
+                Name = o.Name,
+                X = o.Position!.X,
+                Y = o.Position!.Y,
+                Z = o.Position!.Z,
+                Shape = string.IsNullOrEmpty(o.Shape) ? "cube" : o.Shape,
+                Orientation = o.Orientation,
+                SkewDeg = o.SkewDeg,
+            })
+            .ToList();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[perception] fetch scene 失敗：{ex.Message}");
+        return new List<SceneObject>();
     }
 }
-// release 260917 的 GuessBlockColor：指令有提到顏色就用它，沒有就用桌上比較多的顏色
-static string GuessBlockColor(string userCommand, List<SceneObject> snap)
+
+async Task<StepEnvelope?> BuildStepEnvelopeAsync(
+    Assignment assignment,
+    IReadOnlyList<SceneObject> planningScene)
+{
+    MotionPlan? motionPlan = null;
+    string validationError = "";
+    for (int planAttempt = 1; planAttempt <= 3; planAttempt++)
+    {
+        try
+        {
+            motionPlan = await motionPlanner.PlanAsync(
+                assignment, planningScene, validationError);
+        }
+        catch (Exception ex)
+        {
+            validationError = "Motion Planner call failed: " + ex.Message;
+            Console.WriteLine($"[Batch Layer 4A] 第 {planAttempt} 次規劃呼叫失敗：{ex.Message}");
+            motionPlan = null;
+            continue;
+        }
+
+        if (MotionPlanValidator.TryValidate(
+                motionPlan, assignment, planningScene, out validationError))
+            break;
+
+        Console.WriteLine($"[Batch Layer 4A] 第 {planAttempt} 次規劃未通過安全驗證：{validationError}");
+        motionPlan = null;
+    }
+
+    if (motionPlan == null)
+    {
+        Console.WriteLine("[Batch Layer 4A] 無法取得安全的動作規劃");
+        return null;
+    }
+
+    Console.WriteLine(
+        $"[Batch Layer 4A] step {assignment.StepId}: " +
+        $"{motionPlan.ActionSequence.Count} functions — {motionPlan.Reasoning}");
+
+    return new StepEnvelope
+    {
+        StepId = assignment.StepId,
+        Done = false,
+        SourcePosition = assignment.Source,
+        TargetPosition = new SceneObject
+        {
+            Name = $"target_{assignment.Target!.ExpectedShape}_r{assignment.Target.Row}_c{assignment.Target.Col}",
+            X = assignment.Target.WorldX,
+            Y = assignment.Target.WorldY,
+            Z = assignment.Target.WorldZ,
+            Shape = assignment.Target.ExpectedShape,
+            Orientation = assignment.Target.ExpectedOrientation,
+        },
+        Comment = assignment.Reasoning + " | Motion: " + motionPlan.Reasoning,
+        ActionSequence = motionPlan.ActionSequence,
+    };
+}
+
+async Task ExecuteBatchAsync(string comment, List<StepEnvelope> steps,
+    List<TargetCell>? expectedTargets = null, List<string>? bitmapRows = null)
+{
+    if (steps.Count == 0)
+    {
+        Console.WriteLine("[Batch] 沒有可執行步驟。");
+        WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
+        return;
+    }
+
+    var candidateSteps = JsonSerializer.Deserialize<List<StepEnvelope>>(
+        JsonSerializer.Serialize(steps, jsonOptions), jsonOptions)!;
+    foreach (var step in candidateSteps) step.StepId = ++globalStepId;
+    int batchId = ++globalStepId;
+    var batch = new BatchEnvelope
+    {
+        BatchId = batchId,
+        Done = false,
+        Comment = comment,
+        Steps = candidateSteps,
+        VerificationDisabled = !verificationEnabled,
+        Bitmap = expectedTargets != null ? bitmapRows : null,
+        CellSizeM = workspace.CellSize,
+        ExpectedCells = expectedTargets?.Select(t => new ExpectedCell
+        {
+            Row = t.Row,
+            Col = t.Col,
+            SecondRow = t.SecondRow ?? -1,
+            SecondCol = t.SecondCol ?? -1,
+            X = t.WorldX,
+            Y = t.WorldY,
+            Z = t.WorldZ,
+            Shape = t.ExpectedShape,
+            Orientation = t.ExpectedOrientation,
+        }).ToList(),
+    };
+    WriteBatchFile(batch);
+
+    Console.WriteLine($"[Batch] 已一次送出 {steps.Count} steps 給 Unity（batch {batchId}），等待整批完成...");
+    var execResult = await WaitForStepDoneAsync(
+        batchId, timeoutSec: UNITY_STEP_TIMEOUT_SEC * Math.Max(1, steps.Count));
+    if (execResult == null || !execResult.Completed)
+    {
+        Console.WriteLine($"[Batch] Unity batch timeout 或失敗：{execResult?.Error}");
+        return;
+    }
+
+    Console.WriteLine($"[Batch] Unity 回報 batch {batchId} 全部完成。");
+}
+
+List<SceneObject> CloneScene(IEnumerable<SceneObject> scene) =>
+    scene.Select(o => new SceneObject
+    {
+        Name = o.Name,
+        X = o.X,
+        Y = o.Y,
+        Z = o.Z,
+        Shape = o.Shape,
+        Orientation = o.Orientation,
+        SkewDeg = o.SkewDeg,
+    }).ToList();
+
+void UpdateVirtualSceneAfterPlannedStep(List<SceneObject> scene, Assignment assignment)
+{
+    if (assignment.Source == null || assignment.Target == null) return;
+
+    const double samePieceRadiusM = 0.035;
+    scene.RemoveAll(o =>
+        o.Name == assignment.Source.Name &&
+        Math.Sqrt(Math.Pow(o.X - assignment.Source.X, 2) +
+                  Math.Pow(o.Y - assignment.Source.Y, 2)) < samePieceRadiusM);
+
+    scene.Add(new SceneObject
+    {
+        Name = $"{assignment.Target.ExpectedColor}_{assignment.Target.ExpectedShape}",
+        X = assignment.Target.WorldX,
+        Y = assignment.Target.WorldY,
+        Z = assignment.Target.WorldZ,
+        Shape = assignment.Target.ExpectedShape,
+        Orientation = assignment.Target.ExpectedOrientation,
+        SkewDeg = 0,
+    });
+}
+
+string GuessBlockColor(string userCommand, List<SceneObject> snap)
 {
     if (userCommand.Contains("black") || userCommand.Contains("黑")) return "black";
     if (userCommand.Contains("yellow") || userCommand.Contains("黃")) return "yellow";
+    // 未指定時，選擇 supply 較多的顏色
     int y = snap.Count(s => s.Name.StartsWith("yellow_"));
     int b = snap.Count(s => s.Name.StartsWith("black_"));
     return y >= b ? "yellow" : "black";
 }
-static int LayerOf(SceneObject o) => Math.Max(1, (int)Math.Round(o.Z / LayeredGraspGeometry.BlockLayerM));
-// 計畫排出的圖形跟雙模型設計的目標 bitmap 比：兩邊都去掉四周的空列、空行後逐格相同才算一樣。
-// 2D 的 ■ 當 1；3D 比高度圖的層數（含壓在底下沒被搬的支撐）。回傳不同的說明，null = 相同
-static string? DesignMismatch(IReadOnlyList<string> target, List<TranslatedStep> steps, List<SceneObject> scene)
+
+void WriteStepFile(StepEnvelope env)
 {
-    bool stacked = IsaacSimExecutor.RequiresCheck(steps, scene);
-    var figure = PlannedFigure(steps, scene, withSupports: stacked).Values.ToList();
-    var planned = figure.Count == 0 ? new List<string>()
-        : stacked ? FigureBitmap.HeightMap(figure, figure.Select(LayerOf).ToList()).Rows
-        : FigureBitmap.Build(figure).Rows.Select(r => r.Replace('■', '1').Replace('□', '0')).ToList();
-    var want = FigureBitmap.Trim(target);
-    var got = FigureBitmap.Trim(planned);
-    if (want.SequenceEqual(got)) return null;
-    return "執行前檢查：計畫排出的圖形跟雙模型設計的目標 bitmap 不同（0 = 空，數字 = 疊幾層；第一列 = 相機畫面最上方）。" +
-           $"目標：{string.Join(" / ", want)}；計畫：{(got.Count == 0 ? "沒有放下任何物件" : string.Join(" / ", got))}";
+    string json = JsonSerializer.Serialize(env, jsonOptions);
+    File.WriteAllText(currentStepPath, json);
+    File.WriteAllText(Path.Combine(localOutputDir, $"step_{env.StepId}.json"), json);
 }
-// 規劃收到回覆、轉譯完就把這一輪計畫排出的圖形印在 LLM 進度後面，後面的檢查沒過也看得到 LLM 想排成什麼樣子。
-// 2D 印 ■□ bitmap，跟之後送 Unity 比對的相同；3D 疊放印俯視高度圖（數字 = 那格疊到第幾層，例如站起來的 L 是 3 1 1），
-// 含壓在底下沒被搬的支撐，也跟送 Unity 比對的相同。
-static void PrintPlannedFigure(int attempt, List<TranslatedStep> steps, List<SceneObject> scene)
+
+void WriteBatchFile(BatchEnvelope env)
 {
-    bool stacked = IsaacSimExecutor.RequiresCheck(steps, scene);
-    var figure = PlannedFigure(steps, scene, withSupports: stacked).Values.ToList();
-    if (figure.Count == 0)
-    {
-        Console.WriteLine($"[LLM] 第 {attempt}/10 輪計畫沒有放下任何物件，沒有 bitmap。");
-        return;
-    }
-    if (!stacked)
-    {
-        var (rows, _, cellX, cellY) = FigureBitmap.Build(figure);
-        FigureBitmap.Print($"[LLM] 第 {attempt}/10 輪計畫排出的 bitmap（{figure.Count} 個物件，格距 X {cellX * 1000:F0} mm、" +
-                           $"Y {cellY * 1000:F0} mm，跟相機畫面同方向：上 = +Y、右 = +X）：", rows);
-        return;
-    }
-    var (heights, _, cell3dX, cell3dY) = FigureBitmap.HeightMap(figure, figure.Select(LayerOf).ToList());
-    FigureBitmap.PrintHeightMap($"[LLM] 第 {attempt}/10 輪計畫是 3D 疊放，俯視高度圖（數字 = 那格疊到第幾層，· = 空；{figure.Count} 個物件，" +
-                                $"含壓在底下沒被搬的支撐；格距 X {cell3dX * 1000:F0} mm、Y {cell3dY * 1000:F0} mm，上 = +Y、右 = +X）：", heights);
+    string json = JsonSerializer.Serialize(env, jsonOptions);
+    File.WriteAllText(currentStepPath, json);
+    File.WriteAllText(Path.Combine(localOutputDir, $"batch_{env.BatchId}.json"), json);
 }
-static void PrintSimulationCheck(SimulationCheckReport report, string? image)
+
+async Task<ExecutionResult?> WaitForStepDoneAsync(int stepId, double timeoutSec)
 {
+    var start = DateTime.UtcNow;
+    while ((DateTime.UtcNow - start).TotalSeconds < timeoutSec)
+    {
+        // 模擬結束比對一做完就印，不必等實體手臂整批跑完
+        TryPrintSimulationCheckReport(stepId);
+        if (File.Exists(stepDonePath))
+        {
+            try
+            {
+                string json = File.ReadAllText(stepDonePath);
+                var result = JsonSerializer.Deserialize<ExecutionResult>(json, jsonOptions);
+                if (result != null && result.StepId == stepId)
+                {
+                    File.Delete(stepDonePath);   // 避免重讀
+                    TryPrintSimulationCheckReport(stepId);   // 比對不通過時兩個檔案幾乎同時寫出
+                    return result;
+                }
+            }
+            catch { /* 檔案可能仍在寫入，下一輪重試 */ }
+        }
+        await Task.Delay(200);
+    }
+    return null;
+}
+
+void TryPrintSimulationCheckReport(int batchId)
+{
+    if (!File.Exists(simCheckPath)) return;
+    SimulationCheckReport? report;
+    try
+    {
+        report = JsonSerializer.Deserialize<SimulationCheckReport>(File.ReadAllText(simCheckPath), jsonOptions);
+    }
+    catch
+    {
+        return;   // Unity 可能還在寫，下一輪再讀
+    }
+    if (report == null || report.BatchId != batchId) return;
+    try { File.Delete(simCheckPath); } catch (IOException) { }
+
     var previousColor = Console.ForegroundColor;
     if (!report.Performed)
     {
         Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"[Bitmap 比對] batch {report.BatchId}：沒有進行 — {report.SkippedReason}");
+        Console.WriteLine($"[模擬驗證] batch {report.BatchId}：未進行 — {report.SkippedReason}");
         Console.ForegroundColor = previousColor;
         return;
     }
+
     Console.ForegroundColor = report.Passed ? ConsoleColor.Green : ConsoleColor.Red;
-    Console.WriteLine($"[Bitmap 比對] batch {report.BatchId}：{(report.Passed ? "✓ 吻合" : "✗ 不吻合")} — " +
-                      $"Unity 畫面重疊率 {report.OverlapRatio * 100:F0}%（要大於 {report.OverlapThreshold * 100:F0}%）；" +
-                      $"座標比對 {report.CorrectCount}/{report.ExpectedCount} 個物件放對");
+    Console.WriteLine(report.Passed
+        ? $"[模擬驗證] batch {report.BatchId}：✓ 通過 — {report.ExpectedCount} 個物件全部放對"
+        : $"[模擬驗證] batch {report.BatchId}：✗ 不通過 — 預期 {report.ExpectedCount} 個物件，" +
+          $"放對 {report.CorrectCount}，錯誤 {report.Errors.Count} 項");
     Console.ForegroundColor = previousColor;
-    if (image != null) Console.WriteLine($"           比對圖（左：Unity 俯視畫面；右：綠 重疊、紅 該有沒有、藍 多出來）：{image}");
     if (!report.Passed)
         Console.WriteLine(report.VerificationEnabled
-            ? "           實體手臂不會動作"
+            ? "           驗證開啟（實驗組）→ 已停止，實體手臂不會動作"
             : "           驗證關閉（對照組）→ 只記錄，實體手臂照常執行");
+
     int rows = Math.Max(report.ExpectedRows.Count, report.ResultRows.Count);
     if (rows > 0)
     {
-        int width = report.ExpectedRows.Concat(report.ResultRows).Max(r => r.Length);
-        Console.WriteLine("           預期 bitmap / 座標比對結果（■ 正確  ✗ 少放或錯誤  ● 多放或放錯  □ 空）");
+        Console.WriteLine("           預期 bitmap    模擬結果（■ 正確  ✗ 少放/錯誤  ● 多放/放錯  □ 空）");
         for (int r = 0; r < rows; r++)
         {
             string want = r < report.ExpectedRows.Count ? report.ExpectedRows[r] : "";
             string got = r < report.ResultRows.Count ? report.ResultRows[r] : "";
-            Console.WriteLine($"           {want.PadRight(width)}    {got}");
+            Console.WriteLine($"           {want,-13}  {got}");
         }
     }
     foreach (var error in report.Errors) Console.WriteLine("           - " + error);
     foreach (var note in report.Notes) Console.WriteLine("           · " + note);
 }
-static ActionOutcome ClassifyOutcome(IEnumerable<RobotFunctionCall> actions)
+
+// 對應 perception 回傳格式
+public class ObjectsWorld
 {
-    bool holding = false;
-    bool grasped = false;
-    bool placed = false;
-    foreach (var action in actions)
-    {
-        if (action.Function == "grasp")
-        {
-            holding = true;
-            grasped = true;
-        }
-        else if (action.Function == "release")
-        {
-            if (holding && grasped) placed = true;
-            holding = false;
-        }
-    }
-    if (holding) return ActionOutcome.Holding;
-    return placed ? ActionOutcome.Placed : ActionOutcome.NoObjectStateChange;
+    [JsonPropertyName("objects")] public List<WorldObject> Objects { get; set; } = new();
+}
+public class WorldObject
+{
+    [JsonPropertyName("name")] public string Name { get; set; } = "";
+    [JsonPropertyName("confidence")] public double Confidence { get; set; }
+    [JsonPropertyName("position")] public WorldPos? Position { get; set; }
+    [JsonPropertyName("shape")] public string? Shape { get; set; }
+    [JsonPropertyName("orientation")] public string? Orientation { get; set; }
+    [JsonPropertyName("skew_deg")] public double SkewDeg { get; set; }
+}
+public class WorldPos
+{
+    [JsonPropertyName("x")] public double X { get; set; }
+    [JsonPropertyName("y")] public double Y { get; set; }
+    [JsonPropertyName("z")] public double Z { get; set; }
 }
 
-static string SceneInventory(IEnumerable<SceneObject> scene)
-{
-    var groups = scene.GroupBy(o => o.Name).OrderBy(g => g.Key)
-        .Select(g => $"{g.Key}×{g.Count()}");
-    string summary = string.Join("、", groups);
-    return string.IsNullOrWhiteSpace(summary) ? "沒有偵測到物件" : summary;
-}
-
-public sealed class ExecutionUnknownException : Exception
-{
-    public ExecutionUnknownException() : base("Unity 執行逾時；不可確認手臂是否停止。") { }
-}
-
-public sealed class SceneUnavailableException : Exception
-{
-    public SceneUnavailableException(string message) : base(message) { }
-}
-
-enum ActionOutcome { NoObjectStateChange, Holding, Placed }

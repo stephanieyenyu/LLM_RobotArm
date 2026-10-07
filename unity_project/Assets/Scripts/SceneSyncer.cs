@@ -1,8 +1,5 @@
 using System.Collections;
 using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Text;
 using UnityEngine;
 using UnityEngine.Networking;
 
@@ -14,12 +11,6 @@ using UnityEngine.Networking;
 //   2. 若 mode == "executing" → 完全不動 cube（虛擬夾爪負責視覺）
 //   3. 若 mode == "idle" 且上次是 executing（或首次啟動）→ GET /scene 一次，refresh 所有 cube
 //   4. 否則什麼都不做（perception 端持續在更新，但 Unity 不覆蓋顯示）
-//
-// 切換實機 / 純模擬（RunMode.Changed）：
-//   純模擬（切過去或換場景）：馬上顯示場景檔的積木，同時把場景檔載入 Isaac Sim（/sim/load，載入中不輪詢），
-//     載入完下一次輪詢改顯示 Isaac 回報的位置。Isaac 連不上就先留著場景檔的積木；之後連上時 Isaac 若還沒有
-//     積木（剛啟動）會自動載入一次。
-//   切回實機：先清掉模擬的積木，相機場景抓到之前畫面不留模擬的東西。
 //
 // 座標系轉換（跟 Unity UR3 base 目前朝向對齊）：
 //   Robot/QR 是右手系 Z-up（X 前伸、Y 左、Z 上）
@@ -61,11 +52,10 @@ public class SceneSyncer : MonoBehaviour
     [Header("手臂 base 在 QR frame 中的位置（把 workspace 對齊到手臂）")]
     // 預設值 = -JsonExecutor.QR1_X / -QR1_Y（Teach Pendant 實測值）
     // 手臂 base 在 robot (0,0,0)，QR1 在 robot (QR1_X, QR1_Y)，所以在 QR frame 裡
-    // 手臂座標 = (-QR1_X, -QR1_Y) = (0.39337, 0.35747)
-    // Inspector 也可以手動蓋掉這個值；MainScene 存了一份，改 QR1_X/Y 時要一起改（只影響畫面上工作區的位置，
-    // 模擬夾取與放置的判定都在 QR 座標計算，不受影響）
-    public float armBaseAtQrX = -JsonExecutor.QR1_X;   // 0.39337
-    public float armBaseAtQrY = -JsonExecutor.QR1_Y;   // 0.35747
+    // 手臂座標 = (-QR1_X, -QR1_Y) = (0.38824, 0.35473)
+    // Inspector 也可以手動蓋掉這個值
+    public float armBaseAtQrX = -JsonExecutor.QR1_X;   // 0.38824
+    public float armBaseAtQrY = -JsonExecutor.QR1_Y;   // 0.35473
     // 桌面（QR 平面）比手臂安裝面高 QR1_Z，所以手臂 base 在 QR frame 的 Z 是 -QR1_Z
     public float armBaseAtQrZ = -JsonExecutor.QR1_Z;   // -0.030
 
@@ -73,6 +63,18 @@ public class SceneSyncer : MonoBehaviour
     // 底板往 4 個 QR 邊界外多延伸這個距離（純視覺，QR marker 位置不變）
     // 例：0.15 = 每一邊多 15cm，讓底板比 QR 圍住的範圍大
     public float planeMarginM = 0.15f;
+
+    [Header("補貨區 / 擺放區邊界（跟 PlacementPlanner 常數對齊）")]
+    // 必須與 csharp_server/LayeredTypes.cs 的 WorkspaceBounds 相同（LLM 規劃目標格用的值），不開放 Inspector 覆寫
+    [System.NonSerialized] public float supplyZoneXMin = 0.05f;
+    [System.NonSerialized] public float supplyZoneXMax = 0.35f;
+    [System.NonSerialized] public float supplyZoneYMin = 0.02f;
+    [System.NonSerialized] public float supplyZoneYMax = 0.25f;
+    [System.NonSerialized] public float targetZoneRightX = 0.728f;
+    [System.NonSerialized] public float targetZoneBottomY = 0.02f;
+    [System.NonSerialized] public float cellSize = 0.052f;
+    [System.NonSerialized] public int gridRows = 5;
+    [System.NonSerialized] public int gridCols = 5;
 
     [Header("積木顯示")]
     public float cubeSizeM = 0.025f;             // 2.5 cm 立方體
@@ -84,175 +86,21 @@ public class SceneSyncer : MonoBehaviour
     private Transform cubeContainer;
     private List<GameObject> currentCubes = new List<GameObject>();
     private string previousMode = null;                          // 上次 poll 到的 mode（首次為 null）
-    private string lastUnreachableUrl = null;                    // 連不上的網址只提示一次
-    private bool lastIsSim;                                      // 上一次的模式，判斷是不是從純模擬切回實機
-    private int sourceGeneration = 0;                            // 每次切換模式 / 換場景 +1，舊來源晚到的回應直接丟掉
-    private int loadingGeneration = -1;                          // 正在把場景檔載入 Isaac 的那一次（載入中不輪詢）
-    private int emptyLoadGeneration = -1;                        // Isaac 沒有積木時自動載入，每次切換只試一次
-    private System.DateTime virtualWorldStamp;                   // 上次套用的 sim_world.json 修改時間
 
     // 給 SyncGripper 讀，讓虛擬夾爪找最近的 cube
     public List<GameObject> GetCurrentCubes() { return currentCubes; }
     public Transform GetCubeContainer() { return cubeContainer; }
-
-    // 純模擬（RunMode.IsSim）時場景來自 Isaac Sim（格式同 perception_server）；實機模式用 Inspector 的網址
-    string EffectiveSceneUrl => RunMode.IsSim ? RunMode.SimPerceptionUrl + "scene" : sceneUrl;
-    string EffectiveSceneModeUrl => RunMode.IsSim ? RunMode.SimPerceptionUrl + "scene/mode" : sceneModeUrl;
 
     void Start()
     {
         if (autoCreateWorkspace)
             BuildWorkspaceVisuals();
 
-        lastIsSim = RunMode.IsSim;
-        RunMode.Changed += OnRunModeChanged;
-        // 純模擬下重開 Unity：桌面重置成場景檔，不沿用上次留下的模擬結果
-        if (RunMode.IsSim)
-            StartCoroutine(LoadSimWorld(sourceGeneration));
         StartCoroutine(PollLoop());
     }
 
-    void OnDestroy()
-    {
-        RunMode.Changed -= OnRunModeChanged;
-    }
-
-    // 換了資料來源：下一次輪詢當成首次連線，重新抓一次場景（純模擬另外先載入場景檔，見檔頭說明）
-    void OnRunModeChanged()
-    {
-        virtualWorldStamp = default;
-        bool wasSim = lastIsSim;
-        lastIsSim = RunMode.IsSim;
-        sourceGeneration++;
-        previousMode = null;
-        if (RunMode.IsSim)
-            StartCoroutine(LoadSimWorld(sourceGeneration));
-        else if (wasSim)
-            ApplyObjects(new SceneObjectInfo[0]);
-    }
-
-    // 把目前的場景檔載入 Isaac Sim：先顯示場景檔的積木，載入成功後讓下一次輪詢抓 Isaac 的場景（物理落定後的位置）。
-    // 從呼叫當下就標記載入中（StartCoroutine 會同步跑到第一個 yield），已經在等回應的舊輪詢也不會蓋掉畫面。
-    IEnumerator LoadSimWorld(int generation)
-    {
-        loadingGeneration = generation;
-        try
-        {
-            yield return null;   // 等 UI 先顯示切換訊息，載入結果的訊息才不會被蓋掉
-            if (generation != sourceGeneration) yield break;
-            string scene = RunMode.Scene;
-            string body;
-            List<SimSceneFile.Block> blocks;
-            try
-            {
-                body = SimSceneFile.BuildLoadRequest(RunMode.ScenePath, out blocks);
-            }
-            catch (System.Exception ex)
-            {
-                Report($"讀不了虛擬場景檔 {scene}：{ex.Message}");
-                yield break;
-            }
-            ApplyObjects(blocks.Select(ToSceneObject).ToArray());
-
-            string url = RunMode.SimServerUrl + "sim/load";
-            using (UnityWebRequest req = new UnityWebRequest(url, "POST"))
-            {
-                req.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
-                req.downloadHandler = new DownloadHandlerBuffer();
-                req.SetRequestHeader("Content-Type", "application/json");
-                req.timeout = 60;
-                yield return req.SendWebRequest();
-                if (generation != sourceGeneration) yield break;   // 載入途中又切換了
-
-                if (req.result == UnityWebRequest.Result.Success)
-                {
-                    var result = JsonUtility.FromJson<SimLoadResponse>(req.downloadHandler.text);
-                    string warnings = result.warnings != null && result.warnings.Length > 0
-                        ? " 注意：" + string.Join("；", result.warnings) : "";
-                    Report($"已把 {scene} 載入 Isaac Sim（{result.simulated} 塊積木）。{warnings}");
-                    previousMode = null;
-                }
-                else if (req.result == UnityWebRequest.Result.ConnectionError)
-                {
-                    // 上次留下的內建虛擬世界（sim_world.json）作廢，不然下一次輪詢會把舊的擺放結果蓋回來；
-                    // csharp_server 下一個任務開始時會依場景檔寫新的
-                    DeleteVirtualWorldFile();
-                    Report($"連不上 Isaac Sim（{url}：{req.error}）。桌面已重置成場景檔 {scene}；2D 任務用 csharp_server 內建的" +
-                           "虛擬世界（下指令時載入），3D 疊放需要開 isaac_sim_server，開好後會自動載入。");
-                }
-                else
-                {
-                    string error = req.error;
-                    try { error = JsonUtility.FromJson<ErrorResponse>(req.downloadHandler.text).error ?? error; }
-                    catch (System.Exception) { }
-                    Report($"Isaac Sim 沒有載入 {scene}：{error}。畫面改顯示 Isaac 目前的世界。");
-                    previousMode = null;
-                }
-            }
-        }
-        finally
-        {
-            if (loadingGeneration == generation) loadingGeneration = -1;
-        }
-    }
-
-    // 純模擬連不上 Isaac Sim 時，csharp_server 內建的虛擬世界寫在 StreamingAssets/sim_world.json（格式同 /scene，
-    // 任務開始與每批執行完成後才寫），檔案更新就重新套用。回傳有沒有這個檔。
-    bool TryApplyVirtualWorld()
-    {
-        string path = Path.Combine(Application.streamingAssetsPath, "sim_world.json");
-        if (!File.Exists(path)) return false;
-        var stamp = File.GetLastWriteTimeUtc(path);
-        if (stamp == virtualWorldStamp) return true;
-        try
-        {
-            var scene = JsonUtility.FromJson<SceneResponse>(File.ReadAllText(path));
-            if (scene?.objects == null) return true;
-            ApplyObjects(scene.objects);
-            virtualWorldStamp = stamp;
-            Debug.Log($"[SceneSyncer] 連不上 Isaac Sim，顯示 csharp_server 內建虛擬世界的 {scene.objects.Length} 個物件");
-        }
-        catch (System.Exception e) when (e is IOException || e is System.ArgumentException)
-        {
-            Debug.LogWarning($"[SceneSyncer] 讀不了 sim_world.json：{e.Message}");
-        }
-        return true;
-    }
-
-    void DeleteVirtualWorldFile()
-    {
-        string path = Path.Combine(Application.streamingAssetsPath, "sim_world.json");
-        try
-        {
-            if (File.Exists(path)) File.Delete(path);
-        }
-        catch (IOException e)
-        {
-            Debug.LogWarning($"[SceneSyncer] 刪不掉上次留下的 sim_world.json：{e.Message}");
-        }
-        virtualWorldStamp = default;
-    }
-
-    static SceneObjectInfo ToSceneObject(SimSceneFile.Block b) => new SceneObjectInfo
-    {
-        name = b.name ?? "",
-        confidence = 1f,
-        source = "sim_scene_file",
-        shape = b.shape,
-        orientation = b.orientation,
-        position = new ScenePosition { source = "sim_scene_file", x = b.x, y = b.y, z = b.z },
-    };
-
-    // 切換結果顯示在 UI 的狀態列（UIManager），同時寫 Console
-    void Report(string message)
-    {
-        Debug.Log("[SceneSyncer] " + message);
-        var ui = FindObjectOfType<UIManager>();
-        if (ui != null) ui.ShowMessage(message);
-    }
-
     // ==========================================================
-    // 建立虛擬工作平面（白色桌板，不畫補貨區或擺放區：prompt 沒有劃定擺放位置）、QR 標記、cube container
+    // 建立虛擬工作平面、QR 標記、補貨/擺放區半透明色塊、cube container
     // ==========================================================
     void BuildWorkspaceVisuals()
     {
@@ -285,18 +133,41 @@ public class SceneSyncer : MonoBehaviour
         MakeQrMarker("QR3", 0f, workspaceDepthM, Color.blue);
         MakeQrMarker("QR4", workspaceWidthM, workspaceDepthM, Color.magenta);
 
+        // 補貨區（藍色半透明）
+        GameObject supply = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        supply.name = "SupplyZone";
+        supply.transform.SetParent(workspaceRoot, false);
+        Vector3 supplyCenter = QRToUnity(
+            (supplyZoneXMin + supplyZoneXMax) / 2f,
+            (supplyZoneYMin + supplyZoneYMax) / 2f,
+            0f);
+        supplyCenter.y = 0.002f;
+        supply.transform.localPosition = supplyCenter;
+        supply.transform.localScale = new Vector3(
+            supplyZoneYMax - supplyZoneYMin,
+            0.001f,
+            supplyZoneXMax - supplyZoneXMin);
+        SetColor(supply, new Color(0.4f, 0.7f, 1f, 0.5f));
+
+        // 擺放區（黃色半透明，grid 實體邊界）
+        float targetW = gridCols * cellSize;  // robot X 方向 → Unity Z
+        float targetD = gridRows * cellSize;  // robot Y 方向 → Unity X
+        GameObject target = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        target.name = "TargetZone";
+        target.transform.SetParent(workspaceRoot, false);
+        Vector3 targetCenter = QRToUnity(
+            targetZoneRightX - (gridCols - 1) * cellSize / 2f,
+            targetZoneBottomY + (gridRows - 1) * cellSize / 2f,
+            0f);
+        targetCenter.y = 0.002f;
+        target.transform.localPosition = targetCenter;
+        target.transform.localScale = new Vector3(targetD, 0.001f, targetW);
+        SetColor(target, new Color(1f, 0.85f, 0.4f, 0.5f));
+
         // 積木容器
         cubeContainer = new GameObject("CubeContainer").transform;
         cubeContainer.SetParent(workspaceRoot, false);
 
-    }
-
-    // 桌面高度微調（公尺，負值 = 桌面往下）：JsonExecutor 在 3D 批次（layered_grasp）預覽與執行期間
-    // 把桌面、QR 標記與積木整組移到實測的高度，跑完傳 0 回到原位。只改畫面位置，積木的 QR 座標不變。
-    public void SetTableHeightOffset(float offsetM)
-    {
-        if (workspaceRoot == null) return;
-        workspaceRoot.localPosition = -QRToUnity(armBaseAtQrX, armBaseAtQrY, armBaseAtQrZ - offsetM);
     }
 
     // 讓外部（JsonExecutor 模擬預覽）依 QR frame 座標找最近的 cube
@@ -367,30 +238,17 @@ public class SceneSyncer : MonoBehaviour
 
     IEnumerator FetchModeAndMaybeRefresh()
     {
-        if (loadingGeneration == sourceGeneration)
-            yield break;   // 場景檔正在載入 Isaac，先不要抓到舊世界
-        int generation = sourceGeneration;
-        string modeUrl = EffectiveSceneModeUrl;
-        using (UnityWebRequest req = UnityWebRequest.Get(modeUrl))
+        using (UnityWebRequest req = UnityWebRequest.Get(sceneModeUrl))
         {
             req.timeout = 3;
             yield return req.SendWebRequest();
-            if (generation != sourceGeneration)
-                yield break;   // 等回應時切換了資料來源，這個回應屬於舊來源
 
             if (req.result != UnityWebRequest.Result.Success)
             {
-                // 純模擬沒開 Isaac Sim：csharp_server 用內建的虛擬世界，從它寫的 sim_world.json 顯示
-                if (RunMode.IsSim && TryApplyVirtualWorld())
-                    yield break;
-                if (previousMode == null && modeUrl != lastUnreachableUrl)   // 完全連不上，每個網址只 log 一次
-                {
-                    lastUnreachableUrl = modeUrl;
-                    Debug.LogWarning($"[SceneSyncer] 連不上 {modeUrl}：{req.error}");
-                }
+                if (previousMode == null)   // 完全連不上，第一次就 log
+                    Debug.LogWarning($"[SceneSyncer] 連不上 {sceneModeUrl}：{req.error}");
                 yield break;
             }
-            lastUnreachableUrl = null;
 
             string currentMode = ParseMode(req.downloadHandler.text);
             if (string.IsNullOrEmpty(currentMode))
@@ -404,12 +262,12 @@ public class SceneSyncer : MonoBehaviour
             bool shouldRefresh = firstPoll || executingToIdle;
 
             if (firstPoll)
-                Debug.Log($"[SceneSyncer] 首次連上 {(RunMode.IsSim ? "Isaac Sim（純模擬）" : "perception")}，mode={currentMode}，抓一次 /scene");
+                Debug.Log($"[SceneSyncer] 首次連上 perception，mode={currentMode}，抓一次 /scene");
 
             previousMode = currentMode;
 
             if (shouldRefresh)
-                yield return StartCoroutine(FetchAndApplyScene(generation));
+                yield return StartCoroutine(FetchAndApplyScene());
         }
     }
 
@@ -427,14 +285,12 @@ public class SceneSyncer : MonoBehaviour
         }
     }
 
-    IEnumerator FetchAndApplyScene(int generation)
+    IEnumerator FetchAndApplyScene()
     {
-        using (UnityWebRequest req = UnityWebRequest.Get(EffectiveSceneUrl))
+        using (UnityWebRequest req = UnityWebRequest.Get(sceneUrl))
         {
             req.timeout = 3;
             yield return req.SendWebRequest();
-            if (generation != sourceGeneration)
-                yield break;
 
             if (req.result != UnityWebRequest.Result.Success)
             {
@@ -455,14 +311,6 @@ public class SceneSyncer : MonoBehaviour
 
             if (scene == null || scene.objects == null)
                 yield break;
-
-            // 純模擬時 Isaac 還沒有積木（剛啟動、還沒載入過）：把目前的場景檔載入一次
-            if (RunMode.IsSim && scene.objects.Length == 0 && emptyLoadGeneration != generation)
-            {
-                emptyLoadGeneration = generation;
-                yield return StartCoroutine(LoadSimWorld(generation));
-                yield break;
-            }
 
             ApplyObjects(scene.objects);
         }
@@ -572,19 +420,5 @@ public class SceneSyncer : MonoBehaviour
     public class ModeResponse
     {
         public string mode;
-    }
-
-    // Isaac Sim POST /sim/load 的回應與錯誤（只取用得到的欄位）
-    [System.Serializable]
-    class SimLoadResponse
-    {
-        public int simulated;
-        public string[] warnings;
-    }
-
-    [System.Serializable]
-    class ErrorResponse
-    {
-        public string error;
     }
 }
