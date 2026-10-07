@@ -213,7 +213,14 @@ while (true)
                         new InvalidOperationException("Invalid translated step count."));
                 trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
                 // Only translate the LLM-selected placement frame; Unity judges actual overlap.
-                var bitmapLayout = bitmapPlan?.ForUnity(plan);
+                (List<string> Rows, List<ExpectedCell> Cells, double CellXM, double CellYM)? bitmapLayout = null;
+                if (bitmapPlan != null)
+                {
+                    if (translated.BitmapGrid == null)
+                        throw new TranslationContractException("轉譯失敗：未提供 bitmap_grid 的實際擺放座標系。",
+                            new InvalidOperationException("Missing bitmap_grid."));
+                    bitmapLayout = bitmapPlan.ForUnity(translated.BitmapGrid);
+                }
                 if (bitmapPlan != null) Save(dir, "bitmap_layout.json", new {
                     bitmap = bitmapLayout!.Value.Rows, expected_cells = bitmapLayout.Value.Cells,
                     cell_size_x_m = bitmapLayout.Value.CellXM, cell_size_y_m = bitmapLayout.Value.CellYM });
