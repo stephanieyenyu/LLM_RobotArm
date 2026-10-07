@@ -111,11 +111,18 @@ public class SimulationCheckReport
 [System.Serializable]
 public class RobotFunctionCall
 {
+    public LlmTcpPose tcp_pose;
     public string function;
     public string location;
     // JsonUtility does not support Nullable<T>; JSON null is read as 0.
     public float height_m;
     public float seconds;
+}
+
+[System.Serializable]
+public class LlmTcpPose
+{
+    public double x, y, z, rx, ry, rz;
 }
 
 [System.Serializable]
@@ -396,6 +403,8 @@ public class JsonExecutor : MonoBehaviour
 
     // 正在執行一批（或手動回 Home 中斷前的批次）：UI 不允許這時切換模式
     public bool IsBusy => currentStepCoroutine != null;
+    bool resolvingUrSimIk;
+    public bool CanFollowBatchFeedback => IsBusy && !resolvingUrSimIk;
 
     // 切換純模擬 / 實機：手動控制與非 URSim 批次用的連線改連新模式的手臂（下次用到時重新連線）
     void OnRunModeChanged()
@@ -453,6 +462,7 @@ public class JsonExecutor : MonoBehaviour
 
     void OnDestroy()
     {
+        urSimIkCancellation?.Cancel();
         RunMode.Changed -= OnRunModeChanged;
         urListener?.Close();
         if (ursimListener != null && ursimListener != urListener) ursimListener.Close();
@@ -576,6 +586,7 @@ public class JsonExecutor : MonoBehaviour
 
     void AbortCurrentStepForManualHome()
     {
+        urSimIkCancellation?.Cancel();
         if (currentStepCoroutine == null) return;
 
         executionEpoch++;
@@ -727,6 +738,11 @@ public class JsonExecutor : MonoBehaviour
 
     IEnumerator ExecuteBatch(BatchEnvelope batch)
     {
+        if (!useSharedMovejTrajectory)
+        {
+            WriteStepDone(batch.batch_id, false, "LLM TCP / URSim IK 模式需要開啟 useSharedMovejTrajectory；不退回本地 IK。", 0f);
+            yield break;
+        }
         Debug.Log($"[Executor] 收到 batch {batch.batch_id}: {batch.steps.Count} steps — {batch.comment}");
         bool usingTopLeftFallback = false;
 
@@ -765,29 +781,11 @@ public class JsonExecutor : MonoBehaviour
             double[] startQ = useReadyPose && readyJointsRad != null && readyJointsRad.Length == 6
                 ? System.Array.ConvertAll(readyJointsRad, value => (double)value)
                 : DegArrayToRad(simIKReferenceDeg);
-            bool trajectoryReady = BuildSharedTrajectory(batch, startQ, false, out string trajectoryError);
-            if (!trajectoryReady)
-            {
-                StepEnvelope topLeftCube = batch.steps.Find(step =>
-                    step != null && step.target_position != null &&
-                    step.target_position.shape == "cube" &&
-                    step.target_position.name == "target_cube_r0_c0");
-                if (topLeftCube != null &&
-                    trajectoryError.StartsWith(TrajectoryStepPrefix(topLeftCube.step_id), StringComparison.Ordinal) &&
-                    trajectoryError.Contains(SelfCollisionText))
-                {
-                    // A 180-degree yaw preserves the parallel-jaw footprint at this cube.
-                    string originalError = trajectoryError;
-                    trajectoryReady = BuildSharedTrajectory(batch, startQ, true, out trajectoryError);
-                    if (trajectoryReady)
-                    {
-                        usingTopLeftFallback = true;
-                        Debug.Log($"[Executor-shared] step {topLeftCube.step_id} top-left cube uses 180-degree tool yaw; all other target orientations unchanged.");
-                    }
-                    else
-                        trajectoryError = originalError + "；左上角方塊改成夾爪轉 180° 也不行：" + trajectoryError;
-                }
-            }
+            resolvingUrSimIk = true;
+            try { yield return BuildUrSimTcpTrajectory(batch, startQ); }
+            finally { resolvingUrSimIk = false; }
+            bool trajectoryReady = urSimTrajectoryError == null;
+            string trajectoryError = urSimTrajectoryError;
             if (!trajectoryReady)
             {
                 string message = $"手臂路徑檢查未通過（預覽前退回）：{trajectoryError}";
@@ -1175,6 +1173,107 @@ public class JsonExecutor : MonoBehaviour
         var r = new double[6];
         for (int i = 0; i < System.Math.Min(6, deg.Length); i++) r[i] = deg[i] * System.Math.PI / 180.0;
         return r;
+    }
+
+    string urSimTrajectoryError;
+    System.Threading.CancellationTokenSource urSimIkCancellation;
+
+    IEnumerator BuildUrSimTcpTrajectory(BatchEnvelope batch, double[] startQ)
+    {
+        urSimTrajectoryError = null;
+        urSimIkCancellation?.Cancel();
+        urSimIkCancellation?.Dispose();
+        urSimIkCancellation = new System.Threading.CancellationTokenSource();
+        var cancellation = urSimIkCancellation.Token;
+        sharedTrajectory.Clear();
+        sharedFinalTrajectory.Clear();
+        sharedTrajectoryStartQ = (double[])startQ.Clone();
+        var reference = (double[])startQ.Clone();
+        if (string.IsNullOrWhiteSpace(ursimIP))
+        {
+            urSimTrajectoryError = "未設定 URSim IP；不使用本地 IK 替代。";
+            yield break;
+        }
+        double toolZ = batch.layered_grasp ? LayeredGraspGeometry.FingertipLengthM
+            : (robotArm != null ? robotArm.toolOffsetZ : 0.0);
+        UR3eKinematics.toolOffsetZ = toolZ;
+        layeredCollisionModel = batch.layered_grasp;
+        planningTableZ = batch.layered_grasp ? LayeredTableZ : QR1_Z;
+        try
+        {
+        foreach (var env in batch.steps)
+        {
+            if (env == null || env.done) continue;
+            var planned = new List<PlannedJointAction>();
+            if (env.action_sequence == null)
+            {
+                urSimTrajectoryError = $"step {env.step_id} 缺少 action_sequence";
+                yield break;
+            }
+            foreach (var action in env.action_sequence)
+            {
+                var pa = new PlannedJointAction { function = action.function, seconds = action.seconds };
+                if (action.function == "move_above" || action.function == "descend" || action.function == "lift")
+                {
+                    var tcp = action.tcp_pose;
+                    if (tcp == null || new[] { tcp.x, tcp.y, tcp.z, tcp.rx, tcp.ry, tcp.rz }.Any(v => double.IsNaN(v) || double.IsInfinity(v)))
+                    {
+                        urSimTrajectoryError = $"step {env.step_id} {action.function} 缺少完整有效的 LLM TCP 姿態";
+                        yield break;
+                    }
+                    // QR axes are parallel to UR base axes. Only calibrated translation
+                    // is applied; no grasp offsets, height defaults or rotation templates.
+                    var pose = new[] { QR1_X + tcp.x, QR1_Y + tcp.y,
+                        (batch.layered_grasp ? LayeredTableZ : QR1_Z) + tcp.z,
+                        tcp.rx, tcp.ry, tcp.rz };
+                    string host = ursimIP;
+                    var near = (double[])reference.Clone();
+                    var task = System.Threading.Tasks.Task.Run(() => UrSimIkClient.Solve(host, pose, near, toolZ, cancellation));
+                    float reportAt = Time.realtimeSinceStartup + 15f;
+                    while (!task.IsCompleted)
+                    {
+                        if (Time.realtimeSinceStartup >= reportAt)
+                        {
+                            Debug.Log($"[URSim-IK] step {env.step_id} 等待 IK 回覆（無逾時限制，尚未開始動畫）");
+                            reportAt = Time.realtimeSinceStartup + 15f;
+                        }
+                        yield return null;
+                    }
+                    if (task.IsCanceled || cancellation.IsCancellationRequested)
+                    {
+                        urSimTrajectoryError = "URSim IK 查詢已手動中止。";
+                        yield break;
+                    }
+                    if (task.IsFaulted)
+                    {
+                        urSimTrajectoryError = "URSim IK 查詢失敗：" + task.Exception.GetBaseException().Message;
+                        yield break;
+                    }
+                    var joints = task.Result;
+                    if (!ValidateJointTransition(reference, joints, out urSimTrajectoryError, allowSingularEnd: false))
+                        yield break;
+                    pa.targets.Add(joints);
+                    reference = (double[])joints.Clone();
+                    Debug.Log($"[URSim-IK] step {env.step_id} {action.function}: TCP={string.Join(",", pose)}; q={string.Join(",", joints)}");
+                }
+                else if (action.function != "grasp" && action.function != "release" && action.function != "wait")
+                {
+                    urSimTrajectoryError = "LLM TCP 模式不支援動作：" + action.function;
+                    yield break;
+                }
+                planned.Add(pa);
+            }
+            sharedTrajectory[env.step_id] = planned;
+        }
+        urSimTrajectoryError = null;
+        Debug.Log("[URSim-IK] 全批 TCP 已由 URSim 解算並通過關節路徑檢查；開始預覽。");
+        }
+        finally
+        {
+            layeredCollisionModel = false;
+            planningTableZ = QR1_Z;
+            UR3eKinematics.toolOffsetZ = robotArm != null ? robotArm.toolOffsetZ : 0.0;
+        }
     }
 
     bool BuildSharedTrajectory(BatchEnvelope batch, double[] startQ,
@@ -2646,6 +2745,8 @@ public class JsonExecutor : MonoBehaviour
         }
 
         Debug.Log($"[Executor-preview] 開始動畫預覽 batch {batch.batch_id}: {batch.steps.Count} steps");
+        var batchPreviewGripper = FindObjectOfType<SyncGripper>();
+        if (batchPreviewGripper != null) batchPreviewGripper.SetPreviewGrip(false);
 
         // 儲存目前所有 cube 的 local position（動畫結束要復原）
         var cubes = sceneSyncer.GetCurrentCubes();
@@ -2727,7 +2828,8 @@ public class JsonExecutor : MonoBehaviour
                            "預覽結束沒有復原（不在 GetCurrentCubes() 清單裡，可能還掛在夾爪下）——下一輪會沿用它現在的殘留位置");
         }
 
-        Debug.Log($"[Executor-preview] 動畫預覽結束，已復原場景。實機開始執行");
+        if (batchPreviewGripper != null) batchPreviewGripper.ClearPreviewGripOverride();
+        Debug.Log($"[Executor-preview] 動畫預覽結束，已復原場景，等待比對判定。");
     }
 
     IEnumerator AnimateSharedTrajectoryStep(StepEnvelope env, string tag, bool layeredGrasp = false)
@@ -2787,7 +2889,6 @@ public class JsonExecutor : MonoBehaviour
                     held = null;
                 }
                 yield return new WaitForSeconds(1.5f);
-                if (previewGripper != null) previewGripper.ClearPreviewGripOverride();
             }
             else if (action.function == "wait")
             {

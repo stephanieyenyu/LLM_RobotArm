@@ -40,9 +40,10 @@ public sealed class ExperimentLlm
         $"環境：QR 座標為公尺，X/Y 在桌面上，Z 向上；物件 Z 為頂面高度。{CoordinateDirections}cube 尺寸 0.025m，domino 為 0.05×0.025×0.025m。{WorkspaceFacts}{FigureAcceptance}{(CanonicalBitmap ? "" : LetterDesign)}{ImageNote}場景 index 只適用本輪目前清單，重新觀測後可能重排。\n" +
         "每一輪 operation plan 都必須在文字中完整列出每個 target 的實際 (x,y,z) 數值；不得只寫「沿用 P0~P4」、「維持既定目標點」或其他需要查舊輪上下文的代號。\n" +
         "執行介面提供 move_above(location,height_m)、descend(location)、grasp()、release()、lift(location,height_m)、wait(seconds)。location 可為 source 或 target；source 是本次操作所選的來源物件，target 是把來源物件放到的位置，target 的 Z 指來源物件放好後的頂面高度（與場景物件 Z 同一慣例）；height_m 是端點上方的距離。" +
+        "每個移動動作的 TCP 位置與方向都由你決定：列出 tcp_pose(x,y,z,rx,ry,rz)。x/y/z 為 QR 工作座標的實際 TCP 座標（公尺），不是積木頂面；rx/ry/rz 為 UR 基座座標的旋轉向量（弧度），不是 Euler 角。URSim 負責 IK，不要提供關節角度。請自行決定所有需要的中間 TCP 點，執行器不另補避障路徑。\n" +
         "參數範圍：height_m 0.05～0.15 m，seconds 0.1～3；單次最多 50 個操作，每個操作最多 20 個函式。同一個操作內的函式依序執行，中途不會重新感知；每個操作開始前系統會重新觀測來源物件位置。" +
         GripperFacts +
-        "介面不提供任意 XY 偏移、條件分支或同輪失敗後續跑；每輪只能提交一條確定且可執行的動作路徑，執行失敗後由下一輪根據新觀測重規劃。整批動作完成後，執行器會在收尾路徑安全時回到 Ready/Home；若收尾路徑不安全，會留在最後的安全抬升位置，不會因此否定已完成的任務動作。規劃內不得自行加入 go_home。這只是設備能力說明，不規定任務拆解、動作順序或完成方式。\n" +
+        "介面不提供條件分支或同輪失敗後續跑；每輪只能提交一條確定且可執行的動作路徑，執行失敗後由下一輪根據新觀測重規劃。整批最後的 TCP 位置與方向仍由你決定，執行器不附加 Ready/Home 收尾。規劃內不得自行加入 go_home。這只是設備能力說明，不規定任務拆解、動作順序或完成方式。\n" +
         "低階操作範例（僅示範介面語意，不是固定解法）：\n" +
         "若要將目前場景 index 0 的物件移到桌面位置 x=0.10、y=0.15、z=0.02：\n" +
         "move_above(source, 0.12)\n" +
@@ -53,21 +54,49 @@ public sealed class ExperimentLlm
         "descend(target)\n" +
         "release()\n" +
         "lift(target, 0.12)\n" +
-        "請根據實際目標與目前觀測，自行規劃操作。迭代執行期間無法向使用者追問或等待補充資料；本輪計畫只能使用提示中已有的目標、場景與結果，每一輪都是獨立的新嘗試，不會沿用先前輪次的任何判斷。請以自然語言自行決定本輪操作與參數。為讓本地執行介面忠實辨識你的決定，每組抓放都必須在同一行寫出「source index N → target (x, y, z)」，並在「執行路徑開始」與「執行路徑結束」之間依相同順序逐行列出要執行的函式呼叫。", image, dir, "operation_plan");
-    public Task<TranslatedPlan> Translate(string plan, List<SceneObject> scene, string dir)
+        "請根據實際目標與目前觀測，自行規劃操作。迭代執行期間無法向使用者追問或等待補充資料；本輪計畫只能使用提示中已有的目標、場景與結果，每一輪都是獨立的新嘗試，不會沿用先前輪次的任何判斷。請以自然語言完整描述你選的來源 index、目標座標，以及各操作依序執行的函式與參數。動作順序與高度都由你自行決定。", image, dir, "operation_plan");
+    public async Task<TranslatedPlan> Translate(string plan, List<SceneObject> scene, string dir,
+        string goal, string hierarchy)
     {
-        File.WriteAllText(Path.Combine(dir, "translation.system.txt"),
-            "本地確定性自然語言轉譯器；沒有呼叫 LLM，也沒有要求模型填寫 JSON Schema。");
-        File.WriteAllText(Path.Combine(dir, "translation.user.txt"), plan);
-        var translated = NaturalLanguagePlanAdapter.Translate(plan, scene);
-        File.WriteAllText(Path.Combine(dir, "translation.txt"),
-            JsonSerializer.Serialize(translated, new JsonSerializerOptions { WriteIndented = true }));
-        return Task.FromResult(translated);
+        const string system = """
+            你是 UR3 機械手臂的執行資料規劃者。根據原始目標、子任務、目前場景與操作計畫，自行決定並輸出完整執行資料。
+            來源積木、目標座標、動作順序和每個參數都由你決定；沿用操作計畫已有的明確決定，若缺少必要決定，依提供的目標與觀測補全。不要依固定抓放模板補動作。
+            若子任務提供選定的 bitmap，沿用該 bitmap；操作計畫的 bitmap_grid 是這張圖的擺放座標，不得另改圖形或擺放座標。
+            只輸出 JSON 物件，根欄位為 Error（字串）及 Steps（陣列）。可執行時 Error 為空；不可執行或資訊不足時 Error 說明原因且 Steps 為空。
+            每筆 Steps 包含 source_index（目前場景的整數 index）、Target（物件）及 Actions（陣列）。
+            Target 包含 x、y、z（公尺；z 為放好後頂面高度）、name、shape、orientation、skew_deg。身分依你選的來源積木，位置與方向由你決定。
+            每筆 Actions 包含 function、location、height_m、seconds；不用的參數填 null。
+            每個 move_above、descend、lift 動作必須另有 tcp_pose 物件，包含你決定的完整 x,y,z,rx,ry,rz。非移動動作 tcp_pose=null。
+            tcp_pose 的 x/y/z 是 QR 工作座標的實際 TCP 位置（公尺），z 是 TCP 本身高度，不是物件頂面。rx/ry/rz 是 UR 基座座標的旋轉向量（弧度），不是 Euler 角。
+            URSim 依此姿態自動計算關節 IK。每個 TCP 點都是你的決定，程式不改方向、不補抬升或中間避障點。若需要中間點，請自行列出額外移動動作。
+            可用 function：move_above、descend、grasp、release、lift、wait。
+            move_above/lift 使用 location=source或target 及 height_m；descend 使用 location；grasp/release 無參數；wait 使用 seconds。
+            height_m 是端點上方的距離，範圍 0.05～0.15 公尺；seconds 範圍 0.1～3。單批最多 50 個操作，每個操作最多 20 個函式。
+            不提供關節角度，不加入介面未提供的動作。不要讀取或假設前一輪計畫。
+            """;
+        var response = await Call(system,
+            $"原始目標：{goal}\n子任務：{hierarchy}\n目前場景：{SceneText(scene)}\n操作計畫：{plan}\n{CoordinateDirections}{WorkspaceFacts}{GripperFacts}",
+            null, dir, "translation", jsonResponse: true);
+        try
+        {
+            var result = JsonSerializer.Deserialize<TranslatedPlan>(response,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                ?? throw new JsonException("LLM 執行資料為 null。");
+            if (result.Steps == null || result.Steps.Any(step => step == null || step.Target == null ||
+                step.Actions == null || step.Actions.Any(action => action == null)))
+                throw new JsonException("LLM 執行資料的 Steps、Target 或 Actions 有缺漏或 null。");
+            return result;
+        }
+        catch (JsonException ex)
+        {
+            throw new TranslationContractException("LLM 執行資料不是有效 JSON：" + ex.Message, ex);
+        }
     }
     public Task<string> Validate(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image, string dir) => Call(
         "你是獨立的結果驗證者。只根據原始目標、初始場景及目前實際觀測判斷，不提供操作解法。檢查整體目標與局部幾何完整度（包含直線、連接與堆疊）。若目標要求平移、對齊、放置到座標或距離，實際結果與目標值在 0.02 m（2 公分）以內的量測誤差可接受，不得只因 2 公分內的座標偏差判定失敗；超過 2 公分或方向明顯錯誤才視為幾何未達標。沒有足夠觀測證據或目標含糊時不可通過。第一行僅寫 PASS 或 FAIL，後續自然語言描述觀測問題與不確定性。",
         $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n環境：{CoordinateDirections}{FigureAcceptance}\n" + (image == null ? "影像不可取得，證據不足，不能通過。" : SchematicImage ? SchematicImageNote : "附圖是目前實際相機畫面。"), image, dir, "global_validation");
-    async Task<string> Call(string system, string user, byte[]? image, string dir, string name)
+    async Task<string> Call(string system, string user, byte[]? image, string dir, string name,
+        bool jsonResponse = false)
     {
         File.WriteAllText(Path.Combine(dir, name + ".system.txt"), system);
         File.WriteAllText(Path.Combine(dir, name + ".user.txt"), user);
@@ -79,7 +108,9 @@ public sealed class ExperimentLlm
         ChatCompletion completion;
         try
         {
-            completion = await client.CompleteChatAsync(new List<ChatMessage> { new SystemChatMessage(system), new UserChatMessage(parts) });
+            var options = new ChatCompletionOptions();
+            if (jsonResponse) options.ResponseFormat = ChatResponseFormat.CreateJsonObjectFormat();
+            completion = await client.CompleteChatAsync(new List<ChatMessage> { new SystemChatMessage(system), new UserChatMessage(parts) }, options);
         }
         finally
         {

@@ -24,7 +24,7 @@ public static class IsaacSimExecutor
     static readonly HttpClient Http = new()
     {
         BaseAddress = new Uri(Environment.GetEnvironmentVariable("ISAAC_SIM_URL") ?? "http://localhost:6000/"),
-        Timeout = TimeSpan.FromMinutes(5),
+        Timeout = Timeout.InfiniteTimeSpan,
     };
     static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };

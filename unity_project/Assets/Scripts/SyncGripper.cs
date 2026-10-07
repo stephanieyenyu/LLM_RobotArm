@@ -136,13 +136,18 @@ public class SyncGripper : MonoBehaviour
     {
         previewOverrideActive = true;
         previewGripClosed = closed;
+        wantingToGrab = false;
     }
 
     public void ClearPreviewGripOverride()
     {
         previewGripClosed = false;
         previewOverrideActive = false;
-        lastGripClosed = false;
+        // Adopt current feedback without inventing a new grasp edge after preview.
+        wantingToGrab = false;
+        lastGripClosed = robotArm != null && robotArm.Outputs != null &&
+            digitalOutputIndex >= 0 && digitalOutputIndex < robotArm.Outputs.Length &&
+            robotArm.Outputs[digitalOutputIndex];
     }
 
     public void SetManualGrip(bool closed)

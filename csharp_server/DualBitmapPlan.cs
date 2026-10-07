@@ -18,7 +18,7 @@ public sealed class DualBitmapPlan
 
     public string PlanningConstraint => "以下是雙 LLM 選出的目標 bitmap。請根據目前場景與影像，自行找空白的地方擺放，決定來源積木、擺放位置、X/Y 格距、放置高度及動作順序。沒有預先指定的供料區、擺放區、原點或固定目標座標；顏色與形狀依使用者原始要求及實際積木自行選擇。圖形上方為 +Y、右方為 +X。\n"
         + string.Join("\n", Rows)
-        + "\n為讓 Unity 在你選的位置比較原始 bitmap，請在計畫中另列一行 bitmap_grid(left_x, top_y, cell_x, cell_y, top_z)，五個參數皆填你決定的實際公尺數值。left_x/top_y 是 bitmap 第 0 列第 0 欄的格中心（即使該格是空白），cell_x/cell_y 是你選的格距，top_z 是放置後頂面高度。這行只描述你的擺放座標系，不是手臂動作。仍依執行介面逐一列出 source index 與 target 座標，以及完整函式呼叫。";
+        + "\n為讓 Unity 在你選的位置比較原始 bitmap，請在計畫中另列一行 bitmap_grid(left_x, top_y, cell_x, cell_y, top_z)，五個參數皆填你決定的實際公尺數值。left_x/top_y 是 bitmap 第 0 列第 0 欄的格中心（即使該格是空白），cell_x/cell_y 是你選的格距，top_z 是放置後頂面高度。第 r 列第 c 欄的中心為 (left_x+c*cell_x, top_y-r*cell_y, top_z)，請自行讓每個放置目標對應此 bitmap 的佔用格，不另設計另一張圖。這行只描述你的擺放座標系，不是手臂動作。仍依執行介面逐一列出 source index 與 target 座標，以及完整函式呼叫。";
 
     // Parse the LLM's chosen coordinate frame; never infer the target bitmap from its placements.
     public (List<string> Rows, List<ExpectedCell> Cells, double CellXM, double CellYM) ForUnity(string plan)

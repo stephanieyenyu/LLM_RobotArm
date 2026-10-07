@@ -275,6 +275,8 @@ public class ExpectedCell
 /// </summary>
 public class RobotFunctionCall
 {
+    [JsonPropertyName("tcp_pose")]
+    public TcpPose? TcpPose { get; set; }
     [JsonPropertyName("function")]
     public string Function { get; set; } = "";
 
@@ -287,6 +289,16 @@ public class RobotFunctionCall
 
     [JsonPropertyName("seconds")]
     public double? Seconds { get; set; }
+}
+
+public class TcpPose
+{
+    [JsonRequired, JsonPropertyName("x")] public double X { get; set; }
+    [JsonRequired, JsonPropertyName("y")] public double Y { get; set; }
+    [JsonRequired, JsonPropertyName("z")] public double Z { get; set; }
+    [JsonRequired, JsonPropertyName("rx")] public double Rx { get; set; }
+    [JsonRequired, JsonPropertyName("ry")] public double Ry { get; set; }
+    [JsonRequired, JsonPropertyName("rz")] public double Rz { get; set; }
 }
 
 public class MotionPlan

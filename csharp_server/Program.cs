@@ -5,9 +5,9 @@ if (!Directory.Exists(assets)) assets = Path.GetFullPath("../unity_project/Asset
 Directory.CreateDirectory(assets);
 var output = Path.GetFullPath("outputs/experiments");
 Directory.CreateDirectory(output);
-using var http = new HttpClient { BaseAddress = new Uri("http://localhost:5000/"), Timeout = TimeSpan.FromSeconds(5) };
+using var http = new HttpClient { BaseAddress = new Uri("http://localhost:5000/"), Timeout = Timeout.InfiniteTimeSpan };
 // 純模擬（Unity「模擬模式」按鈕）：場景與照片改由 Isaac Sim 提供，格式同 perception_server；紀錄另存，不跟實機成功率混在一起
-using var simPerception = new HttpClient { BaseAddress = IsaacSimExecutor.PerceptionBaseUri, Timeout = TimeSpan.FromSeconds(30) };
+using var simPerception = new HttpClient { BaseAddress = IsaacSimExecutor.PerceptionBaseUri, Timeout = Timeout.InfiniteTimeSpan };
 var simOutput = Path.GetFullPath("outputs/experiments_sim");
 var perception = http;
 bool sim = false;
@@ -28,12 +28,12 @@ var baseline = fixedBaseline && File.Exists(baselinePath)
 int stepId = checked((int)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 if (fixedBaseline)
 {
-    Console.WriteLine("自由規劃實驗：每任務最多 10 次；任務間恢復初始桌面，任務內不重置。");
+    Console.WriteLine("自由規劃實驗：每任務不限嘗試次數，直到成功或手動中止；任務間恢復初始桌面，任務內不重置。");
     Console.WriteLine($"初始配置：{baselinePath}；第一次任務建立。更換配置需停止服務後移除此檔。");
 }
 else
 {
-    Console.WriteLine("自由規劃實驗：每任務最多 10 次；每個任務以收到指令時的桌面為起點，任務內不重置。");
+    Console.WriteLine("自由規劃實驗：每任務不限嘗試次數，直到成功或手動中止；每個任務以收到指令時的桌面為起點，任務內不重置。");
     Console.WriteLine("（要求每個任務先恢復同一個固定配置：setx FIXED_BASELINE 1 後重開 terminal）");
 }
 Console.WriteLine("純模擬 / 實機用 Unity 的「模擬模式」按鈕切換（StreamingAssets/run_mode.json），每個任務開始時讀一次。");
@@ -194,12 +194,12 @@ while (true)
                     trace.Add("bitmap 使用 ZIP 的 OpenAI/Gemini 獨立生成、交叉審查與 80/20 匿名評分");
                 }
                 llm.CanonicalBitmap = bitmapPlan != null;
-                if (bitmapPlan != null) hierarchy += "\n" + bitmapPlan.PlanningConstraint;
+                if (bitmapPlan != null) hierarchy += "\n拆解內容中的圖形設計、顆數與目標座標只是尚未取得正式 bitmap 的初步構想。以下選出的 bitmap 才是本輪唯一圖形目標；請依此重新自行規劃來源、擺放座標與動作，不沿用與此圖不符的初步構想。\n" + bitmapPlan.PlanningConstraint;
                 stage = "操作規劃";
                 plan = await llm.Plan(goal, before, hierarchy, NoPriorFeedback, image, dir);
                 stage = "轉譯成執行資料";
                 stageKind = "translation_format";
-                var translated = await llm.Translate(plan, before, dir);
+                var translated = await llm.Translate(plan, before, dir, goal, hierarchy);
                 Save(dir, "translated_plan.json", translated);
                 // 轉譯失敗也算一輪失敗
                 if (!string.IsNullOrWhiteSpace(translated.Error))
@@ -212,6 +212,14 @@ while (true)
                     throw new TranslationContractException("執行資料無效或超過單次 50 步上限。",
                         new InvalidOperationException("Invalid translated step count."));
                 trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
+                foreach (var step in translated.Steps)
+                    foreach (var action in step.Actions)
+                        if (action.Function is "move_above" or "descend" or "lift")
+                        {
+                            var tcp = action.TcpPose;
+                            if (tcp == null || new[] { tcp.X, tcp.Y, tcp.Z, tcp.Rx, tcp.Ry, tcp.Rz }.Any(v => !double.IsFinite(v)))
+                                throw new TranslationContractException("移動動作缺少 LLM 決定的完整有效 tcp_pose。", new FormatException("Invalid TCP pose."));
+                        }
                 // Only translate the LLM-selected placement frame; Unity judges actual overlap.
                 var bitmapLayout = bitmapPlan?.ForUnity(plan);
                 if (bitmapPlan != null) Save(dir, "bitmap_layout.json", new {
@@ -364,7 +372,7 @@ while (true)
                         if (!MotionPlanValidator.TryValidate(motion, assignment, before, out error))
                             throw new InvalidOperationException($"第 {k + 1} 個操作執行前檢查：{error}");
                         bool places = ClassifyOutcome(step.Actions) == ActionOutcome.Placed;
-                        if (places && ExperimentChecks.IsAlreadyAtTarget(assignment))
+                        if (places && !step.Actions.Any(action => action.TcpPose != null) && ExperimentChecks.IsAlreadyAtTarget(assignment))
                         {
                             var satisfied = new VerifyResult
                             {
@@ -402,7 +410,7 @@ while (true)
                         // 純模擬時「實機」就是 URSim：標 robot_target = "ursim"，Unity 不會連實體手臂
                         var batch2d = new BatchEnvelope { BatchId = batchId2d, Steps = batchSteps,
                             Comment = "2D 整批（Unity 預覽比對 bitmap 通過才執行）", RobotTarget = sim ? "ursim" : "" };
-                        if (figure.Count > 0)
+                        if (bitmapLayout != null || figure.Count > 0)
                         {
                             var (rows, cells, cellX, cellY) = bitmapLayout
                                 ?? FigureBitmap.Build(figure.Values.ToList());

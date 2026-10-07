@@ -3,6 +3,9 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using OpenAI.Chat;
+using OpenAI;
+using System.ClientModel;
+using System.ClientModel.Primitives;
 
 // OpenAI 與 Gemini 各自生成，再各自審查對方的候選圖。
 public sealed class PatternDesigner
@@ -11,6 +14,7 @@ public sealed class PatternDesigner
     const double OpenAiVoteWeight = 0.80;
     const double GeminiVoteWeight = 0.20;
     readonly ChatClient openAi;
+    static readonly HttpClient ModelHttpClient = new() { Timeout = Timeout.InfiniteTimeSpan };
     readonly HttpClient gemini;
     readonly string geminiModel;
     readonly int maxRows, maxCols;
@@ -22,9 +26,12 @@ public sealed class PatternDesigner
         var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY");
         if (string.IsNullOrWhiteSpace(openAiKey)) throw new InvalidOperationException("OPENAI_API_KEY is not set.");
         if (string.IsNullOrWhiteSpace(geminiKey)) throw new InvalidOperationException("GEMINI_API_KEY is not set.");
-        openAi = new ChatClient(openAiModel, openAiKey);
+        openAi = new ChatClient(openAiModel, new ApiKeyCredential(openAiKey), new OpenAIClientOptions {
+            NetworkTimeout = Timeout.InfiniteTimeSpan,
+            Transport = new HttpClientPipelineTransport(ModelHttpClient)
+        });
         this.geminiModel = geminiModel ?? Environment.GetEnvironmentVariable("GEMINI_MODEL") ?? "gemini-3.1-flash-lite";
-        gemini = new HttpClient { Timeout = TimeSpan.FromSeconds(150) };
+        gemini = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         gemini.DefaultRequestHeaders.Add("x-goog-api-key", geminiKey);
         gemini.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         this.maxRows = maxRows;

@@ -1,8 +1,39 @@
 using System.Text.Json;
+if (args.Contains("--ursim-ik-smoke"))
+{
+    using var diagnosticStop = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+    var q = UrSimIkClient.Solve("192.168.50.221", new[] { 0.1, -0.3, 0.25, 0.0, Math.PI, 0.0 },
+        new[] { 0.0, -1.57, 1.57, -1.57, -1.57, 0.0 }, 0.123, diagnosticStop.Token);
+    Console.WriteLine("URSim IK (no motion): " + string.Join(", ", q));
+    var rotated = UrSimIkClient.Solve("192.168.50.221", new[] { 0.1, -0.3, 0.25, 0.2, 3.0, 0.1 },
+        q, 0.123, diagnosticStop.Token);
+    Console.WriteLine("URSim arbitrary TCP direction (no motion): " + string.Join(", ", rotated));
+    try
+    {
+        UrSimIkClient.Solve("192.168.50.221", new[] { 9.0, 9.0, 9.0, 0.0, Math.PI, 0.0 },
+            q, 0.123, diagnosticStop.Token);
+        throw new Exception("Unreachable TCP unexpectedly accepted.");
+    }
+    catch (InvalidOperationException ex) when (ex.Message.Contains("無 IK 解"))
+    { Console.WriteLine("URSim unreachable TCP rejected (no local IK fallback)."); }
+    return;
+}
 int passed = 0;
 void Check(bool condition, string name) { if (!condition) throw new Exception(name); Console.WriteLine("PASS " + name); passed++; }
 SceneObject Piece(double x) => new() { Name = "yellow_cube", Shape = "cube", X = x, Y = 0.1, Z = 0.025 };
 var baseline = new List<SceneObject> { Piece(0.1), Piece(0.15) };
+var tcpAction = JsonSerializer.Deserialize<RobotFunctionCall>("""
+    {"function":"descend","location":"target","tcp_pose":{"x":0.55,"y":0.3,"z":0.045,"rx":-1.2,"ry":2.1,"rz":0.7}}
+    """);
+var tcpWire = JsonSerializer.Serialize(tcpAction);
+var tcpRoundtrip = JsonSerializer.Deserialize<RobotFunctionCall>(tcpWire)!;
+Check(tcpRoundtrip.TcpPose!.Z == 0.045 && tcpRoundtrip.TcpPose.Rx == -1.2 &&
+    tcpRoundtrip.TcpPose.Ry == 2.1 && tcpRoundtrip.TcpPose.Rz == 0.7,
+    "LLM TCP position and arbitrary rotation vector survive the execution JSON transport");
+bool missingTcpComponentRejected = false;
+try { JsonSerializer.Deserialize<TcpPose>("{\"x\":0.1,\"y\":0.2,\"z\":0.045,\"rx\":0,\"ry\":3.14}"); }
+catch (JsonException) { missingTcpComponentRejected = true; }
+Check(missingTcpComponentRejected, "missing TCP direction component is rejected instead of becoming a programmed default");
 var canonicalPlan = new DualBitmapPlan { Rows = new() { "■□", "■■" } };
 var freeLayout = canonicalPlan.ForUnity("bitmap_grid(0.60, 0.15, 0.045, 0.035, 0.025)");
 Check(freeLayout.Cells.Count == 3 && freeLayout.Cells[0].X == 0.60 && freeLayout.Cells[0].Y == 0.15,

@@ -2,9 +2,11 @@
 
 以中文自然語言指令控制 UR3e 機械手臂的框架。RealSense D435i 即時偵測工作台物件 → OpenAI gpt-5 解析指令 → Unity 送 URScript 到手臂。
 
-目前採自由規劃與失敗反思實驗流程；每個任務以收到指令時的桌面為起點（設 `FIXED_BASELINE=1` 則要求每個任務先恢復同一個固定配置），任務內不重置，最多嘗試十次。操作方式、重置基準與評分限制見 [實驗協定](docs/experiment_protocol.md)。
+目前每輪採獨立自由規劃，不使用 Reflection；每個任務以收到指令時的桌面為起點（設 `FIXED_BASELINE=1` 則要求每個任務先恢復同一個固定配置），不限嘗試次數，成功或手動中止才結束。操作方式、重置基準與評分限制見 [實驗協定](docs/experiment_protocol.md)。
 
 ## 系統流程
+
+每個移動動作的 `tcp_pose`（x、y、z、rx、ry、rz）由 LLM 決定。位置使用 QR 工作座標公尺，方向使用 UR 基座的旋轉向量弧度。Unity 只套用校正座標平移，透過 URSim 30002 的 secondary URScript 查詢 `get_inverse_kin`，經 RTDE 30004 接收暫存器 24～29 的六軸解，以同一組解進行預覽和後續執行；本地運動學只作 FK 與關節碰撞檢查，不為這條路徑求 IK、不另補 TCP 點或方向。查詢程式不含移動指令，不替換 URSim 的主程式。控制器須支援外部 RTDE 暫存器及帶 tcp 參數的 `get_inverse_kin_has_solution`。查詢無逾時限制，可用手動中止或退出 Play 取消。原本的自動 Ready/Home 收尾不再附加到此路徑，最後位置由 LLM 的最後一個移動決定。
 
 2D 圖形的 bitmap 生成採用 `LLM_RobotArm.zip` 的 `PatternDesigner` 雙模型流程：OpenAI（gpt-5）與 Gemini 各自生成、互相審查並提供修正版，多個候選以 OpenAI 80% / Gemini 20% 匿名評分選出，最多兩輪。需設定 `OPENAI_API_KEY` 與 `GEMINI_API_KEY`；`GEMINI_MODEL` 可覆寫 zip 預設的 `gemini-3.1-flash-lite`。選出的圖形存於每輪的 `canonical_bitmap.json`。bitmap 最多 5 列 × 5 欄，生成候選與審查修正版均受尺寸檢查；庫存計算包含目前場景全部積木，不劃供料區，也不由程式預選顏色。
 
@@ -21,11 +23,11 @@ perception_server (Python + Flask)
    └─ 每 200ms 更新場景，回傳 3D 世界座標
    ↓
 LLM 自由拆解子任務 → 自然語言操作計畫
-   ↓  本地確定性轉譯（NaturalLanguagePlanAdapter，不呼叫 LLM）→ 內部執行資料
+   ↓  LLM 執行資料規劃 → JSON（來源、目標、動作順序與參數由 LLM 決定）
 MotionPlanValidator + 積木重疊檢查 → Unity 整批（2D 先預覽並比對 bitmap；3D 先在 URSim/Isaac 驗證）
    ↓
 獨立視覺模型整體驗證
-   └─ 未達標：失敗摘要 → 自行生成規則 → 更新 prompt（最多 10 次）
+   └─ 未達標：全新獨立嘗試（不限次數，不使用 Reflection）
    ↓  StreamingAssets/current_step.json（robot function sequence）
 Unity JsonExecutor（高階 function → URScript）
    ↓  TCP 30002 URScript
@@ -37,9 +39,9 @@ UR3e
 **csharp_server/**
 - `perception_server.py` — RealSense 常駐 + YOLO + HSV + QR 偵測 + Part B 3D 座標 + Flask HTTP（`/camera` 提供相機內參與位姿給 Isaac Sim）
 - `IsaacSimExecutor.cs` — 疊放規劃先送 Isaac Sim 模擬，存模擬 / 疊合截圖
-- `Program.cs` — 任務起點確認（目前桌面穩定，或固定配置比對）、任務內保留現況、十次嘗試與逐操作執行
+- `Program.cs` — 任務起點確認、獨立無限次重試、完整 LLM TCP 資料檢查與整批執行
 - `ExperimentLlm.cs` — 自由拆解、自然語言規劃、獨立結果驗證及反思
-- `NaturalLanguagePlanAdapter.cs` — 把規劃文字裡明確寫出的「source index N → target (x, y, z)」與「執行路徑開始／結束」之間的函式呼叫轉成內部執行資料（不呼叫 LLM；domino 方向沿用來源，白名單以外的函式會被略過）
+- `ExperimentLlm.cs` — LLM 依目標、場景與操作計畫輸出執行 JSON；程式只讀取及檢查資料，不補抓放動作。`NaturalLanguagePlanAdapter.cs` 保留作為舊解析器，目前實驗流程不使用。
 - `FigureBitmap.cs` — 把 2D 計畫放下的物件畫成 bitmap（跟相機畫面同方向，X、Y 格距分開），印在 terminal，也送給 Unity 當模擬結束比對的預期格；排字母時每個字母最多 5×5 格，超過就在送出前退回
 - `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
 - `ExperimentMetrics.cs` — 首次／十次內成功率及各次累積成功率

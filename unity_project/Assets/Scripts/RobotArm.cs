@@ -159,16 +159,21 @@ public class RobotArm : MonoBehaviour
         if (FreezeVisualFeedback)
             return;
 
+        // Pure simulation must stay still while the LLM is planning. URSim may
+        // still publish motion from another program even without a new batch.
+        var executor = RunMode.IsSim ? FindObjectOfType<JsonExecutor>() : null;
+        bool allowFeedback = !RunMode.IsSim || (executor != null && executor.CanFollowBatchFeedback);
+
         // 只有 followRealRobotFeedback=true 才從實機讀 Angles；
         // 模擬預覽期間 JsonExecutor 會關掉這個，自己寫 Angles
-        if (followRealRobotFeedback && urListener != null && urListener.Connected)
+        if (allowFeedback && followRealRobotFeedback && urListener != null && urListener.Connected)
             for (int i = 0; i < Transforms.Length; i++)
                 Angles[i] = (float)urListener.JointData.AsArray[i].q_actual * 180f / MathF.PI;
 
         ApplyAnglesToTransforms();
 
 
-        if(urListener != null && urListener.Connected)
+        if(allowFeedback && urListener != null && urListener.Connected)
         {
             // TCP Position und Rotation auslesen
             Vector4 cartPosition = Robot2Unity * new Vector4((float)urListener.CartesianInfo.X, 
