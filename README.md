@@ -16,7 +16,7 @@ perception_server (Python + Flask)
    ├─ YOLO11n（COCO 物件） + HSV 立方體 + ArUco QR
    └─ 每 200ms 更新場景，回傳 3D 世界座標
    ↓
-目標 bitmap 設計（release 260917）：OpenAI、Gemini 各畫一張、互相審查、加權投票 80/20（每個任務都先畫）
+LLM 判斷平面或立體 → 目標 bitmap 設計（release 260917）：OpenAI、Gemini 各畫一張、互相審查、加權投票 80/20（每個任務都先畫；立體畫高度圖）
    ↓
 LLM 自由拆解子任務 → 自然語言操作計畫（有目標 bitmap 時照它排）
    ↓  本地確定性轉譯（NaturalLanguagePlanAdapter，不呼叫 LLM）→ 內部執行資料
@@ -38,7 +38,9 @@ UR3e
 - `Program.cs` — 任務起點確認（目前桌面穩定，或固定配置比對）、任務內保留現況、十次嘗試與逐操作執行
 - `ExperimentLlm.cs` — 自由拆解、自然語言規劃、獨立結果驗證及反思
 - `NaturalLanguagePlanAdapter.cs` — 把規劃文字裡明確寫出的「source index N → target (x, y, z)」與「執行路徑開始／結束」之間的函式呼叫轉成內部執行資料（不呼叫 LLM；domino 方向沿用來源，白名單以外的函式會被略過）
-- `PatternDesigner.cs`、`BitmapParser.cs` — release 260917 的目標 bitmap 設計（prompt 原封不動）：每個任務都先由 OpenAI 與 Gemini 各畫一張最多 5×5 的 bitmap、互相審查、加權投票 80/20；每次呼叫存在任務資料夾的 `design/`，結果存成 `design.json`
+- `FigureDimensionJudge.cs` — 每個任務畫目標之前，請 LLM 判斷指令要排平面（2D）還是立體（3D）；沒有關鍵字規則，也不分類動作
+- `PatternDesigner.cs`、`BitmapParser.cs` — release 260917 的目標 bitmap 設計（prompt 原封不動）：平面的任務由 OpenAI 與 Gemini 各畫一張最多 5×5 的 bitmap、互相審查、加權投票 80/20；每次呼叫存在任務資料夾的 `design/`，結果存成 `design.json`
+- `SpatialPatternDesigner.cs` — release 260917 的立體設計（prompt 是原文，生成的 prompt 最後多一行說明 column_heights 的列、欄方向）：畫正面一排 × 最多 3 欄 × 最高 3 層的高度圖（例如站起來的 L 是 `3 1 1`），pattern審查開著時跟平面一樣雙模型各畫一張、用 260917 的正面方向審查互審、80/20 投票
 - `FigureBitmap.cs` — 把計畫放下的物件畫成 bitmap（跟相機畫面同方向，X、Y 格距分開；3D 疊放是俯視高度圖，例如站起來的 L 是 `3 1 1`），規劃轉譯完就印在 terminal 的 LLM 進度後面，也送給 Unity 當畫面比對的預期；排字母時每個字母最多 5×5 格，超過就在送出前退回
 - `SimCheckImage.cs` — Unity 畫面比對圖（Unity 俯視畫面 / 預期 / 疊合）加上重疊率、PASS/FAIL 與圖例，3D 標出每處疊幾層，存進每一輪的資料夾
 - `ExperimentChecks.cs` — 初始桌面一對一比對與來源身分檢查
@@ -96,7 +98,7 @@ dotnet run
   2. Unity 先預覽一次，預覽結束逐層切開拍俯視畫面得到每一點疊幾層，跟計畫的俯視高度圖（含壓在底下沒被搬的支撐）比畫面重疊率（Σ min ÷ Σ max，要大於 90%），不通過 URSim 與實機都不動。
   3. 整輪步驟以 `robot_target = "ursim"` 交給 Unity，Unity 用同一套關節軌跡只在 **URSim** 執行，實體手臂不動。
   4. Isaac Sim 的手臂即時跟隨 URSim（唯讀埠 30013 的關節角 + DO4 夾爪），積木用物理模擬被夾起、放下。
-  5. URSim 跑完，Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定度、指尖是否低於桌面），
+  5. URSim 跑完，Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定度、指尖是否低於桌面、手臂有沒有自撞），
      再由 LLM 看模擬畫面；都通過才把同一批（同樣的步驟、來源位置與積木高度）整批送實體手臂，
      實機跑的就是 Isaac 驗證過的同一條關節軌跡。不通過就算這次嘗試失敗、進 Reflection。
      整批送出前會確認來源積木在驗證後沒被移動（超過 1 cm 就不執行）；步驟之間不重新觀測、不做局部驗證，
@@ -131,6 +133,11 @@ URSim 驗證途中觸發安全停止時，Unity 最多等 300 秒讓人在 URSim
 - 目前不支援從疊好的積木中間抽出。
 
 這時 Unity 的碰撞模型只在 3D 批次把手指段改成「指尖在桌面上方 3 mm」的檢查，前提是實體手指至少 30 mm 長。
+**手臂自撞（2026-10-07 起，只有 3D）**：Unity 規劃 3D 批次時，自撞改用畫面上手臂模型（含夾爪）的 mesh 檢查
+（`ArmMeshSelfCollision.cs`：底座與 6 個關節各帶動的一段各取凸包，相鄰兩段與手臂直立時就重疊的組合不檢查，
+排除了哪些印在 Console）。原本的膠囊沿 DH 骨架走，沒算到上臂實際往側邊偏約 12 cm，疊到 5 層時夾爪貼著上臂下降會漏掉；
+2D 照舊用膠囊。Isaac 驗證期間每一步也用 USD 碰撞體與 physics 的連桿位姿做凸包相交（GJK），一碰到就在 Isaac 的
+console 印出哪兩段、當時的 URSim 關節角，驗證判不通過（`手臂沒有自撞`），實機不動；自撞檢查建不起來時 3D 驗證一律不通過。
 2D 批次不帶這些欄位，送給 Unity 的 JSON 跟以前逐字相同，計算也完全相同。
 層高與夾取深度的數字在 `unity_project/Assets/Scripts/LayeredGraspGeometry.cs`，Unity 與 csharp_server 共用；
 Isaac 的投影用同規則的 `isaac_sim/block_layers.py`。
@@ -161,7 +168,7 @@ UR 基座 → Isaac 世界在啟動時用 FK 自動校正（本資產實測差 1
 
 ## 純模擬：不接相機與實體手臂
 
-Unity 右上角的「模式」按鈕一鍵切換實機 / 純模擬（寫 `unity_project/Assets/StreamingAssets/run_mode.json`），
+Unity 下方指令列的「模式」按鈕一鍵切換實機 / 純模擬（寫 `unity_project/Assets/StreamingAssets/run_mode.json`），
 csharp_server 每個任務開始時讀一次，整個任務都用同一個模式。LLM 的 prompt 與整個規劃、驗證流程兩種模式完全相同。
 
 | | 實機 | 純模擬 |
@@ -177,7 +184,7 @@ csharp_server 每個任務開始時讀一次，整個任務都用同一個模式
 1. URSim 虛擬機開機、切 Remote Control。
 2. `D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui`（3D 疊放才需要；2D 沒開 Isaac 時自動改用內建的虛擬世界）
 3. `cd csharp_server` 後 `dotnet run`
-4. Unity Play → 右上角「模式」切成純模擬 →「場景」按鈕輪流切換 `sim_scenes/` 裡的檔案 → 輸入指令。
+4. Unity Play → 下方指令列的「模式」切成純模擬 →「場景」按鈕輪流切換 `sim_scenes/` 裡的檔案 → 輸入指令。
 
 切到純模擬、按「場景」換檔，或在純模擬下重開 Unity 的當下，桌面都重置成場景檔：Unity 先畫出場景檔的積木，同時呼叫 Isaac 的 `/sim/load` 重建模擬世界（連不上 Isaac 時，作廢上次留下的內建虛擬世界 `sim_world.json`），
 載入完改顯示 Isaac 回報的位置（物理落定後）；結果顯示在狀態列。Isaac 還沒開時畫面先顯示場景檔，等 Isaac 開好、

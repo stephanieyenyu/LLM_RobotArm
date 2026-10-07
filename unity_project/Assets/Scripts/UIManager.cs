@@ -15,9 +15,6 @@ public class UIManager : MonoBehaviour
 
     private TextField inputField;
     private Button sendButton;
-    private Button simModeButton;
-    private Button simSceneButton;
-    private Button patternReviewButton;
     // pattern審查開關的目前狀態（從 skip_pattern_review.txt 讀回來；OnGUI 每幀用，不每幀讀檔）
     private bool patternReviewEnabled = true;
     private Label statusLabel;
@@ -121,7 +118,8 @@ public class UIManager : MonoBehaviour
         }
 
         // ---------------------------------------------------------
-        // 右上角三個手動控制按鈕：鬆開 / 夾緊 / 回 Home
+        // 右上角只放三個手動控制按鈕：鬆開 / 夾緊 / 回 Home。
+        // 模式、場景與其他開關都在下方指令列（OnGUI），三個資料夾（main、zero-constraint、rulebased）同一套介面
         // ---------------------------------------------------------
         var controlPanel = new VisualElement();
         controlPanel.name = "robot-manual-controls";
@@ -160,29 +158,9 @@ public class UIManager : MonoBehaviour
         homeBtn.style.height = 36;
         homeBtn.style.width = 120;
 
-        // 純模擬 / 實機切換：寫 StreamingAssets/run_mode.json，csharp_server 下一個指令開始時讀
-        simModeButton = new Button(OnToggleSimMode);
-        simModeButton.style.height = 36;
-        simModeButton.style.width = 120;
-        simModeButton.style.marginTop = 10;
-        simSceneButton = new Button(OnCycleScene);
-        simSceneButton.style.height = 36;
-        simSceneButton.style.width = 120;
-        simSceneButton.style.marginTop = 4;
-        // 雙模型設計 bitmap 的交叉審查開關（release 260917 的 pattern審查按鈕）
-        patternReviewButton = new Button(TogglePatternReview);
-        patternReviewButton.style.height = 36;
-        patternReviewButton.style.width = 120;
-        patternReviewButton.style.marginTop = 10;
-        patternReviewEnabled = ReadPatternReviewEnabled();
-        UpdateModeButtons();
-
         controlPanel.Add(openBtn);
         controlPanel.Add(gripBtn);
         controlPanel.Add(homeBtn);
-        controlPanel.Add(simModeButton);
-        controlPanel.Add(simSceneButton);
-        controlPanel.Add(patternReviewButton);
         root.Add(controlPanel);
         Debug.Log("[UI] 輸入框、執行按鈕與手動控制已建立。", this);
     }
@@ -225,7 +203,6 @@ public class UIManager : MonoBehaviour
             ShowMessage("切換模式失敗（寫不了 run_mode.json）：" + ex.Message);
             return;
         }
-        UpdateModeButtons();
         ShowMessage(RunMode.IsSim
             ? $"已切成純模擬：正在把 {RunMode.Scene} 載入 Isaac Sim，畫面會顯示模擬的積木。2D 由 Unity 預覽與 bitmap 比對完成就算執行，" +
               "不用開 URSim；3D 疊放需要 URSim 與 isaac_sim_server（--ursim_ip）。2D 沒開 Isaac 時用 csharp_server 內建的虛擬世界。"
@@ -257,7 +234,6 @@ public class UIManager : MonoBehaviour
             ShowMessage("換場景失敗（寫不了 run_mode.json）：" + ex.Message);
             return;
         }
-        UpdateModeButtons();
         ShowMessage($"虛擬場景：{next}，正在載入 Isaac Sim…");
     }
 
@@ -295,21 +271,9 @@ public class UIManager : MonoBehaviour
         }
         // 狀態一律從檔案讀回來，寫入失敗時畫面不會顯示成已切換
         patternReviewEnabled = ReadPatternReviewEnabled();
-        UpdateModeButtons();
         ShowMessage(patternReviewEnabled
-            ? "pattern審查開啟：下一個指令起，OpenAI 與 Gemini 各畫一張目標 bitmap、互相審查、投票（需要 GEMINI_API_KEY）。"
-            : "pattern審查關閉：下一個指令起，只請 OpenAI 畫一次目標 bitmap 就採用。");
-    }
-
-    void UpdateModeButtons()
-    {
-        if (patternReviewButton != null) patternReviewButton.text = PatternReviewButtonText();
-        if (simModeButton != null) simModeButton.text = ModeButtonText();
-        if (simSceneButton != null)
-        {
-            simSceneButton.text = SceneButtonText();
-            simSceneButton.style.display = RunMode.IsSim ? DisplayStyle.Flex : DisplayStyle.None;
-        }
+            ? "pattern審查開啟：下一個指令起，OpenAI 與 Gemini 各畫一張目標 bitmap（立體的是高度圖）、互相審查、投票（需要 GEMINI_API_KEY）。"
+            : "pattern審查關閉：下一個指令起，只請 OpenAI 畫一次目標 bitmap 就採用（立體的照 260917 再由 OpenAI 檢查正面方向）。");
     }
 
     public void ShowMessage(string message)

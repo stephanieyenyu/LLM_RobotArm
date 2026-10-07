@@ -2,12 +2,17 @@ using System.Text.Json.Serialization;
 using OpenAI.Chat;
 
 /// <summary>
-/// 每個任務開始時的目標 bitmap 設計結果（release 260917 的 PatternDesigner），存成任務資料夾的 design.json，也寫進 result.json。
+/// 每個任務開始時的目標 bitmap 設計結果（release 260917 的 PatternDesigner / SpatialPatternDesigner），
+/// 存成任務資料夾的 design.json，也寫進 result.json。
 /// </summary>
 public sealed class PatternDesign
 {
+    // LLM 判斷指令要排平面（2d）還是立體（3d），跟它的理由（FigureDimensionJudge）
+    [JsonPropertyName("dimension")] public string Dimension { get; set; } = "2d";
+    [JsonPropertyName("dimension_reason")] public string DimensionReason { get; set; } = "";
     [JsonPropertyName("block_color")] public string BlockColor { get; set; } = "";
-    // 目標 bitmap：0 = 空、1 = 放一塊；第一列 = 相機畫面最上方（+Y 那側）
+    // 目標 bitmap，第一列 = 相機畫面最上方（+Y 那側）。2d：0 = 空、1 = 放一塊；
+    // 3d：俯視高度圖，數字 = 那格疊幾層（SpatialPatternDesigner 的 column_heights，正面一排）
     [JsonPropertyName("bitmap")] public List<string> Bitmap { get; set; } = new();
     // false = Unity 的 pattern審查關閉，只請 OpenAI 畫一次
     [JsonPropertyName("cross_reviewed")] public bool Reviewed { get; set; }

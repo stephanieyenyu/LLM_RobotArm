@@ -23,6 +23,12 @@ var llm = new ExperimentLlm(model);
 // release 260917 的 PatternDesigner（prompt 原封不動）：每個任務一開始都先畫目標 bitmap
 // （最多 5×5，OpenAI 與 Gemini 各畫一張、交叉審查、加權投票）；不分類指令
 var patternDesigner = new PatternDesigner(5, 5, model);
+// 畫之前由 LLM 判斷指令要排平面還是立體（沒有 router、沒有關鍵字規則）；立體用 260917 的 SpatialPatternDesigner
+// 畫高度圖，畫布是正面一排 × 最多 3 欄 × 最高 3 層（一次排一個字母；同 260917 的 1×3×3，10-07 試過 1×5×5，
+// 疊到 5 層時手臂得折起來才夠得到），雙模型流程同 2D（2026-10-07）
+const int SpatialCols = 3, SpatialLayers = 3;
+var dimensionJudge = new FigureDimensionJudge(model);
+var spatialDesigner = new SpatialPatternDesigner(1, SpatialCols, SpatialLayers, patternDesigner, model);
 var baselinePath = Path.Combine(output, "initial_scene.json");
 // 預設每個任務以收到指令時的桌面為起點；FIXED_BASELINE=1 才要求每個任務先恢復成同一個固定配置
 bool fixedBaseline = Environment.GetEnvironmentVariable("FIXED_BASELINE") == "1";
@@ -79,6 +85,7 @@ while (true)
     PatternDesign? design = null;
     string? designError = null;
     llm.TargetBitmap = null;
+    llm.TargetIs3D = false;
     try
     {
         if (sim)
@@ -156,14 +163,15 @@ while (true)
         if (waitForBaseline && baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
         Save(run, "initial_scene.json", initial);
         Console.WriteLine($"[任務開始] 初始桌面已確認（{SceneInventory(initial)}）；本任務內不再重置。");
-        // 目標 bitmap 設計（release 260917）：選出後每一輪都要把積木排成這張圖。
-        // 指令不是排圖形時沒有目標，照常自由規劃；設計不出可用的圖，任務記為失敗、不進入規劃
+        // 目標 bitmap 設計（release 260917）：LLM 先判斷平面或立體，再畫對應的圖，選出後每一輪都要把積木排成這張圖。
+        // 設計不出可用的圖，任務記為失敗、不進入規劃
         int maxAttempts = 10;
         try
         {
             design = await DesignTarget(goal, initial, Path.Combine(run, "design"));
             Save(run, "design.json", design);
             llm.TargetBitmap = design.Bitmap;
+            llm.TargetIs3D = design.Dimension == "3d";
         }
         catch (PatternDesignException ex)
         {
@@ -171,6 +179,10 @@ while (true)
             maxAttempts = 0;
             Console.WriteLine($"[Layer 1] pattern 設計失敗：{ex.Message}；這個任務記為失敗，不進入規劃。");
         }
+        // 立體的目標一定要疊放，疊放要 Isaac Sim 做物理驗證；沒開 Isaac 就不必花規劃的呼叫
+        if (design?.Dimension == "3d" && sim && virtualWorld != null)
+            throw new SimulationUnavailableException("純模擬目前沒開 Isaac Sim：這個任務的目標是立體的，疊放需要 Isaac 做物理驗證，" +
+                "內建的虛擬世界只支援 2D。開好 isaac_sim_server 後再下指令。", null);
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
             var dir = Path.Combine(run, $"attempt_{attempt:00}");
@@ -218,11 +230,13 @@ while (true)
                     throw new TranslationContractException("轉譯失敗：" + translated.Error,
                         new InvalidOperationException(translated.Error));
                 }
+                // 上限不寫在訊息裡（2026-10-07 起規劃與反思都不給操作數上限）
                 if (translated.Steps == null || translated.Steps.Count > 50)
-                    throw new TranslationContractException("執行資料無效或超過單次 50 步上限。",
+                    throw new TranslationContractException("執行資料無效或操作數超過單次上限。",
                         new InvalidOperationException("Invalid translated step count."));
                 trace.Add($"轉譯出 {translated.Steps.Count} 個操作");
                 PrintPlannedFigure(attempt, translated.Steps, before);
+                if (design != null) PrintDesignTarget(design);
                 // 有雙模型設計的目標時，計畫排出的圖形要跟它完全相同才往下走
                 if (llm.TargetBitmap != null && DesignMismatch(llm.TargetBitmap, translated.Steps, before) is string mismatch)
                 {
@@ -515,7 +529,15 @@ while (true)
                 trace.Add($"在「{stage}」停止");
                 Console.WriteLine($"[實驗] 第 {attempt}/10 輪轉譯失敗，將進入 Reflection：{failure}");
             }
-            catch (InvalidOperationException ex) { failure = ex.Message; failureKind = stageKind; trace.Add($"在「{stage}」停止"); }
+            catch (InvalidOperationException ex)
+            {
+                failure = ex.Message;
+                failureKind = stageKind;
+                trace.Add($"在「{stage}」停止");
+                // 執行階段的退回原因在送出的地方就印過了；其他階段（執行前檢查、URSim／Isaac 驗證）之前不印，看起來像直接跳到整體驗證
+                if (stageKind != "execution")
+                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪在「{stage}」停止：{failure}");
+            }
             trace.Add(sim ? $"純模擬沒有實體手臂；URSim 執行了 {robotOperations} 個操作" : $"實體手臂完整執行了 {robotOperations} 個操作");
             var after = await Scene();
             Save(dir, "after_scene.json", after);
@@ -743,24 +765,42 @@ static Dictionary<int, SceneObject> PlannedFigure(List<TranslatedStep> steps, Li
             placed[i] = FigureObject(scene[i], top);
     return placed;
 }
-// 目標 bitmap 設計：每個任務都先用 release 260917 的 PatternDesigner 畫一張（prompt 原封不動，不分類指令）。
-// 顏色照舊版 GuessBlockColor；庫存是桌上那個顏色的所有 cube / domino（現在沒有補貨區）
+// 目標 bitmap 設計：每個任務先由 LLM 判斷要排平面還是立體（FigureDimensionJudge），平面用 release 260917 的
+// PatternDesigner 畫 0/1 bitmap，立體用 260917 的 SpatialPatternDesigner 畫高度圖（prompt 都原封不動）。
+// 顏色照舊版 GuessBlockColor；庫存是桌上那個顏色的所有 cube / domino（現在沒有補貨區；立體只用 cube）
 async Task<PatternDesign> DesignTarget(string goal, List<SceneObject> scene, string logDir)
 {
     DesignLog.Start(logDir);
     string color = GuessBlockColor(goal, scene);
     int cubes = scene.Count(o => o.Name == $"{color}_cube"), dominoes = scene.Count(o => o.Name == $"{color}_domino");
-    Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={color}, {cubes} cube + {dominoes} domino)...");
+    Console.WriteLine("[Layer 1] 呼叫 LLM 判斷指令要排平面（2D）還是立體（3D）...");
+    var (dimension, reason) = await dimensionJudge.JudgeAsync(goal);
+    Console.WriteLine($"[Layer 1] LLM 判斷：{(dimension == "3d" ? "立體（3D）" : "平面（2D）")} — {reason}");
     try
     {
+        if (dimension == "3d")
+        {
+            Console.WriteLine($"[3D Layer 1] 呼叫 LLM 設計立體圖形 (color={color}, {cubes} cube，正面一排 × {SpatialCols} 欄 × {SpatialLayers} 層)...");
+            int[,] heights = (await spatialDesigner.DesignAsync(goal, color, cubes)).ColumnHeights!;
+            var heightRows = Enumerable.Range(0, heights.GetLength(0)).Select(r => string.Concat(
+                Enumerable.Range(0, heights.GetLength(1)).Select(c => (char)('0' + heights[r, c])))).ToList();
+            FigureBitmap.PrintHeightMap("[3D Layer 1] 目標高度圖（俯視，數字 = 那格疊幾層，· = 空；第一列 = 相機畫面最上方，" +
+                                        "正面從 -Y 那側看，往右 = +X）：", heightRows);
+            return new PatternDesign { Dimension = dimension, DimensionReason = reason, BlockColor = color,
+                Bitmap = heightRows, Reviewed = !PatternDesigner.SkipReview };
+        }
+        Console.WriteLine($"[Layer 1] 呼叫 LLM 設計 pattern (color={color}, {cubes} cube + {dominoes} domino)...");
         int[,] grid = (await patternDesigner.DesignAsync(goal, color, cubes, dominoes)).Bitmap!;
         var rows = Enumerable.Range(0, grid.GetLength(0)).Select(r => string.Concat(
             Enumerable.Range(0, grid.GetLength(1)).Select(c => grid[r, c] == 1 ? '1' : '0'))).ToList();
         FigureBitmap.Print("[Layer 1] 目標 bitmap（第一列 = 相機畫面最上方）：", rows.Select(r => r.Replace('0', '□').Replace('1', '■')));
-        return new PatternDesign { BlockColor = color, Bitmap = rows, Reviewed = !PatternDesigner.SkipReview };
+        return new PatternDesign { Dimension = dimension, DimensionReason = reason, BlockColor = color,
+            Bitmap = rows, Reviewed = !PatternDesigner.SkipReview };
     }
-    // 舊版設計器畫不出可用的圖時丟 InvalidOperationException；Gemini 的 HTTP 錯誤、缺 key 照基礎設施錯誤處理
-    catch (InvalidOperationException ex) when (!ex.Message.StartsWith("Gemini API"))
+    // 舊版設計器畫不出可用的圖時丟 InvalidOperationException（立體另有 SpatialPatternInfeasibleException）；
+    // Gemini 的 HTTP 錯誤、缺 key 照基礎設施錯誤處理
+    catch (Exception ex) when (ex is SpatialPatternInfeasibleException ||
+                               ex is InvalidOperationException && !ex.Message.StartsWith("Gemini API"))
     {
         throw new PatternDesignException(ex.Message);
     }
@@ -787,8 +827,13 @@ static string? DesignMismatch(IReadOnlyList<string> target, List<TranslatedStep>
     var want = FigureBitmap.Trim(target);
     var got = FigureBitmap.Trim(planned);
     if (want.SequenceEqual(got)) return null;
-    return "執行前檢查：計畫排出的圖形跟雙模型設計的目標 bitmap 不同（0 = 空，數字 = 疊幾層；第一列 = 相機畫面最上方）。" +
-           $"目標：{string.Join(" / ", want)}；計畫：{(got.Count == 0 ? "沒有放下任何物件" : string.Join(" / ", got))}";
+    string message = "執行前檢查：計畫排出的圖形跟雙模型設計的目標 bitmap 不同（0 = 空，數字 = 疊幾層；第一列 = 相機畫面最上方）。" +
+                     $"目標：{string.Join(" / ", want)}；計畫：{(got.Count == 0 ? "沒有放下任何物件" : string.Join(" / ", got))}";
+    // 立體的目標或疊放的計畫：附上每一格的實際頂面與層數怎麼算出來（2026-10-07）；平面對平面的訊息不變
+    bool layered = stacked || target.Any(r => r.Any(c => c > '1'));
+    return layered && figure.Count > 0
+        ? message + "。" + FigureBitmap.DescribeLayers(figure, figure.Select(LayerOf).ToList())
+        : message;
 }
 // 規劃收到回覆、轉譯完就把這一輪計畫排出的圖形印在 LLM 進度後面，後面的檢查沒過也看得到 LLM 想排成什麼樣子。
 // 2D 印 ■□ bitmap，跟之後送 Unity 比對的相同；3D 疊放印俯視高度圖（數字 = 那格疊到第幾層，例如站起來的 L 是 3 1 1），
@@ -812,6 +857,14 @@ static void PrintPlannedFigure(int attempt, List<TranslatedStep> steps, List<Sce
     var (heights, _, cell3dX, cell3dY) = FigureBitmap.HeightMap(figure, figure.Select(LayerOf).ToList());
     FigureBitmap.PrintHeightMap($"[LLM] 第 {attempt}/10 輪計畫是 3D 疊放，俯視高度圖（數字 = 那格疊到第幾層，· = 空；{figure.Count} 個物件，" +
                                 $"含壓在底下沒被搬的支撐；格距 X {cell3dX * 1000:F0} mm、Y {cell3dY * 1000:F0} mm，上 = +Y、右 = +X）：", heights);
+}
+// 接在每一輪計畫的圖形後面印設計階段（雙 LLM）選出的目標，方便對照；比對時兩邊都會先去掉四周的空列、空行
+static void PrintDesignTarget(PatternDesign design)
+{
+    if (design.Dimension == "3d")
+        FigureBitmap.PrintHeightMap("[LLM] 對照：設計階段雙 LLM 選出的目標高度圖（數字 = 那格疊幾層，· = 空）：", design.Bitmap);
+    else
+        FigureBitmap.Print("[LLM] 對照：設計階段雙 LLM 選出的目標 bitmap：", design.Bitmap.Select(r => r.Replace('0', '□').Replace('1', '■')));
 }
 static void PrintSimulationCheck(SimulationCheckReport report, string? image)
 {

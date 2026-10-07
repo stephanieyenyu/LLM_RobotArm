@@ -257,6 +257,23 @@ var missingPair = NaturalLanguagePlanAdapter.Translate(
     multiPlan.Replace("第 2 顆：source index 2 → target (0.604, 0.184, 0.025)", ""), multiScene);
 Check(!string.IsNullOrEmpty(missingPair.Error),
       "natural language adapter refuses unmatched multi-step actions");
+// 每組抓放各寫一個「執行路徑」區塊時全部照實轉譯（2026-10-07 之前只讀最後一個區塊，其他組被默默丟掉）；
+// 說明文字裡提到「執行路徑開始」不算區塊
+const string onePick = "\nmove_above(source, 0.08)\ndescend(source)\ngrasp()\nlift(source, 0.08)\n" +
+                       "move_above(target, 0.08)\ndescend(target)\nrelease()\nlift(target, 0.08)\n";
+var perPairBlocks = NaturalLanguagePlanAdapter.Translate(
+    "每組的函式列在「執行路徑開始」與「執行路徑結束」之間。\n" +
+    "第 1 顆：source index 1 → target (0.604, 0.154, 0.025)\n第 2 顆：source index 2 → target (0.604, 0.184, 0.025)\n" +
+    "執行路徑開始" + onePick + "執行路徑結束\n\n執行路徑開始" + onePick + "執行路徑結束\n", multiScene);
+Check(string.IsNullOrEmpty(perPairBlocks.Error) && perPairBlocks.Steps.Count == 2 &&
+      perPairBlocks.Steps[0].SourceIndex == 1 && perPairBlocks.Steps[1].SourceIndex == 2 &&
+      perPairBlocks.Steps.All(x => x.Actions.Count == 8),
+      "one execution block per pick-and-place is translated in full, in order");
+var extraBlock = NaturalLanguagePlanAdapter.Translate(
+    "source index 1 → target (0.604, 0.154, 0.025)\n執行路徑開始" + onePick + "執行路徑結束\n執行路徑開始" + onePick + "執行路徑結束\n",
+    multiScene);
+Check(!string.IsNullOrEmpty(extraBlock.Error),
+      "two execution blocks with only one source-target pair is a translation error, not a silent drop");
 // 2D 整批：計畫放下的物件畫成 bitmap（跟相機畫面同方向：上 = +Y、右 = +X），也是 Unity 比對的預期格
 SceneObject Figure(double x, double y, string shape = "cube", string? orientation = null) =>
     new() { Name = shape == "domino" ? "black_domino" : "yellow_cube", Shape = shape, Orientation = orientation, X = x, Y = y, Z = 0.025 };
@@ -307,6 +324,22 @@ Check(FigureBitmap.HeightMap(new[] { Figure(0.40, 0.20), Figure(0.46, 0.20), Fig
 Check(FigureBitmap.Trim(new[] { "00000", "01110", "00100", "00000" }).SequenceEqual(new[] { "111", "010" }) &&
       FigureBitmap.Trim(new[] { "000" }).Count == 0 && FigureBitmap.Trim(new[] { "311" }).SequenceEqual(new[] { "311" }),
       "a designed bitmap is compared after trimming empty border rows and columns");
+// 比對失敗時附上每格的實際值：最左格 5 塊、頂面寫成每層 5 cm（0.025…0.225）→ 換算第 9 層（2026-10-07 立體 L 的情形）
+var doubled = new List<SceneObject>();
+foreach (var z in new[] { 0.025, 0.075, 0.125, 0.175, 0.225 }) { var o = Figure(0.52, 0.10); o.Z = z; doubled.Add(o); }
+foreach (var x in new[] { 0.58, 0.64, 0.70, 0.76 }) doubled.Add(Figure(x, 0.10));
+var doubledLayers = doubled.Select(o => Math.Max(1, (int)Math.Round(o.Z / LayeredGraspGeometry.BlockLayerM))).ToList();
+string layersText = FigureBitmap.DescribeLayers(doubled, doubledLayers);
+Check(FigureBitmap.HeightMap(doubled, doubledLayers).Rows.SequenceEqual(new[] { "91111" }) &&
+      layersText.Contains("第 1 列第 1 行 (0.520, 0.100)：5 個物件，最高頂面 z = 0.225 m → 第 9 層") &&
+      layersText.Contains("第 1 列第 5 行 (0.760, 0.100)：1 個物件，最高頂面 z = 0.025 m → 第 1 層"),
+      "a failed 3D comparison reports each cell's object count, top z and the layer it converts to");
+// 立體的目標是 SpatialPatternDesigner 的 column_heights（正面一排，可能帶空欄），例如 U = "03130"：去掉空欄後跟計畫疊出的高度圖相同
+var standingU = FigureBitmap.HeightMap(new[] { Figure(0.40, 0.20), Figure(0.40, 0.20), Figure(0.40, 0.20), Figure(0.43, 0.20),
+                                               Figure(0.46, 0.20), Figure(0.46, 0.20), Figure(0.46, 0.20) },
+                                       new[] { 1, 2, 3, 1, 1, 2, 3 });
+Check(FigureBitmap.Trim(new[] { "03130" }).SequenceEqual(FigureBitmap.Trim(standingU.Rows)) && standingU.Rows.SequenceEqual(new[] { "313" }),
+      "a designed column-height row 0 3 1 3 0 matches a standing U built as 3 1 3 after trimming");
 // 沒被搬、但最後壓在放下的積木底下的場景積木是結構的一部分（高度圖與 Unity 比對都算它）
 var baseScene = new List<SceneObject> { Block("yellow_cube", 0.40, 0.20, 0.025), Block("yellow_cube", 0.10, 0.10, 0.025),
                                         Block("yellow_cube", 0.12, 0.30, 0.025), Block("yellow_cube", 0.55, 0.20, 0.025) };

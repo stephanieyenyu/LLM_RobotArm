@@ -84,6 +84,32 @@ public static class FigureBitmap
         return band.Select(r => r.PadRight(width, '0').Substring(left, right - left + 1)).ToList();
     }
 
+    /// <summary>
+    /// 高度圖每一格的實際值（列、行跟 Trim 之後相同）：那格最高物件的位置、那格有幾個物件、最高頂面 z、換算的層數。
+    /// 跟目標比對失敗時附在訊息裡（2026-10-07），規劃看得到自己寫的高度被算成第幾層；只講計畫自己的數字與換算方式，不講該填多少。
+    /// </summary>
+    public static string DescribeLayers(IReadOnlyList<SceneObject> placed, IReadOnlyList<int> layerOf)
+    {
+        var (rows, cells, _, _) = HeightMap(placed, layerOf);
+        int top = rows.FindIndex(r => r.Any(c => c != '0'));
+        int left = rows.Where(r => r.Any(c => c != '0')).Min(r => r.ToList().FindIndex(c => c != '0'));
+        var byCell = new SortedDictionary<(int Row, int Col), (int Count, int Highest)>();
+        for (int i = 0; i < cells.Count; i++)
+            foreach (var at in new[] { (cells[i].Row, cells[i].Col), (cells[i].SecondRow, cells[i].SecondCol) }.Where(p => p.Item1 >= 0).Distinct())
+            {
+                var (count, highest) = byCell.TryGetValue(at, out var seen) ? seen : (0, -1);
+                byCell[at] = (count + 1, highest < 0 || layerOf[i] > layerOf[highest] ? i : highest);
+            }
+        var parts = byCell.Select(p =>
+        {
+            var o = placed[p.Value.Highest];
+            return $"第 {p.Key.Row - top + 1} 列第 {p.Key.Col - left + 1} 行 ({o.X:F3}, {o.Y:F3})：{p.Value.Count} 個物件，" +
+                   $"最高頂面 z = {o.Z:F3} m → 第 {layerOf[p.Value.Highest]} 層";
+        });
+        return $"計畫各格（列、行同上方去掉空白後的圖）放好後的最高頂面與換算的層數（層數 = 頂面 z ÷ 層高 {LayeredGraspGeometry.BlockLayerM:F3} m，" +
+               "四捨五入、最少 1；頂面是計畫的 target z 與底下支撐兩者較高的）：" + string.Join("；", parts);
+    }
+
     /// <summary>印高度圖：數字之間空一格，0 印成 ·（例如 "3 1 1"）。</summary>
     public static void PrintHeightMap(string title, IEnumerable<string> rows)
     {

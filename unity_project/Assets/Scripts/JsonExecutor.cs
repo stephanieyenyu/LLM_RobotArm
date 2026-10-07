@@ -2418,6 +2418,19 @@ public class JsonExecutor : MonoBehaviour
             }
         }
 
+        // 3D 批次的自撞改用手臂模型本身的外型（ArmMeshSelfCollision）：下面的膠囊沿 DH 骨架走，沒算到上臂實際往側邊偏，
+        // 夾爪貼著上臂下降時會漏掉（2026-10-07）。外型建不起來才退回膠囊。2D 照舊用膠囊
+        if (layeredCollisionModel && ArmMeshModel() is ArmMeshSelfCollision armMesh)
+        {
+            if (armMesh.Collides(q, out string hit))
+            {
+                error = $"{SelfCollisionText}：{hit}";
+                return false;
+            }
+            error = null;
+            return true;
+        }
+
         for (int a = 0; a < 6; a++)
         {
             for (int b = a + 2; b < 6; b++)
@@ -2444,6 +2457,27 @@ public class JsonExecutor : MonoBehaviour
         }
         error = null;
         return true;
+    }
+
+    // 3D 手臂自撞用的手臂外型：第一次用到時建一次（場景裡的方塊不算進手臂）；建不起來就印原因，之後退回膠囊
+    ArmMeshSelfCollision armMeshSelfCollision;
+    bool armMeshSelfCollisionTried;
+    ArmMeshSelfCollision ArmMeshModel()
+    {
+        if (armMeshSelfCollisionTried) return armMeshSelfCollision;
+        armMeshSelfCollisionTried = true;
+        var blocks = sceneSyncer != null
+            ? sceneSyncer.GetCurrentCubes().Where(b => b != null).Select(b => b.transform)
+            : Enumerable.Empty<Transform>();
+        var model = new ArmMeshSelfCollision(robotArm, blocks);
+        if (model.Error != null)
+            Debug.LogWarning($"[Executor] 3D 手臂自撞檢查用不了手臂模型外型（{model.Error}），退回膠囊近似");
+        else
+        {
+            armMeshSelfCollision = model;
+            Debug.Log("[Executor] 3D 手臂自撞檢查：" + model.Summary);
+        }
+        return armMeshSelfCollision;
     }
 
     static Vector3 ToVector3(double[] p) => new Vector3((float)p[0], (float)p[1], (float)p[2]);

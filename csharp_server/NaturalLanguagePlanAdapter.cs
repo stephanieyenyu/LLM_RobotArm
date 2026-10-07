@@ -37,7 +37,8 @@ public static class NaturalLanguagePlanAdapter
         for (int groupIndex = 0; groupIndex < groups.Count; groupIndex++)
         {
             var group = groups[groupIndex];
-            if (group.Count > 20) return Error($"第 {groupIndex + 1} 個步驟超過 20 個函式。");
+            // 上限不寫在訊息裡（2026-10-07 起規劃與反思都不給函式數上限）
+            if (group.Count > 20) return Error($"第 {groupIndex + 1} 個步驟的函式數超過介面上限。");
 
             int sourceIndex;
             SceneObject target;
@@ -161,13 +162,25 @@ public static class NaturalLanguagePlanAdapter
         return true;
     }
 
+    // 所有「執行路徑開始…執行路徑結束」區塊依序接起來：每組抓放各寫一個區塊、或全部寫在同一個區塊都照實轉譯
+    // （2026-10-07 之前只讀最後一個區塊，每組各寫一個區塊時其他組會被默默丟掉）。每個區塊從「結束」前面最近的
+    // 「開始」算起，文字裡提到「執行路徑開始」的說明不會被當成區塊；最後一個「開始」沒有「結束」時讀到結尾，都沒有就讀全文
     static string ExecutionBlock(string plan)
     {
-        int start = plan.LastIndexOf("執行路徑開始", StringComparison.Ordinal);
-        if (start < 0) return plan;
-        start += "執行路徑開始".Length;
-        int end = plan.IndexOf("執行路徑結束", start, StringComparison.Ordinal);
-        return end < 0 ? plan[start..] : plan[start..end];
+        const string Begin = "執行路徑開始", End = "執行路徑結束";
+        var blocks = new List<string>();
+        int position = 0;
+        while (true)
+        {
+            int end = plan.IndexOf(End, position, StringComparison.Ordinal);
+            if (end < 0) break;
+            int start = plan.LastIndexOf(Begin, end, end - position + 1, StringComparison.Ordinal);
+            if (start >= position) blocks.Add(plan[(start + Begin.Length)..end]);
+            position = end + End.Length;
+        }
+        int open = plan.IndexOf(Begin, position, StringComparison.Ordinal);
+        if (open >= 0) blocks.Add(plan[(plan.LastIndexOf(Begin, StringComparison.Ordinal) + Begin.Length)..]);
+        return blocks.Count > 0 ? string.Join("\n", blocks) : plan;
     }
 
     static bool TrySourceIndex(string plan, IReadOnlyList<SceneObject> scene,
