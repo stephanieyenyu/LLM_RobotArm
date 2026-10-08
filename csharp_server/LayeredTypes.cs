@@ -110,6 +110,27 @@ public class ExecutionResult
     public string? Error { get; set; }
     [JsonPropertyName("duration_sec")]
     public double DurationSec { get; set; }
+    // 純模擬的 preview_only 批次：預覽結束時每塊放下的方塊（預覽前的位置與落點），用來更新模擬世界
+    [JsonPropertyName("final_blocks")]
+    public List<PreviewBlock>? FinalBlocks { get; set; }
+}
+
+/// <summary>Unity 預覽裡被放下的一塊方塊：from = 預覽前的中心（QR），x, y = 落點中心，z = 落點頂面。</summary>
+public class PreviewBlock
+{
+    [JsonPropertyName("from_x")]
+    public double FromX { get; set; }
+    [JsonPropertyName("from_y")]
+    public double FromY { get; set; }
+    [JsonPropertyName("x")]
+    public double X { get; set; }
+    [JsonPropertyName("y")]
+    public double Y { get; set; }
+    [JsonPropertyName("z")]
+    public double Z { get; set; }
+    // domino 的 horizontal / vertical；cube 是空字串
+    [JsonPropertyName("orientation")]
+    public string? Orientation { get; set; }
 }
 
 /// <summary>
@@ -198,6 +219,13 @@ public class BatchEnvelope
     [JsonPropertyName("cell_size_m")]
     public double CellSizeM { get; set; }
 
+    // X、Y 格距分開（手指沿 X 開合，X 方向通常排得比 Y 疏）；舊版 Unity 讀不到時用 cell_size_m
+    [JsonPropertyName("cell_size_x_m")]
+    public double CellSizeXM { get; set; }
+
+    [JsonPropertyName("cell_size_y_m")]
+    public double CellSizeYM { get; set; }
+
     // 3D 模擬驗證與純模擬：robot_target = "ursim" 的批次只在 URSim 執行（Isaac Sim 跟隨），實體手臂不動；
     // layered_grasp = 3D 分層夾取；skip_preview = 軌跡在驗證批次已經預覽過，正式執行不再預覽。
     // 其他批次不寫出這些欄位，送給 Unity 的 JSON 跟以前相同
@@ -212,6 +240,12 @@ public class BatchEnvelope
     [JsonPropertyName("skip_preview")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool SkipPreview { get; set; }
+
+    // 純模擬的 2D 批次：Unity 預覽與 bitmap 比對通過就是執行完成，不連 URSim、也不連實體手臂，
+    // 回報預覽結束時的方塊落點（ExecutionResult.FinalBlocks）。false 時不寫出這個欄位，實機批次的 JSON 不變。
+    [JsonPropertyName("preview_only")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool PreviewOnly { get; set; }
 }
 
 /// <summary>
@@ -233,6 +267,35 @@ public class SimulationCheckReport
     public int ExpectedCount { get; set; }
     [JsonPropertyName("correct_count")]
     public int CorrectCount { get; set; }
+    // 畫面重疊率 = 預覽結束時 Unity 俯視畫面的方塊像素跟預期佔地的交集 ÷ 聯集；大於門檻才算吻合（2026-10-01 起，
+    // 之前是下面的格子重疊率）
+    [JsonPropertyName("overlap_ratio")]
+    public double OverlapRatio { get; set; }
+    [JsonPropertyName("overlap_threshold")]
+    public double OverlapThreshold { get; set; }
+    // 座標比對的格子重疊率 = 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數），只當說明
+    [JsonPropertyName("cell_overlap_ratio")]
+    public double CellOverlapRatio { get; set; }
+    // 比對圖（Unity StreamingAssets 底下的檔名，左：Unity 俯視畫面，右：綠 = 重疊、紅 = 該有沒有、藍 = 多出來）
+    [JsonPropertyName("image_file")]
+    public string? ImageFile { get; set; }
+    // 比對圖的版面：三格（Unity 俯視畫面 / 預期 / 疊合）每格寬、格與格的間隔（像素），
+    // 以及圖上左上角對應的 QR 座標（x0, y1，公尺）與每公尺幾像素；server 用來加註文字與 3D 的層數
+    [JsonPropertyName("image_panel_width")]
+    public int ImagePanelWidth { get; set; }
+    [JsonPropertyName("image_gap")]
+    public int ImageGap { get; set; }
+    [JsonPropertyName("image_x0_m")]
+    public double ImageX0M { get; set; }
+    [JsonPropertyName("image_y1_m")]
+    public double ImageY1M { get; set; }
+    [JsonPropertyName("image_px_per_m")]
+    public double ImagePxPerM { get; set; }
+    // 預覽排完、場景還原前拍的 Unity 照片：正上方的完整畫面（範圍跟比對相同）與主相機（Game 視窗）的畫面
+    [JsonPropertyName("photo_file")]
+    public string? PhotoFile { get; set; }
+    [JsonPropertyName("view_file")]
+    public string? ViewFile { get; set; }
     [JsonPropertyName("expected_rows")]
     public List<string> ExpectedRows { get; set; } = new();
     [JsonPropertyName("result_rows")]

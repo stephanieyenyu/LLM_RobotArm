@@ -56,6 +56,7 @@ Endpoint：
 """
 
 import argparse
+import base64
 import collections
 import queue
 import socket
@@ -185,6 +186,9 @@ VERIFY_Z_TOL_M = 0.008           # 頂面高度與預期層高的誤差
 VERIFY_TILT_TOL_DEG = 10.0       # 傾斜角
 VERIFY_MOVED_TOL_M = 0.010       # 沒被搬的積木位移超過這個就算被撞動
 VERIFY_STABLE_TOL_M = 0.002      # 靜止觀察 1 秒內的最大位移
+VERIFY_OVERLAP_THRESHOLD = 0.9   # 畫面重疊率要大於這個（跟 Unity JsonExecutor.bitmapOverlapThreshold 相同）
+OVERLAP_PIXEL_M = 0.001          # 畫面重疊率 1 mm 一像素（同 Unity FigureImageOverlap）
+OVERLAP_ALIGN_M = 0.005          # 算重疊率前，實際圖形整體平移對齊的搜尋範圍（±5 mm）
 VERIFY_SUPPORT_RADIUS_M = 0.020  # 上下兩塊中心 XY 距離在這之內才算疊在上面
 VERIFY_TIP_TABLE_TOL_M = 0.003   # 指尖（依 URSim 關節角算）低於桌面超過這個就算撞桌
 VERIFY_SETTLE_MAX_S = 3.0
@@ -1336,7 +1340,7 @@ def snapshot_blocks():
     return snap
 
 
-def do_verify_begin(scene, cam, steps, use_current_world=False):
+def do_verify_begin(scene, cam, steps, use_current_world=False, expected_cells=None, cell_x=None, cell_y=None):
     if follower is None:
         raise RuntimeError("isaac_sim_server 沒有用 --ursim_ip 啟動，無法跟隨 URSim 驗證")
     if follower.latest()[0] is None:
@@ -1362,9 +1366,138 @@ def do_verify_begin(scene, cam, steps, use_current_world=False):
         "follow_steps": 0,
         "stale_steps": 0,
         "started": time.time(),
+        # 畫面重疊率用：server 依計畫算的預期格（每一格每一層一個，含壓在底下沒被搬的支撐）與格距；沒給就不算
+        "expected_cells": list(expected_cells or []),
+        "cell_x": float(cell_x) if cell_x else CUBE_SIZE_M,
+        "cell_y": float(cell_y) if cell_y else CUBE_SIZE_M,
     })
     log(f"[isaac_sim_server] 驗證開始：{len(steps)} 步，{reply['simulated']} 塊積木，手臂跟隨 URSim")
     return reply
+
+
+def convex_hull_2d(points):
+    """平面點的凸包（單調鏈，逆時針）。"""
+    pts = sorted({(round(float(x), 9), round(float(y), 9)) for x, y in points})
+    if len(pts) <= 2:
+        return np.array(pts)
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower, upper = [], []
+    for pt in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], pt) <= 0:
+            lower.pop()
+        lower.append(pt)
+    for pt in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], pt) <= 0:
+            upper.pop()
+        upper.append(pt)
+    return np.array(lower[:-1] + upper[:-1])
+
+
+def inside_convex(hull, px, py):
+    """像素中心（px、py 陣列）是否落在逆時針凸包內（含邊界）。"""
+    inside = np.ones(px.shape, dtype=bool)
+    for i in range(len(hull)):
+        ax, ay = hull[i]
+        bx, by = hull[(i + 1) % len(hull)]
+        inside &= (bx - ax) * (py - ay) - (by - ay) * (px - ax) >= -1e-12
+    return inside
+
+
+def figure_overlap(expected, cell_x, cell_y):
+    """3D 的畫面重疊率，算法同 main Unity 的 FigureImageOverlap：範圍是預期佔地的外框四邊各加半格，1 mm 一像素，
+    每一點的預期層數（cube 2.5×2.5 cm，domino 5×2.5 cm 照方向）跟模擬結束時實際疊到的層數比，重疊率 = Σmin ÷ Σmax
+    （全部只有一層時就是像素的交集 ÷ 聯集，疊到別塊上也會扣分）。實際佔地用每塊積木目前的位姿（含偏轉、傾斜）投影到桌面，
+    層數 = 真實頂面 ÷ 2.5 cm 四捨五入。
+    跟 Unity 不同的一點：Isaac 有物理，整個圖形常一致偏幾 mm（2026-10-08 實測五塊都 Y −2.0 mm），所以先把實際的圖形
+    在 ±OVERLAP_ALIGN_M 內整體平移、找重疊率最高的位置再算；個別積木放歪、少層、多放照樣扣分，位置偏差另由位置檢查把關。
+    回傳 (重疊率, 預期層數圖, 對齊後的實際層數圖, 平移 (dx_m, dy_m), 不對齊時的重疊率)。"""
+    half = CUBE_SIZE_M / 2
+    pad = int(round(OVERLAP_ALIGN_M / OVERLAP_PIXEL_M))
+
+    def half_xy(e):
+        if e.get("shape") != "domino":
+            return half, half
+        return (half, 2 * half) if e.get("orientation") == "vertical" else (2 * half, half)
+
+    def layer_of(top):
+        return max(1, int(round(top / CUBE_SIZE_M)))
+
+    x0 = min(float(e["x"]) - half_xy(e)[0] for e in expected) - cell_x / 2
+    x1 = max(float(e["x"]) + half_xy(e)[0] for e in expected) + cell_x / 2
+    y0 = min(float(e["y"]) - half_xy(e)[1] for e in expected) - cell_y / 2
+    y1 = max(float(e["y"]) + half_xy(e)[1] for e in expected) + cell_y / 2
+    w = int(np.ceil((x1 - x0) / OVERLAP_PIXEL_M))
+    h = int(np.ceil((y1 - y0) / OVERLAP_PIXEL_M))
+    # 實際的層數圖四邊多畫 pad 像素，平移時才有資料。圖的方向同 bitmap：上 = +Y、右 = +X
+    gx0, gy1 = x0 - pad * OVERLAP_PIXEL_M, y1 + pad * OVERLAP_PIXEL_M
+    px, py = np.meshgrid(gx0 + (np.arange(w + 2 * pad) + 0.5) * OVERLAP_PIXEL_M,
+                         gy1 - (np.arange(h + 2 * pad) + 0.5) * OVERLAP_PIXEL_M)
+    want_full = np.zeros(px.shape, dtype=np.int32)
+    for e in expected:
+        hx, hy = half_xy(e)
+        mask = (np.abs(px - float(e["x"])) <= hx) & (np.abs(py - float(e["y"])) <= hy)
+        want_full[mask] = np.maximum(want_full[mask], layer_of(float(e["z"])))
+    want = want_full[pad:pad + h, pad:pad + w]
+    got_full = np.zeros(px.shape, dtype=np.int32)
+    corners = np.array([[sx, sy, sz] for sx in (-0.5, 0.5) for sy in (-0.5, 0.5) for sz in (-0.5, 0.5)])
+    for b in blocks:
+        if b["cuboid"] is None:
+            continue
+        center, top, R_qr = block_pose_qr(b)
+        pts = center + (corners * b["dims"]) @ R_qr.T
+        if (pts[:, 0].max() < gx0 or pts[:, 0].min() > x1 + pad * OVERLAP_PIXEL_M or
+                pts[:, 1].max() < y0 - pad * OVERLAP_PIXEL_M or pts[:, 1].min() > gy1):
+            continue
+        hull = convex_hull_2d(pts[:, :2])
+        if len(hull) < 3:
+            continue
+        mask = inside_convex(hull, px, py)
+        got_full[mask] = np.maximum(got_full[mask], layer_of(top))
+
+    def ratio_at(sx, sy):
+        # 實際圖形往 +X 偏 sx 像素、往 -Y 偏 sy 像素時，取對應的視窗跟預期比
+        got = got_full[pad + sy:pad + sy + h, pad + sx:pad + sx + w]
+        total = int(np.maximum(want, got).sum())
+        return (float(np.minimum(want, got).sum()) / total if total else 0.0), got
+
+    unaligned, _ = ratio_at(0, 0)
+    best = (unaligned, 0, 0)
+    for sy in range(-pad, pad + 1):
+        for sx in range(-pad, pad + 1):
+            r, _ = ratio_at(sx, sy)
+            # 同分時取平移最小的
+            if r > best[0] + 1e-12 or (abs(r - best[0]) <= 1e-12 and sx * sx + sy * sy < best[1] ** 2 + best[2] ** 2):
+                best = (r, sx, sy)
+    ratio, sx, sy = best
+    _, got = ratio_at(sx, sy)
+    return ratio, want, got, (sx * OVERLAP_PIXEL_M, -sy * OVERLAP_PIXEL_M), unaligned
+
+
+def overlap_image(want, got, scale=2, gap=8):
+    """比對圖（PNG），三格同 main 的 sim_check.png：模擬結果 / 預期（灰階越深層數越多）/ 疊合
+    （綠 = 吻合、紅 = 該有沒有、藍 = 多出來、橘 = 有但層數不對）。"""
+    h, w = want.shape
+    shade = [(255, 255, 255), (215, 215, 215), (175, 175, 175), (140, 140, 140), (110, 110, 110)]
+
+    def layers(img):
+        out = np.zeros((h, w, 3), dtype=np.uint8)
+        for k, colour in enumerate(shade):
+            out[np.minimum(img, len(shade) - 1) == k] = colour
+        return out
+
+    diff = np.full((h, w, 3), 255, dtype=np.uint8)
+    diff[(want > 0) & (got == want)] = (80, 170, 60)       # BGR：綠
+    diff[(want > 0) & (got == 0)] = (60, 60, 220)          # 紅
+    diff[(want == 0) & (got > 0)] = (220, 120, 40)         # 藍
+    diff[(want > 0) & (got > 0) & (got != want)] = (40, 150, 240)   # 橘
+    spacer = np.full((h, gap, 3), 255, dtype=np.uint8)
+    panel = np.hstack([layers(got), spacer, layers(want), spacer, diff])
+    panel = cv2.resize(panel, (panel.shape[1] * scale, panel.shape[0] * scale), interpolation=cv2.INTER_NEAREST)
+    ok, png = cv2.imencode(".png", panel)
+    return png.tobytes() if ok else None
 
 
 def released_at_end(actions):
@@ -1492,6 +1625,19 @@ def do_verify_end():
     gap_text = f"；資料中斷 {len(gaps)} 次，最長 {max(gaps):.1f} s" if gaps else "；沒有超過 0.3 s 的中斷"
     check("URSim 資料完整", verify_state["follow_steps"] > 0 and verify_state["stale_steps"] <= 0.05 * max(total, 1),
           f"跟隨 {verify_state['follow_steps']} 步，其中 {verify_state['stale_steps']} 步讀不到 URSim{gap_text}")
+    # 畫面重疊率（三個版本的 3D 驗證都看這一項，算法同 main 的 2D Unity 比對）
+    overlap = None
+    expected = verify_state.get("expected_cells") or []
+    if expected:
+        ratio, want, got, (dx, dy), unaligned = figure_overlap(expected, verify_state["cell_x"], verify_state["cell_y"])
+        check("畫面重疊率", ratio > VERIFY_OVERLAP_THRESHOLD,
+              f"{ratio * 100:.0f}%（要大於 {VERIFY_OVERLAP_THRESHOLD * 100:.0f}%；1 mm 一像素、依層數加權；"
+              f"整個圖形對齊平移 X {dx * 1000:+.0f} mm、Y {dy * 1000:+.0f} mm，不對齊是 {unaligned * 100:.0f}%；"
+              f"預期 {len(expected)} 格，最高 {int(want.max())} 層，模擬結果最高 {int(got.max())} 層）")
+        png = overlap_image(want, got)
+        overlap = {"ratio": round(ratio, 4), "unaligned_ratio": round(unaligned, 4), "threshold": VERIFY_OVERLAP_THRESHOLD,
+                   "pixel_m": OVERLAP_PIXEL_M, "align_shift_m": [round(dx, 4), round(dy, 4)],
+                   "image_png_base64": base64.b64encode(png).decode("ascii") if png else None}
 
     passed = not reasons
     log(f"[isaac_sim_server] 驗證結果：{'PASS' if passed else 'FAIL'}" + ("" if passed else "；" + "；".join(reasons)))
@@ -1503,6 +1649,7 @@ def do_verify_end():
         "min_fingertip_height_mm": round(float(min_tip) * 1000, 1) if np.isfinite(min_tip) else None,
         "fingertip_tracked_from": "ready" if ready_reached else "verify_begin",
         "duration_s": round(time.time() - verify_state["started"], 1),
+        "overlap": overlap,
     }
 
 
@@ -1629,7 +1776,8 @@ def endpoint_verify_begin():
     data = request.get_json(force=True)
     try:
         return jsonify(run_on_main(do_verify_begin, data.get("scene", []), data.get("camera"), data.get("steps") or [],
-                                   bool(data.get("use_current_world"))))
+                                   bool(data.get("use_current_world")), data.get("expected_cells"),
+                                   data.get("cell_size_x_m"), data.get("cell_size_y_m")))
     except Exception as ex:
         return json_error(ex, 409)
 
@@ -1768,7 +1916,7 @@ def main():
     threading.Thread(target=lambda: app.run(host=args.host, port=args.port, threaded=True, use_reloader=False),
                      daemon=True, name="flask").start()
     log(f"[isaac_sim_server] listening on http://{args.host}:{args.port}")
-    print("  POST /verify/begin  {'scene': [...], 'camera': {...}?, 'steps': [...]}")
+    print("  POST /verify/begin  {'scene': [...], 'camera': {...}?, 'steps': [...], 'expected_cells': [...]?}")
     print("  POST /verify/end")
     print("  POST /reset         {'scene': [...], 'camera': {...}?, 'joints': [...]?}")
     print("  POST /overlay       body = 真實相機 JPEG")

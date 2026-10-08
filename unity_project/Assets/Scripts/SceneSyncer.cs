@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 using UnityEngine;
@@ -14,7 +15,7 @@ using UnityEngine.Networking;
 //   3. 若 mode == "idle" 且上次是 executing（或首次啟動）→ GET /scene 一次，refresh 所有 cube
 //   4. 否則什麼都不做（perception 端持續在更新，但 Unity 不覆蓋顯示）
 //
-// 切換實機 / 純模擬（RunMode.Changed，2026-10-07 從 main 搬來，沒有 main 的內建虛擬世界）：
+// 切換實機 / 純模擬（RunMode.Changed，2026-10-07 從 main 搬來；2026-10-08 加上沒開 Isaac 時的內建虛擬世界）：
 //   純模擬（切過去或換場景）：馬上顯示場景檔的積木，同時把場景檔載入 Isaac Sim（/sim/load，載入中不輪詢），
 //     載入完下一次輪詢改顯示 Isaac 回報的位置（/perception/scene）。Isaac 連不上就先留著場景檔的積木；
 //     之後連上時 Isaac 若還沒有積木（剛啟動）會自動載入一次。
@@ -99,6 +100,7 @@ public class SceneSyncer : MonoBehaviour
     private int sourceGeneration = 0;                            // 每次切換模式 / 換場景 +1，舊來源晚到的回應直接丟掉
     private int loadingGeneration = -1;                          // 正在把場景檔載入 Isaac 的那一次（載入中不輪詢）
     private int emptyLoadGeneration = -1;                        // Isaac 沒有積木時自動載入，每次切換只試一次
+    private System.DateTime virtualWorldStamp;                   // 上次套用的 sim_world.json 修改時間
 
     // 給 SyncGripper 讀，讓虛擬夾爪找最近的 cube
     public List<GameObject> GetCurrentCubes() { return currentCubes; }
@@ -129,6 +131,7 @@ public class SceneSyncer : MonoBehaviour
     // 換了資料來源：下一次輪詢當成首次連線，重新抓一次場景（純模擬另外先載入場景檔，見檔頭說明）
     void OnRunModeChanged()
     {
+        virtualWorldStamp = default;
         bool wasSim = lastIsSim;
         lastIsSim = RunMode.IsSim;
         sourceGeneration++;
@@ -182,8 +185,11 @@ public class SceneSyncer : MonoBehaviour
                 }
                 else if (req.result == UnityWebRequest.Result.ConnectionError)
                 {
-                    Report($"連不上 Isaac Sim（{url}：{req.error}）。畫面先顯示場景檔 {scene}；純模擬要開 isaac_sim_server" +
-                           "（--ursim_ip <URSim IP>）與 URSim，開好後會自動載入。");
+                    // 上次留下的內建虛擬世界（sim_world.json）作廢，不然下一次輪詢會把舊的擺放結果蓋回來；
+                    // csharp_server 下一個任務開始時會依場景檔寫新的
+                    DeleteVirtualWorldFile();
+                    Report($"連不上 Isaac Sim（{url}：{req.error}）。桌面已重置成場景檔 {scene}；2D 任務用 csharp_server 內建的" +
+                           "虛擬世界（下指令時載入），3D 疊放需要開 isaac_sim_server，開好後會自動載入。");
                 }
                 else
                 {
@@ -199,6 +205,43 @@ public class SceneSyncer : MonoBehaviour
         {
             if (loadingGeneration == generation) loadingGeneration = -1;
         }
+    }
+
+    // 純模擬連不上 Isaac Sim 時，csharp_server 內建的虛擬世界寫在 StreamingAssets/sim_world.json（格式同 /scene，
+    // 任務開始與每批執行完成後才寫），檔案更新就重新套用。回傳有沒有這個檔。
+    bool TryApplyVirtualWorld()
+    {
+        string path = Path.Combine(Application.streamingAssetsPath, "sim_world.json");
+        if (!File.Exists(path)) return false;
+        var stamp = File.GetLastWriteTimeUtc(path);
+        if (stamp == virtualWorldStamp) return true;
+        try
+        {
+            var scene = JsonUtility.FromJson<SceneResponse>(File.ReadAllText(path));
+            if (scene?.objects == null) return true;
+            ApplyObjects(scene.objects);
+            virtualWorldStamp = stamp;
+            Debug.Log($"[SceneSyncer] 連不上 Isaac Sim，顯示 csharp_server 內建虛擬世界的 {scene.objects.Length} 個物件");
+        }
+        catch (System.Exception e) when (e is IOException || e is System.ArgumentException)
+        {
+            Debug.LogWarning($"[SceneSyncer] 讀不了 sim_world.json：{e.Message}");
+        }
+        return true;
+    }
+
+    void DeleteVirtualWorldFile()
+    {
+        string path = Path.Combine(Application.streamingAssetsPath, "sim_world.json");
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch (IOException e)
+        {
+            Debug.LogWarning($"[SceneSyncer] 刪不掉上次留下的 sim_world.json：{e.Message}");
+        }
+        virtualWorldStamp = default;
     }
 
     static SceneObjectInfo ToSceneObject(SimSceneFile.Block b) => new SceneObjectInfo
@@ -379,6 +422,9 @@ public class SceneSyncer : MonoBehaviour
 
             if (req.result != UnityWebRequest.Result.Success)
             {
+                // 純模擬沒開 Isaac Sim：csharp_server 用內建的虛擬世界，從它寫的 sim_world.json 顯示
+                if (RunMode.IsSim && TryApplyVirtualWorld())
+                    yield break;
                 if (previousMode == null && modeUrl != lastUnreachableUrl)   // 完全連不上，每個網址只 log 一次
                 {
                     lastUnreachableUrl = modeUrl;

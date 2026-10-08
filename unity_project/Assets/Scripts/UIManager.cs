@@ -207,8 +207,9 @@ public class UIManager : MonoBehaviour
             return;
         }
         ShowMessage(RunMode.IsSim
-            ? $"已切成純模擬：正在把 {RunMode.Scene} 載入 Isaac Sim，畫面會顯示模擬的積木。下一個指令起場景來自 Isaac，" +
-              "動作只送 URSim（實體手臂不動）；要先開 URSim 與 isaac_sim_server（--ursim_ip），不需要 perception_server。"
+            ? $"已切成純模擬：正在把 {RunMode.Scene} 載入 Isaac Sim，畫面會顯示模擬的積木，不需要 perception_server。" +
+              "2D 只用 Unity 模擬驗證（畫面重疊率＋LLM 看 Unity 畫面），不用開 URSim，沒開 Isaac 時用 csharp_server 內建的虛擬世界；" +
+              "3D 由 Isaac Sim 模擬驗證，需要 URSim 與 isaac_sim_server（--ursim_ip）。"
             : "已切成實機：畫面改顯示相機看到的積木，下一個指令起動作送實體手臂。要先開 perception_server。");
     }
 

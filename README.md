@@ -19,11 +19,34 @@ LLM CommandRouter（arrange_pattern / move_relative / stack）
    └─ SingleObjectTaskBuilder：方向/距離或疊放目標 → 實際座標
    ↓
 LLM MotionPlanner → MotionPlanValidator
-   ↓  StreamingAssets/current_step.json（robot function sequence）
+   ↓
+模擬驗證（相機只在收到指令時拍一次，之後都看模擬畫面）
+   ├─ 2D（排平面圖形、相對移動）：Unity 整批模擬 → Unity 畫面重疊率 > 90% ＋ LLM 看 Unity 畫面判 PASS（不需要 Isaac Sim）
+   └─ 3D（排立體圖形、疊放）：Unity 只轉送 URSim、Isaac Sim 跟隨做物理 → 物理檢查 ＋ 畫面重疊率（整體對齊 ±5 mm）> 90% ＋ LLM 看 Isaac 畫面判 PASS
+   ↓  通過才送：StreamingAssets/current_step.json（robot function sequence）
 Unity JsonExecutor（高階 function → URScript）
    ↓  TCP 30002 URScript
-UR3e
+UR3e（做完就結束，執行後不再用相機驗證）
 ```
+
+## 模擬驗證（2026-10-08 起，三個版本相同）
+
+main、zero-constraint、rulebased 三個版本用同一套驗證流程。相機（純模擬：虛擬場景）只在收到指令時讀一次場景與相機位姿，
+之後的驗證都看模擬畫面；手臂做完就結束，執行後不再重讀場景驗證。任何一關沒過，手臂都不動，這個指令結束。
+
+- **2D**（`arrange_pattern`、`move_relative`）：整批先在 Unity 模擬（只預覽，手臂不動），預覽結束用正上方的正交相機只拍方塊（背景洋紅、1 mm 一格），
+  跟預期格（排圖形是 LayoutRealizer 的目標格；相對移動是那一塊的落點）比畫面重疊率（Σ min ÷ Σ max，要大於 90%，同 main；比對圖 `sim_check.png`）。
+  通過後由 LLM 看 Unity 主相機的模擬畫面（`unity_view.png`）與預覽後的場景判 PASS（`SimulationImageJudge.cs`），兩關都過才把同一批
+  （`skip_preview`，不再預覽）送實體手臂。不需要 Isaac Sim。紀錄存在 `csharp_server/outputs/unity_<時間>_<名稱>/`。
+- **3D**（`arrange_3d_pattern`、`stack`、多層疊放）：Unity 不預覽，只把同一套關節軌跡以 `robot_target = "ursim"`、`skip_preview` 轉送 URSim；
+  Isaac Sim 跟隨 URSim 做物理，跑完做物理檢查（位置、層高、傾斜、撞動其他積木、穩定、指尖撞桌、手臂自撞），再比畫面重疊率：
+  Isaac 量到的積木位姿依頂面高度換算層數，投影成 1 mm 一格的俯視高度圖，跟預期格（每一層各一格，含塔底）比 Σ min ÷ Σ max；
+  先把整個圖形在 ±5 mm 內平移對齊再算（Isaac 的物理落點常整體偏約 2 mm），要大於 90%（比對圖 `isaac_overlap.png`）。
+  最後由 LLM 看 Isaac 的模擬畫面判 PASS，全部通過才把同一批送實體手臂（純模擬送 URSim）。紀錄存在 `csharp_server/outputs/isaac_<時間>_<名稱>/`。
+- 給 LLM 的畫面附一句說明它看的是 Unity 或 Isaac 的模擬畫面；判定的 system prompt 不變（main 的獨立結果驗證者原文）。
+- **「Unity驗證」開關**保留，預設開啟：關掉（對照組）時 2D 的畫面重疊率與 LLM 畫面判定只記錄、照常送手臂；3D 的 Isaac 驗證不受開關影響。
+- 2026-10-08 之前：2D、3D 都先在 Unity 預覽逐塊比對位置與高度，每一步之後重讀相機場景驗證；Isaac 驗證時才讀相機位姿；
+  純模擬一定要開 Isaac Sim 與 URSim。
 
 ## 檔案總覽
 
@@ -59,10 +82,10 @@ CommandRouter 判斷為 `arrange_3d_pattern`（指令明確說立體、3D、upri
 2. **Layer 2 布局**：`SpatialLayoutRealizer` 寫死位置：第 c 欄 X = `TargetOriginX` + c × `SpatialCellSize`（0.49 + c × 0.052），Y = `SpatialTargetOriginY`（0.08）；第 k 層頂面 = k × 0.025 m。超出畫布、層數、庫存或 UR 目標半徑 0.18..0.48 m 就停止，不自動平移。
 3. **Layer 3 分派與順序**：先鋪第 1 層，用 2D 的 `TaskAssigner`（遠端優先、補貨區裡離目標最近的 cube、不拿已規劃的格子）；第 2 層起整層疊完才疊下一層，同層也是遠端優先，來源與放開高度照 `SingleObjectTaskBuilder.BuildStackOntoLocation`（補貨區最低、最近的 cube；目標高度 = 累積塔頂 + 來源高度 + 0.008 m 放開間隙）。任何一格排不出來就整批取消，不送半成品。
 4. **Layer 4 動作**：每一步由 `MotionPlanner` 組白名單函式，`MotionPlanValidator` 檢查（疊放要有足夠的高度）。
-5. **Unity 比對**：整批附上每一層的預期格（格距用 `SpatialCellSize`），模擬結束逐塊比對位置、高度、是否在空中放開；同一格疊好幾塊時配對會把高度差算進去，結果印每格放對幾層。「Unity驗證：開」時不通過就不讓手臂動，「關」時只記錄。
+5. **預期格**：整批附上每一層的預期格（格距用 `SpatialCellSize`），交給 Isaac 比畫面重疊率（見上方「模擬驗證」）；Unity 不預覽。2026-10-08 之前是 Unity 模擬結束逐塊比對位置、高度、是否在空中放開，「Unity驗證：開」時不通過就不讓手臂動。
 6. **3D 分層夾取**：3D 批次帶 `layered_grasp`，Unity 用實測指尖長度 179 mm、實測桌面高度（QR1_Z − 30 mm）規劃，夾取與放置時指尖停在積木真實頂面下 19 mm（頂面高度由 server 依固定布局給 `source_top_m` / `target_top_m`），碰撞模型的手指段只檢查指尖離桌 3 mm；數字在 `LayeredGraspGeometry.cs`，Unity 與 server 共用。
 7. **手臂自撞**：3D 批次規劃時自撞改用畫面上手臂與夾爪模型的外型（`ArmMeshSelfCollision.cs`，手臂與夾爪的 .dae/.obj 已開 Read/Write）；Isaac 驗證期間也用 USD 碰撞體檢查自撞。
-8. **模擬驗證（URSim + Isaac Sim）**：整批先以 `robot_target = "ursim"` 只在 URSim 執行（Unity 先預覽並比對，通過才讓 URSim 動），Isaac Sim 的手臂即時跟隨 URSim、積木用物理模擬；URSim 跑完 Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定、指尖撞桌、手臂自撞），通過後再讓 LLM 看 Isaac 的模擬畫面判定（`SimulationImageJudge.cs`，system prompt 是 main 的獨立結果驗證者原文，第一行 PASS 才算通過）。驗證開始時 server 讀 perception_server 的 `/camera`（相機內參與相機在 QR 座標系的位姿），Isaac 把模擬相機擺到跟實體相機同一個位置，畫面判定看到的角度才跟實體相機一致；讀不到時沿用 Isaac 上次的相機。全部通過才把同一批（同樣的步驟與高度、`skip_preview` 不再預覽）送實體手臂；任何一關沒過、或 Isaac / URSim 不可用，實體手臂都不動。Isaac 驗證不受「Unity驗證」開關影響。紀錄存在 `csharp_server/outputs/isaac_<時間>_<pattern>/`。
+8. **模擬驗證（URSim + Isaac Sim）**：整批先以 `robot_target = "ursim"` 只在 URSim 執行（Unity 不預覽，只轉送），Isaac Sim 的手臂即時跟隨 URSim、積木用物理模擬；URSim 跑完 Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定、指尖撞桌、手臂自撞）與畫面重疊率（整體對齊 ±5 mm 後要大於 90%），通過後再讓 LLM 看 Isaac 的模擬畫面判定（`SimulationImageJudge.cs`，system prompt 是 main 的獨立結果驗證者原文，第一行 PASS 才算通過）。收到指令時 server 讀一次 perception_server 的 `/camera`（相機內參與相機在 QR 座標系的位姿），Isaac 把模擬相機擺到跟實體相機同一個位置，畫面判定看到的角度才跟實體相機一致；讀不到時沿用 Isaac 上次的相機。全部通過才把同一批（同樣的步驟與高度、`skip_preview` 不再預覽）送實體手臂；任何一關沒過、或 Isaac / URSim 不可用，實體手臂都不動。Isaac 驗證不受「Unity驗證」開關影響。紀錄存在 `csharp_server/outputs/isaac_<時間>_<pattern>/`。
 
 3D 要先開 URSim（VirtualBox 裡開 URSim UR3，按開機、啟動）與 Isaac Sim（repo 根目錄）：
 ```powershell
@@ -77,23 +100,25 @@ csharp_server 每個指令開始時讀一次，整個任務用同一個模式（
 
 - **場景**：不讀 perception_server，改讀 Isaac Sim 的 `/perception/scene`（格式相同）。每個指令開始時用虛擬場景檔重建 Isaac 世界
   （`reset_each_task` 預設 true；false 時接續上一個任務的模擬結果）。
-- **動作**：每一批、每一步都標 `robot_target = "ursim"`，Unity 只送 URSim，Isaac 的手臂跟隨 URSim、積木用物理模擬；
+- **動作**：2D 只在 Unity 模擬驗證，通過就算執行完成，模擬世界照預覽落點更新（不連 URSim、不需要 Isaac）；
+  3D 的批次標 `robot_target = "ursim"`，Unity 只送 URSim，Isaac 的手臂跟隨 URSim、積木用物理模擬；
   手動按鈕（鬆開 / 夾緊 / 回 Home）也只動 URSim，Unity 的手臂跟隨 URSim。Unity 那邊切成純模擬時，就算 server 送來沒標的批次也只會送 URSim。
-- **規則不變**：2D、3D、相對移動、疊放都走跟實機一樣的流程（Unity 預覽與比對、MotionPlanValidator、每步之後重讀場景驗證）。
+- **規則不變**：2D、3D、相對移動、疊放都走跟實機一樣的流程（MotionPlanValidator、2D 的 Unity 模擬驗證、3D 的 Isaac 驗證）。
 - **3D 模擬驗證**：Isaac 本身就是世界，不重新投影（`use_current_world`）；驗證前記下積木位姿（`/sim/snapshot`），
   驗證結束不論通過與否都放回去（`/sim/restore`），通過後「正式執行」也送 URSim。相機是載入場景時設定的（場景檔的 `camera`，
   沒給就用 `sim_scenes/camera/default.json`，也就是實機相機的位姿）。
 - **虛擬場景檔**：repo 根目錄 `sim_scenes/*.json`，純模擬時 Unity 多一顆「場景：…」按鈕輪流切換。預設
-  `supply_cubes.json`：15 塊黃方塊排在供料區（X 0.05～0.35、Y 0.02～0.25，間距 6 cm），2D／3D 目標區留空；
-  另有 `two_cubes.json`、`domino_cubes.json`。座標是 QR 座標（公尺），`z` 是頂面高度。
+  `yellow_cubes_15.json`：15 塊黃方塊 5 欄 × 3 排（中心間距 6 cm，X 0.08～0.32、Y 0.06～0.18，都在供料區內），2D／3D 目標區留空；
+  另一個是 `domino_cube.json`（一塊橫放的黃 domino 在 (0.20, 0.10)、一塊黃方塊在 (0.12, 0.18)）。三個版本的這兩個檔案完全相同，
+  指定的場景檔不存在時改用預設（2026-10-08 起；之前是 `supply_cubes`、`two_cubes`、`domino_cubes`）。座標是 QR 座標（公尺），`z` 是頂面高度。
 
-純模擬要開 URSim 與 Isaac Sim（`--ursim_ip` 一定要給，Isaac 才會跟隨 URSim），不用開 perception_server：
+純模擬的 3D 要開 URSim 與 Isaac Sim（`--ursim_ip` 一定要給，Isaac 才會跟隨 URSim）；2D 只要 csharp_server 與 Unity，沒開 Isaac 時用內建的虛擬世界（`VirtualSimWorld.cs`，同 main）。不用開 perception_server：
 ```powershell
 D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui
 cd csharp_server
 dotnet run
 ```
-csharp_server 啟動時連不上 perception_server 只會提示、不會結束；實機模式的指令才需要它。連不上 Isaac 時純模擬的指令不執行，
+csharp_server 啟動時連不上 perception_server 只會提示、不會結束；實機模式的指令才需要它。連不上 Isaac 時，純模擬的 2D 改用內建的虛擬世界（沒有物理，方塊照預覽落點移動），3D 不執行，
 console 會印原因。
 
 ## 前置

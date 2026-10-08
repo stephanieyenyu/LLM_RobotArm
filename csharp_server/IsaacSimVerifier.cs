@@ -27,12 +27,14 @@ public static class IsaacSimVerifier
     /// </summary>
     /// camera = perception_server /camera 的內參與相機位姿；Isaac 用它把模擬相機擺到跟實體相機同一個位置（null = 沿用上次）。
     /// useCurrentWorld（純模擬）：Isaac 本身就是世界，不重新投影，直接從目前的物理狀態開始驗證。
+    /// expectedCells：預期的高度圖（每一格每一層一個），Isaac 在 verify/end 算畫面重疊率（整體對齊 ±5 mm 後 &gt; 90%，同 main）。
     public static async Task BeginVerifyAsync(List<SceneObject> scene, JsonElement? camera, IEnumerable<object> steps, string dir,
-        bool useCurrentWorld = false)
+        bool useCurrentWorld = false, IReadOnlyList<ExpectedCell>? expectedCells = null, double cellXM = 0, double cellYM = 0)
     {
-        object body = useCurrentWorld
-            ? new { scene, camera, steps, use_current_world = true }
-            : new { scene, camera, steps };
+        var expected = (expectedCells ?? new List<ExpectedCell>())
+            .Select(c => new { x = c.X, y = c.Y, z = c.Z, shape = c.Shape, orientation = c.Orientation }).ToList();
+        object body = new { scene, camera, steps, use_current_world = useCurrentWorld,
+            expected_cells = expected, cell_size_x_m = cellXM, cell_size_y_m = cellYM };
         File.WriteAllText(Path.Combine(dir, "isaac_verify_begin_request.json"), JsonSerializer.Serialize(body, Indented));
         File.WriteAllText(Path.Combine(dir, "isaac_verify_begin.json"), await Post("verify/begin", body));
         await SaveFrame(dir, "isaac_before.jpg");
@@ -52,6 +54,13 @@ public static class IsaacSimVerifier
             Scene = root.GetProperty("objects").Deserialize<List<SceneObject>>(Json) ?? new(),
         };
         File.WriteAllText(Path.Combine(dir, "isaac_after_scene.json"), JsonSerializer.Serialize(report.Scene, Indented));
+        // 畫面重疊率（有給預期格才有）與比對圖：模擬結果 / 預期 / 疊合
+        if (root.TryGetProperty("overlap", out var overlap) && overlap.ValueKind == JsonValueKind.Object)
+        {
+            report.OverlapRatio = overlap.GetProperty("ratio").GetDouble();
+            if (overlap.TryGetProperty("image_png_base64", out var png) && png.ValueKind == JsonValueKind.String)
+                File.WriteAllBytes(Path.Combine(dir, "isaac_overlap.png"), Convert.FromBase64String(png.GetString()!));
+        }
         report.Frame = await SaveFrame(dir, "isaac_after.jpg");
         return report;
     }
@@ -109,6 +118,8 @@ public sealed class VerifyReport
     public List<string> Reasons { get; set; } = new();
     public List<SceneObject> Scene { get; set; } = new();
     public byte[]? Frame { get; set; }
+    // 畫面重疊率（整體對齊後）；沒給預期格時是 null
+    public double? OverlapRatio { get; set; }
 }
 
 /// <summary>Isaac Sim / URSim 不可用（沒開、連不上、讀不到 URSim 關節角）：實體手臂不動。</summary>

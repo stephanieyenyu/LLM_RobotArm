@@ -12,7 +12,7 @@ public static class SingleObjectTaskBuilder
     // Do not command hard contact with the lower block. Release this far above
     // the ideal stacked pose so RealSense/TCP calibration error cannot drive the
     // gripper or held block into the support and trigger a protective stop.
-    private const double StackReleaseClearanceM = 0.008;
+    internal const double StackReleaseClearanceM = 0.008;
     private const double MinX = 0.00;
     private const double MaxX = 0.65;
     private const double MinY = 0.00;

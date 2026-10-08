@@ -15,7 +15,9 @@ public sealed class SimulationImageJudge
     const string FigureAcceptance = "目標要求排出圖形（字母、形狀等）時，驗收條件是圖形排在桌面上空著的地方：組成圖形的物件要跟沒有用到的物件明顯分開，不能夾雜在其他物件之間，圖形要能單獨被辨認出來。";
     const string DotMatrixReading = "用積木排的字母或圖形像點陣字：每一格放一塊積木，同一個方向用固定格距排，格子之間的空隙不算斷開。";
     const string UprightReading = "立起來的圖形（往上疊的）以正面判讀：從 -Y 那側（相機畫面下方）水平看過去，往右是 +X、往上是 +Z，不能左右或上下顛倒。";
-    const string ImageNote = "附圖是 Isaac Sim 模擬（URSim 執行完這一批）結束時的畫面，模擬相機的位置與內參跟實體相機相同。";
+    // 驗證看的是模擬畫面（2026-10-08 起相機只在收到指令時用一次，同 main）：2D 看 Unity 模擬結束時的主相機畫面，3D 看 Isaac Sim 的畫面
+    public const string UnityImageNote = "附圖是 Unity 模擬（預覽）結束時主相機的畫面，不是相機照片；方塊位置是模擬算出的落點。";
+    public const string IsaacImageNote = "附圖是 Isaac Sim 模擬（URSim 執行完這一批）結束時的畫面，模擬相機的位置與內參跟實體相機相同。";
 
     readonly ChatClient client;
 
@@ -27,24 +29,29 @@ public sealed class SimulationImageJudge
     }
 
     /// <summary>回傳 LLM 的判定全文（第一行 PASS 或 FAIL）。prompt 與回覆存在 dir。</summary>
-    public async Task<string> JudgeAsync(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image, string dir)
+    public async Task<string> JudgeAsync(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image, string dir,
+        string? imageNote = null, string name = "isaac_judge")
     {
         string user = $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n" +
                       $"環境：{AxesFacts}{CoordinateDirections}{ObjectSizes}{FigureAcceptance}{DotMatrixReading}{UprightReading}\n" +
-                      (image == null ? "影像不可取得，證據不足，不能通過。" : ImageNote);
-        File.WriteAllText(Path.Combine(dir, "isaac_judge.system.txt"), SystemPrompt);
-        File.WriteAllText(Path.Combine(dir, "isaac_judge.user.txt"), user);
+                      (image == null ? "影像不可取得，證據不足，不能通過。" : imageNote ?? IsaacImageNote);
+        File.WriteAllText(Path.Combine(dir, name + ".system.txt"), SystemPrompt);
+        File.WriteAllText(Path.Combine(dir, name + ".user.txt"), user);
         var parts = new List<ChatMessageContentPart> { ChatMessageContentPart.CreateTextPart(user) };
-        if (image != null) parts.Add(ChatMessageContentPart.CreateImagePart(BinaryData.FromBytes(image), "image/jpeg"));
+        if (image != null) parts.Add(ChatMessageContentPart.CreateImagePart(BinaryData.FromBytes(image), ImageMediaType(image)));
         ChatCompletion completion = await client.CompleteChatAsync(new List<ChatMessage>
         {
             new SystemChatMessage(SystemPrompt),
             new UserChatMessage(parts),
         });
         string text = string.Concat(completion.Content.Select(p => p.Text));
-        File.WriteAllText(Path.Combine(dir, "isaac_judge.txt"), text);
+        File.WriteAllText(Path.Combine(dir, name + ".txt"), text);
         return text;
     }
+
+    // Unity 存的畫面是 PNG，相機與 Isaac 是 JPEG
+    static string ImageMediaType(byte[] image) =>
+        image.Length > 3 && image[0] == 0x89 && image[1] == 0x50 && image[2] == 0x4E && image[3] == 0x47 ? "image/png" : "image/jpeg";
 
     static string SceneText(List<SceneObject> scene) =>
         JsonSerializer.Serialize(scene.Select((item, index) => new { index, item }));

@@ -3,12 +3,12 @@ using System.IO;
 using System.Linq;
 using UnityEngine;
 
-// 一鍵切換純模擬 / 實機（UIManager 的「模式」按鈕；2026-10-07 從 main 搬來）。狀態存在 StreamingAssets/run_mode.json，
+// 一鍵切換純模擬 / 實機（UIManager 的「模式」按鈕）。狀態存在 StreamingAssets/run_mode.json，
 // csharp_server 每個任務開始時讀同一個檔（csharp_server/RunModeConfig.cs），整個任務都用那個模式：
-//   real（預設；沒有這個檔也是）：場景與照片來自相機（perception_server），動作送實體手臂。
-//   sim：場景與照片來自 Isaac Sim，任務開始時用虛擬場景檔（repo 的 sim_scenes/*.json）重建 Isaac 世界；
-//        csharp_server 把每一批、每一步都標 robot_target = "ursim"，只有 URSim 會動，Isaac 跟隨 URSim 做物理。
-//        不需要相機與 perception_server。
+//   real（預設；沒有這個檔也是）：場景與照片來自相機（perception_server），驗證通過的動作送實體手臂。
+//   sim：場景與照片來自 Isaac Sim（沒開 Isaac 時用 csharp_server 內建的虛擬世界），任務開始時用虛擬場景檔
+//        （repo 的 sim_scenes/*.json）重建場景，不需要相機與 perception_server。
+//        2D 只在 Unity 模擬驗證，不動 URSim；3D 的批次標 robot_target = "ursim"，只有 URSim 會動，Isaac 跟隨 URSim 做物理。
 // Unity 這邊依模式切換：SceneSyncer / perception mode 的網址、Unity 手臂跟隨的對象、手動控制按鈕連的手臂。
 // 切到純模擬或換場景的當下，SceneSyncer 先顯示場景檔的積木，同時把場景檔載入 Isaac（/sim/load）；
 // 任務開始時 csharp_server 仍依 reset_each_task 再載入一次。
@@ -18,7 +18,7 @@ public static class RunMode
     class Data
     {
         public string mode = "real";
-        public string scene = "sim_scenes/supply_cubes.json";
+        public string scene = "sim_scenes/yellow_cubes_15.json";   // 三個版本相同的兩個場景：yellow_cubes_15（預設）、domino_cube
         public bool reset_each_task = true;
         public string sim_perception_url = "http://localhost:6000/perception/";
     }
@@ -80,6 +80,15 @@ public static class RunMode
         {
             Debug.LogWarning($"[RunMode] 讀不懂 {FilePath}，Unity 先當實機模式：{ex.Message}");
             data = new Data();
+        }
+        // 場景檔換過名字或被刪掉（2026-10-08 起只剩兩個場景）：改回預設場景並存檔，csharp_server 讀到的也一致
+        if (!File.Exists(ScenePath))
+        {
+            string missing = data.scene;
+            data.scene = new Data().scene;
+            Debug.LogWarning($"[RunMode] 找不到虛擬場景檔 {missing}，改用預設的 {data.scene}");
+            try { Save(); }
+            catch (Exception ex) { Debug.LogWarning($"[RunMode] 寫不了 {FilePath}：{ex.Message}"); }
         }
     }
 
