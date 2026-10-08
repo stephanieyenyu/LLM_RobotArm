@@ -307,7 +307,8 @@ public class JsonExecutor : MonoBehaviour
     // Do not advance merely because a fixed delay elapsed.  Every motion is
     // confirmed against the UR secondary-interface feedback first.
     private const float MOTION_START_GRACE_SEC = 0.35f;
-    private const float MOTION_TIMEOUT_SEC = 180f;
+    // 每個動作等 UR 到位的上限：3 分鐘改 6 分鐘（2026-10-08，URSim 在 VirtualBox 慢速模式下只跑約一半速度）
+    private const float MOTION_TIMEOUT_SEC = 360f;
     private const float TCP_POSITION_TOLERANCE_M = 0.012f;
     private const float HOME_JOINT_TOLERANCE_RAD = 0.04f;
     private const float SAFETY_STABLE_SEC = 1f;
@@ -893,19 +894,21 @@ public class JsonExecutor : MonoBehaviour
         else
         {
             if (batch.skip_preview)
-                Debug.Log($"[Executor-preview] batch {batch.batch_id} 的軌跡在驗證批次已經預覽過，不再預覽，直接執行");
+                Debug.Log($"[Executor-preview] batch {batch.batch_id} 不在 Unity 預覽（2D 正式執行：前一批已在 Unity 模擬驗證過；"
+                          + "3D：由 Isaac Sim 驗證），直接執行");
             ReportSimulationCheckSkippedIfNeeded(batch, batch.skip_preview
-                ? "這批的軌跡在前一批已經預覽過，沒有再播模擬"
+                ? "這批不在 Unity 預覽（2D 正式執行已在前一批模擬驗證過；3D 由 Isaac Sim 驗證）"
                 : "previewBatchInUnityBeforeRobot 關閉，沒有播模擬，直接送實機");
         }
-        // 純模擬的 2D：預覽與 bitmap 比對通過就是執行完成，不連 URSim、也不連實體手臂；回報預覽結束時的方塊落點
+        // 2D 的 Unity 模擬驗證批次（preview_only）：預覽與比對做完就回報，不連 URSim、也不動實體手臂；回報預覽結束時的方塊落點，
+        // server 再讓 LLM 看主相機畫面，通過才送正式執行的批次（純模擬：通過就算執行完成）
         if (batch.preview_only)
         {
             if (robotArm != null) robotArm.followRealRobotFeedback = true;
             RobotArm.FreezeVisualFeedback = false;
             yield return StartCoroutine(SetPerceptionMode("idle"));
-            Debug.Log($"[Executor-preview] 純模擬：batch {batch.batch_id} 預覽與比對通過就是執行完成，" +
-                      $"{previewFinalBlocks?.Count ?? 0} 塊方塊照預覽落點回報給 csharp_server（不連 URSim 或實體手臂）");
+            Debug.Log($"[Executor-preview] batch {batch.batch_id} Unity 模擬驗證批次：預覽與比對通過，" +
+                      $"{previewFinalBlocks?.Count ?? 0} 塊方塊的預覽落點回報給 csharp_server（手臂沒有動）");
             WriteStepDone(batch.batch_id, true, null, 0f, previewFinalBlocks);
             yield break;
         }

@@ -1,0 +1,21 @@
+{
+  "description": "15 塊黃方塊排整齊（5 欄 × 3 排，中心間距 6 cm，X 0.08～0.32、Y 0.06～0.18）：全部在 rulebased 的供料區內、離手臂基座 0.19～0.43 m，夾爪下降時碰不到旁邊的方塊；右側的擺放區留空。三個版本的這個檔案完全相同。",
+  "objects": [
+    { "name": "yellow_cube", "shape": "cube", "x": 0.080, "y": 0.060, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.140, "y": 0.060, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.200, "y": 0.060, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.260, "y": 0.060, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.320, "y": 0.060, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.080, "y": 0.120, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.140, "y": 0.120, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.200, "y": 0.120, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.260, "y": 0.120, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.320, "y": 0.120, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.080, "y": 0.180, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.140, "y": 0.180, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.200, "y": 0.180, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.260, "y": 0.180, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.320, "y": 0.180, "z": 0.025, "orientation": null }
+  ],
+  "camera": null
+}

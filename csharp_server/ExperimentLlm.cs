@@ -89,9 +89,13 @@ public sealed class ExperimentLlm
             JsonSerializer.Serialize(translated, new JsonSerializerOptions { WriteIndented = true }));
         return Task.FromResult(translated);
     }
-    public Task<string> Validate(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image, string dir) => Call(
+    // 驗證看的是模擬畫面（2026-10-08 起相機只在任務開始拍一次）：2D 看 Unity 模擬結束時的主相機畫面，3D 看 Isaac Sim 的畫面
+    public const string UnityImageNote = "附圖是 Unity 模擬（預覽）結束時主相機的畫面，不是相機照片；方塊位置是模擬算出的落點。";
+    public const string IsaacImageNote = "附圖是 Isaac Sim 模擬（URSim 執行完這一批）結束時的畫面，模擬相機的位置與內參跟實體相機相同。";
+    public Task<string> Validate(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image, string dir,
+        string? imageNote = null, string name = "global_validation") => Call(
         "你是獨立的結果驗證者。只根據原始目標、初始場景及目前實際觀測判斷，不提供操作解法。檢查整體目標與局部幾何完整度（包含直線、連接與堆疊）。若目標要求平移、對齊、放置到座標或距離，實際結果與目標值在 0.02 m（2 公分）以內的量測誤差可接受，不得只因 2 公分內的座標偏差判定失敗；超過 2 公分或方向明顯錯誤才視為幾何未達標。沒有足夠觀測證據或目標含糊時不可通過。第一行僅寫 PASS 或 FAIL，後續自然語言描述觀測問題與不確定性。",
-        $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n環境：{AxesFacts}{CoordinateDirections}{ObjectSizes}{FigureAcceptance}{DotMatrixReading}{(TargetIs3D ? UprightReading : "")}\n" + (image == null ? "影像不可取得，證據不足，不能通過。" : SchematicImage ? SchematicImageNote : "附圖是目前實際相機畫面。"), image, dir, "global_validation");
+        $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n環境：{AxesFacts}{CoordinateDirections}{ObjectSizes}{FigureAcceptance}{DotMatrixReading}{(TargetIs3D ? UprightReading : "")}\n" + (image == null ? "影像不可取得，證據不足，不能通過。" : imageNote ?? (SchematicImage ? SchematicImageNote : "附圖是目前實際相機畫面。")), image, dir, name);
     // 反思只規定輸出格式，內容寫什麼完全由 LLM 自己判斷（2026-10-02 起）；設備能力與夾爪是事實，放在環境事實裡
     // 每輪操作數、每個操作函式數的上限不給（2026-10-07 起，規劃也一樣），超過時由轉譯失敗得知、訊息也不寫數字
     const string InterfaceFacts = "執行介面：設備只提供 source/target 與 move_above、descend、grasp、release、lift、wait（height_m 0.05～0.15 m、seconds 0.1～3；同一個操作內依序執行，中途不會重新感知），不提供任意 XY 偏移、條件分支或同輪失敗後續跑；每輪只能提交一條動作路徑。執行器會在收尾路徑安全時自動回 Ready/Home，否則留在最後的安全抬升位置。";
@@ -106,7 +110,7 @@ public sealed class ExperimentLlm
         File.WriteAllText(Path.Combine(dir, name + ".system.txt"), system);
         File.WriteAllText(Path.Combine(dir, name + ".user.txt"), user);
         var parts = new List<ChatMessageContentPart> { ChatMessageContentPart.CreateTextPart(user) };
-        if (image != null) parts.Add(ChatMessageContentPart.CreateImagePart(BinaryData.FromBytes(image), "image/jpeg"));
+        if (image != null) parts.Add(ChatMessageContentPart.CreateImagePart(BinaryData.FromBytes(image), ImageMediaType(image)));
         Console.WriteLine($"[LLM] {name}…（API 無逾時限制，等待回覆）");
         using var progress = new CancellationTokenSource();
         Task reporter = ReportProgress(name, progress.Token);
@@ -126,6 +130,10 @@ public sealed class ExperimentLlm
         File.WriteAllText(Path.Combine(dir, name + ".usage.json"), JsonSerializer.Serialize(completion.Usage));
         return text;
     }
+
+    // Unity 存的畫面是 PNG，相機與 Isaac 是 JPEG
+    static string ImageMediaType(byte[] image) =>
+        image.Length > 3 && image[0] == 0x89 && image[1] == 0x50 && image[2] == 0x4E && image[3] == 0x47 ? "image/png" : "image/jpeg";
 
     static async Task ReportProgress(string name, CancellationToken cancellationToken)
     {
