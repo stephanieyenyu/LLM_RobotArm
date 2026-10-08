@@ -179,21 +179,28 @@ Check(Near(overlapping.Values.Max(), 0.050) && Near(overlapping.Values.Min(), 0.
 var fingerRoot = LayeredGraspGeometry.FingerRoot(new[] { 0.1, 0.2, 0.3 }, new[] { 0.1, 0.2, 0.006 });
 Check(Near(fingerRoot[0], 0.1) && Near(fingerRoot[1], 0.2) && Near(fingerRoot[2], 0.036), "finger root is 30 mm up the tool axis from the fingertip");
 // 一鍵切換純模擬 / 實機（Unity 寫 run_mode.json，csharp_server 每個任務讀一次）
-var modeDir = Path.Combine(Path.GetTempPath(), "robot_mode_" + Guid.NewGuid().ToString("N"));
+// 暫存資料夾照 repo 的結構擺（StreamingAssets 往上三層是 repo 根目錄），不動到真正的 run_mode.json
+var modeRoot = Path.Combine(Path.GetTempPath(), "robot_mode_" + Guid.NewGuid().ToString("N"));
+var modeDir = Path.Combine(modeRoot, "unity_project", "Assets", "StreamingAssets");
 Directory.CreateDirectory(modeDir);
+Directory.CreateDirectory(Path.Combine(modeRoot, "sim_scenes"));
+File.WriteAllText(Path.Combine(modeRoot, "sim_scenes", "domino_cube.json"), "{}");
 Check(!RunModeConfig.Load(modeDir).IsSim, "no run_mode.json means real hardware, exactly as before");
 File.WriteAllText(Path.Combine(modeDir, RunModeConfig.FileName),
-    "{\"mode\": \"sim\", \"scene\": \"sim_scenes/letter_blocks.json\", \"reset_each_task\": false, \"sim_perception_url\": \"http://localhost:6000/perception/\"}");
+    "{\"mode\": \"sim\", \"scene\": \"sim_scenes/domino_cube.json\", \"reset_each_task\": false, \"sim_perception_url\": \"http://localhost:6000/perception/\"}");
 var simMode = RunModeConfig.Load(modeDir);
-Check(simMode.IsSim && simMode.Scene == "sim_scenes/letter_blocks.json" && !simMode.ResetEachTask,
+Check(simMode.IsSim && simMode.Scene == "sim_scenes/domino_cube.json" && !simMode.ResetEachTask,
       "the file Unity writes (including its extra url field) selects simulation and the scene");
+File.WriteAllText(Path.Combine(modeDir, RunModeConfig.FileName), "{\"mode\": \"sim\", \"scene\": \"sim_scenes/letter_blocks.json\"}");
+Check(RunModeConfig.Load(modeDir).Scene == RunModeConfig.DefaultScene,
+      "a scene file that no longer exists falls back to the default scene instead of stopping the task");
 File.WriteAllText(Path.Combine(modeDir, RunModeConfig.FileName), "{\"mode\": \"simulation\"}");
 bool rejected = false;
 try { RunModeConfig.Load(modeDir); } catch (InvalidDataException) { rejected = true; }
 Check(rejected, "an unknown mode is refused instead of guessed (a wrong guess could move the real arm)");
 var repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../.."));
 var streamingAssets = Path.Combine(repoRoot, "unity_project", "Assets", "StreamingAssets");
-foreach (var sceneFile in new[] { "two_cubes", "letter_blocks", "domino_cubes" })
+foreach (var sceneFile in new[] { "yellow_cubes_15", "domino_cube" })
 {
     var config = new RunModeConfig { Mode = "sim", Scene = $"sim_scenes/{sceneFile}.json" };
     var simScene = SimScene.Load(config.ScenePath(streamingAssets));
@@ -203,6 +210,12 @@ foreach (var sceneFile in new[] { "two_cubes", "letter_blocks", "domino_cubes" }
           cameraJson.TryGetProperty("intrinsics", out _) && cameraJson.TryGetProperty("pose_in_qr", out _),
           $"{sceneFile}.json without a camera gets the lab camera from sim_scenes/camera/default.json");
 }
+var defaultScene = SimScene.Load(new RunModeConfig { Mode = "sim" }.ScenePath(streamingAssets));
+Check(defaultScene.Objects.Count == 15 && defaultScene.Objects.All(o => o.Name == "yellow_cube"),
+      "the default virtual scene is 15 yellow cubes (same file in all three versions)");
+var dominoScene = SimScene.Load(new RunModeConfig { Mode = "sim", Scene = "sim_scenes/domino_cube.json" }.ScenePath(streamingAssets));
+Check(dominoScene.Objects.Count == 2 && dominoScene.Objects.Count(o => o.Shape == "domino") == 1 && dominoScene.Objects.Count(o => o.Shape == "cube") == 1,
+      "the other virtual scene is one domino and one cube");
 var badScene = new List<SceneObject> {
     new() { Name = "cup", Shape = "cube", X = 0.2, Y = 0.1, Z = 0.025 },
     new() { Name = "yellow_cube", Shape = "cube", X = 0.2, Y = 0.1, Z = 0 },

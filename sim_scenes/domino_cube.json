@@ -1,0 +1,8 @@
+{
+  "description": "一塊黃 domino（橫放，長邊沿 X）和一塊黃方塊，都在 rulebased 的供料區內、手臂夾得到；右側的擺放區留空。三個版本的這個檔案完全相同。",
+  "objects": [
+    { "name": "yellow_domino", "shape": "domino", "x": 0.200, "y": 0.100, "z": 0.025, "orientation": "horizontal" },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.120, "y": 0.180, "z": 0.025, "orientation": null }
+  ],
+  "camera": null
+}

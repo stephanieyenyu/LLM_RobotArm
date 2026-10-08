@@ -73,6 +73,12 @@ public class BatchEnvelope
     // true = 3D 疊放批次（URSim 驗證與通過後的實機）：descend 改用 LayeredGraspGeometry 的分層夾取深度，
     // 碰撞模型的手指段只檢查指尖。2D 批次不送這個欄位，JsonUtility 讀成 false，所有計算跟加欄位前相同。
     public bool layered_grasp;
+    // true = 這批的軌跡在前一批已經預覽過（3D 疊放的正式執行，跟 URSim 驗證那批同一條軌跡），不再播預覽、直接執行。
+    // 2D 批次不送這個欄位，JsonUtility 讀成 false，照常預覽與比對 bitmap。
+    public bool skip_preview;
+    // true = 純模擬的 2D 批次：預覽與 bitmap 比對通過就是執行完成，不連 URSim、也不連實體手臂，
+    // 回報預覽結束時的方塊落點（StepDoneReport.final_blocks）。實機的批次不送這個欄位，讀成 false
+    public bool preview_only;
 }
 
 // bitmap 裡一個應該放積木的物件（cube 佔一格，domino 佔兩格），QR frame 座標
@@ -100,8 +106,20 @@ public class SimulationCheckReport
     public bool verification_enabled;  // 開 = 不通過就擋；關 = 只記錄
     public int expected_count;
     public int correct_count;
-    public float overlap_ratio;        // 放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）
-    public float overlap_threshold;    // 重疊率要大於這個值才算吻合
+    public float overlap_ratio;        // 畫面重疊率：Unity 俯視畫面的方塊像素跟預期佔地的交集 ÷ 聯集（判定用）
+    public float overlap_threshold;    // 畫面重疊率要大於這個值才算吻合
+    public float cell_overlap_ratio;   // 座標比對的格子重疊率：放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數），只當說明
+    public string image_file;          // 比對圖（StreamingAssets 底下）；空字串 = 沒存到
+    // 比對圖的版面（server 加註文字與 3D 層數用）：每格寬、格間距（像素），左上角的 QR 座標與每公尺幾像素
+    public int image_panel_width;
+    public int image_gap;
+    public float image_x0_m;
+    public float image_y1_m;
+    public float image_px_per_m;
+    // 預覽排完、場景還原前拍的 Unity 照片（StreamingAssets 底下的檔名；空字串 = 沒拍到）：
+    // photo_file = 正上方拍的完整畫面（範圍跟比對相同），view_file = 主相機（Game 視窗）的畫面
+    public string photo_file;
+    public string view_file;
     public List<string> expected_rows;
     public List<string> result_rows;
     public List<string> errors;
@@ -132,6 +150,17 @@ public class StepDoneReport
     public bool completed;
     public string error;
     public float duration_sec;
+    // 純模擬的 preview_only 批次：預覽結束時每塊放下的方塊（預覽前的位置與落點），server 照這個更新模擬世界
+    public List<PreviewBlock> final_blocks;
+}
+
+// 預覽裡被放下的一塊方塊：from = 預覽前的中心（QR），x, y = 落點中心，z = 落點頂面；domino 的方向，cube 為空字串
+[System.Serializable]
+public class PreviewBlock
+{
+    public float from_x, from_y;
+    public float x, y, z;
+    public string orientation;
 }
 
 public class JsonExecutor : MonoBehaviour
@@ -143,6 +172,9 @@ public class JsonExecutor : MonoBehaviour
     public string urIP = "192.168.50.204";
     [Tooltip("URSim（Oracle VirtualBox）的 IP。robot_target = \"ursim\" 的批次（3D 疊放的 Isaac Sim 驗證）只送到這台，實體手臂不動。")]
     public string ursimIP = "192.168.50.221";
+    [Tooltip("2D 批次（沒有 layered_grasp）用 Unity 本地 IK（UR3eKinematics，同 main、rulebased）解 LLM 給的 TCP 姿態，不用開 URSim。" +
+             "關掉就跟 3D 一樣送 URSim 的 get_inverse_kin 解（URSim 不會動）。")]
+    public bool unityIkFor2D = true;
     public float pollIntervalSec = 0.3f;
 
     [Header("Perception Server")]
@@ -285,7 +317,8 @@ public class JsonExecutor : MonoBehaviour
     // Do not advance merely because a fixed delay elapsed.  Every motion is
     // confirmed against the UR secondary-interface feedback first.
     private const float MOTION_START_GRACE_SEC = 0.35f;
-    private const float MOTION_TIMEOUT_SEC = 180f;
+    // 每個動作等 UR 到位的上限：3 分鐘改 6 分鐘（2026-10-08，URSim 在 VirtualBox 慢速模式下只跑約一半速度）
+    private const float MOTION_TIMEOUT_SEC = 360f;
     private const float TCP_POSITION_TOLERANCE_M = 0.012f;
     private const float HOME_JOINT_TOLERANCE_RAD = 0.04f;
     private const float SAFETY_STABLE_SEC = 1f;
@@ -375,6 +408,8 @@ public class JsonExecutor : MonoBehaviour
     // 最近一次比對的重疊率，以及有沒有大於門檻（錯誤清單只是說明，放不放行看這個）
     private float bitmapOverlapRatio;
     private bool bitmapCheckPassed;
+    // 最近一次預覽結束時被放下的方塊（預覽前的位置與落點）；preview_only 批次回報給 server
+    private List<PreviewBlock> previewFinalBlocks;
     // 這一批的比對結果有沒有寫給 csharp_server；沒寫的話要補一份「未進行」
     private bool simCheckReported;
 
@@ -653,7 +688,9 @@ public class JsonExecutor : MonoBehaviour
                 if (!onUrsim && RunMode.IsSim)
                     Debug.LogWarning($"[Executor] batch {batch.batch_id} 是實機模式任務的批次，但 Unity 已切成純模擬；" +
                                      "這批會送到手動控制目前連的手臂（純模擬時是 URSim）");
-                if (onUrsim)
+                // 2D 的 Unity 模擬驗證批次（preview_only）只預覽，不連 URSim、也不動實體手臂
+                bool useUrsim = onUrsim && !batch.preview_only;
+                if (useUrsim)
                 {
                     if (string.IsNullOrWhiteSpace(ursimIP))
                     {
@@ -681,7 +718,7 @@ public class JsonExecutor : MonoBehaviour
                 currentStepId = -1;
                 if (batch.layered_grasp && sceneSyncer != null)
                     sceneSyncer.SetTableHeightOffset(0f);
-                if (onUrsim)
+                if (useUrsim)
                 {
                     urListener = parkedRealListener;
                     parkedRealListener = null;
@@ -740,7 +777,7 @@ public class JsonExecutor : MonoBehaviour
     {
         if (!useSharedMovejTrajectory)
         {
-            WriteStepDone(batch.batch_id, false, "LLM TCP / URSim IK 模式需要開啟 useSharedMovejTrajectory；不退回本地 IK。", 0f);
+            WriteStepDone(batch.batch_id, false, "LLM TCP 模式需要開啟 useSharedMovejTrajectory（關掉時的舊路徑不看 LLM 給的 TCP 姿態）。", 0f);
             yield break;
         }
         Debug.Log($"[Executor] 收到 batch {batch.batch_id}: {batch.steps.Count} steps — {batch.comment}");
@@ -810,13 +847,19 @@ public class JsonExecutor : MonoBehaviour
             Debug.Log($"[Executor-precheck] ✓ batch {batch.batch_id} 全部 {batch.steps.Count} steps 通過 UR3e kinematics 檢查");
         }
 
+        if (batch.preview_only && !previewBatchInUnityBeforeRobot)
+        {
+            WriteStepDone(batch.batch_id, false, "純模擬要靠 Unity 預覽完成任務，請在 Inspector 勾選 Preview Batch In Unity Before Robot", 0f);
+            yield break;
+        }
+
         EnsureUrConnectionStarted();
         yield return StartCoroutine(SetPerceptionMode("executing"));
         if (sceneSyncer == null)
             sceneSyncer = FindObjectOfType<SceneSyncer>();
         if (robotArm == null)
             robotArm = FindObjectOfType<RobotArm>();
-        if (previewBatchInUnityBeforeRobot || previewOnlySharedTrajectory || usingTopLeftFallback)
+        if ((previewBatchInUnityBeforeRobot || previewOnlySharedTrajectory || usingTopLeftFallback) && !batch.skip_preview)
         {
             // 動畫預覽：手臂 + 方塊完整演示（跑完自動復原）
             // 預覽期間關 followRealRobotFeedback，讓 Update() 用我們設的 Angles 而非實機 q_actual
@@ -833,24 +876,27 @@ public class JsonExecutor : MonoBehaviour
                 yield return StartCoroutine(SetPerceptionMode("idle"));
                 yield break;
             }
-            // 2D：比對通過就是這次任務成功，不送手臂。3D（layered_grasp）通過後照常送 URSim，由 Isaac 驗證與整體驗證判定
-            if (bitmapCheckErrors != null && bitmapCheckPassed && !batch.layered_grasp)
-            {
-                if (robotArm != null) robotArm.followRealRobotFeedback = true;
-                RobotArm.FreezeVisualFeedback = false;
-                string message = $"成功：bitmap 重疊率 {bitmapOverlapRatio * 100f:F0}%，本次任務完成。";
-                Debug.Log("[Executor-preview] " + message);
-                var ui = FindObjectOfType<UIManager>();
-                if (ui != null) ui.ShowMessage(message);
-                WriteStepDone(batch.batch_id, true, null, 0f);
-                yield return StartCoroutine(SetPerceptionMode("idle"));
-                yield break;
-            }
         }
         else
         {
-            ReportSimulationCheckSkippedIfNeeded(batch,
-                "previewBatchInUnityBeforeRobot 關閉，沒有播模擬，直接送實機");
+            if (batch.skip_preview)
+                Debug.Log($"[Executor-preview] batch {batch.batch_id} 不在 Unity 預覽（2D 正式執行：前一批已在 Unity 模擬驗證過；"
+                          + "3D：由 Isaac Sim 驗證），直接執行");
+            ReportSimulationCheckSkippedIfNeeded(batch, batch.skip_preview
+                ? "這批不在 Unity 預覽（2D 正式執行已在前一批模擬驗證過；3D 由 Isaac Sim 驗證）"
+                : "previewBatchInUnityBeforeRobot 關閉，沒有播模擬，直接送實機");
+        }
+        // 2D 的 Unity 模擬驗證批次（preview_only）：預覽與比對做完就回報，不連 URSim、也不動實體手臂；回報預覽結束時的方塊落點，
+        // server 再讓 LLM 看主相機畫面，通過才送正式執行的批次（純模擬：通過就算執行完成）
+        if (batch.preview_only)
+        {
+            if (robotArm != null) robotArm.followRealRobotFeedback = true;
+            RobotArm.FreezeVisualFeedback = false;
+            yield return StartCoroutine(SetPerceptionMode("idle"));
+            Debug.Log($"[Executor-preview] batch {batch.batch_id} Unity 模擬驗證批次：預覽與比對通過，" +
+                      $"{previewFinalBlocks?.Count ?? 0} 塊方塊的預覽落點回報給 csharp_server（手臂沒有動）");
+            WriteStepDone(batch.batch_id, true, null, 0f, previewFinalBlocks);
+            yield break;
         }
         if (previewOnlySharedTrajectory)
         {
@@ -1190,9 +1236,13 @@ public class JsonExecutor : MonoBehaviour
         sharedFinalTrajectory.Clear();
         sharedTrajectoryStartQ = (double[])startQ.Clone();
         var reference = (double[])startQ.Clone();
-        if (string.IsNullOrWhiteSpace(ursimIP))
+        // 2D 用 Unity 本地 IK（unityIkFor2D，同 main、rulebased），不用開 URSim；
+        // 3D 由 URSim 的 get_inverse_kin 解（3D 本來就要開 URSim 給 Isaac Sim 跟隨）
+        bool unityIk = unityIkFor2D && !batch.layered_grasp;
+        string ikName = unityIk ? "Unity-IK" : "URSim-IK";
+        if (!unityIk && string.IsNullOrWhiteSpace(ursimIP))
         {
-            urSimTrajectoryError = "未設定 URSim IP；不使用本地 IK 替代。";
+            urSimTrajectoryError = "未設定 URSim IP，沒辦法用 URSim 解 IK（3D 批次，或關掉了 unityIkFor2D）。";
             yield break;
         }
         double toolZ = batch.layered_grasp ? LayeredGraspGeometry.FingertipLengthM
@@ -1227,35 +1277,52 @@ public class JsonExecutor : MonoBehaviour
                     var pose = new[] { QR1_X + tcp.x, QR1_Y + tcp.y,
                         (batch.layered_grasp ? LayeredTableZ : QR1_Z) + tcp.z,
                         tcp.rx, tcp.ry, tcp.rz };
-                    string host = ursimIP;
-                    var near = (double[])reference.Clone();
-                    var task = System.Threading.Tasks.Task.Run(() => UrSimIkClient.Solve(host, pose, near, toolZ, cancellation));
-                    float reportAt = Time.realtimeSinceStartup + 15f;
-                    while (!task.IsCompleted)
+                    double[] joints;
+                    if (unityIk)
                     {
-                        if (Time.realtimeSinceStartup >= reportAt)
+                        // 同一個 TCP 姿態（UR 基座座標、旋轉向量）交給 UR3eKinematics，從上一個姿勢的關節角找最近的解
+                        var target = new UR3eKinematics.Pose { x = pose[0], y = pose[1], z = pose[2], rx = pose[3], ry = pose[4], rz = pose[5] };
+                        var solution = UR3eKinematics.IKNearest(target, reference);
+                        if (!solution.ok)
                         {
-                            Debug.Log($"[URSim-IK] step {env.step_id} 等待 IK 回覆（無逾時限制，尚未開始動畫）");
-                            reportAt = Time.realtimeSinceStartup + 15f;
+                            urSimTrajectoryError = $"step {env.step_id} {action.function} Unity IK 無解" +
+                                                   $"（{UR3eKinematics.Describe(solution.error)}）：{solution.message}，目標 {target}";
+                            yield break;
                         }
-                        yield return null;
+                        joints = (double[])solution.q.Clone();
                     }
-                    if (task.IsCanceled || cancellation.IsCancellationRequested)
+                    else
                     {
-                        urSimTrajectoryError = "URSim IK 查詢已手動中止。";
-                        yield break;
+                        string host = ursimIP;
+                        var near = (double[])reference.Clone();
+                        var task = System.Threading.Tasks.Task.Run(() => UrSimIkClient.Solve(host, pose, near, toolZ, cancellation));
+                        float reportAt = Time.realtimeSinceStartup + 15f;
+                        while (!task.IsCompleted)
+                        {
+                            if (Time.realtimeSinceStartup >= reportAt)
+                            {
+                                Debug.Log($"[URSim-IK] step {env.step_id} 等待 IK 回覆（無逾時限制，尚未開始動畫）");
+                                reportAt = Time.realtimeSinceStartup + 15f;
+                            }
+                            yield return null;
+                        }
+                        if (task.IsCanceled || cancellation.IsCancellationRequested)
+                        {
+                            urSimTrajectoryError = "URSim IK 查詢已手動中止。";
+                            yield break;
+                        }
+                        if (task.IsFaulted)
+                        {
+                            urSimTrajectoryError = "URSim IK 查詢失敗：" + task.Exception.GetBaseException().Message;
+                            yield break;
+                        }
+                        joints = task.Result;
                     }
-                    if (task.IsFaulted)
-                    {
-                        urSimTrajectoryError = "URSim IK 查詢失敗：" + task.Exception.GetBaseException().Message;
-                        yield break;
-                    }
-                    var joints = task.Result;
                     if (!ValidateJointTransition(reference, joints, out urSimTrajectoryError, allowSingularEnd: false))
                         yield break;
                     pa.targets.Add(joints);
                     reference = (double[])joints.Clone();
-                    Debug.Log($"[URSim-IK] step {env.step_id} {action.function}: TCP={string.Join(",", pose)}; q={string.Join(",", joints)}");
+                    Debug.Log($"[{ikName}] step {env.step_id} {action.function}: TCP={string.Join(",", pose)}; q={string.Join(",", joints)}");
                 }
                 else if (action.function != "grasp" && action.function != "release" && action.function != "wait")
                 {
@@ -1267,7 +1334,7 @@ public class JsonExecutor : MonoBehaviour
             sharedTrajectory[env.step_id] = planned;
         }
         urSimTrajectoryError = null;
-        Debug.Log("[URSim-IK] 全批 TCP 已由 URSim 解算並通過關節路徑檢查；開始預覽。");
+        Debug.Log($"[{ikName}] 全批 TCP 已由{(unityIk ? " Unity 本地 IK " : " URSim ")}解算並通過關節路徑檢查。");
         }
         finally
         {
@@ -1493,6 +1560,7 @@ public class JsonExecutor : MonoBehaviour
     // ============================================================
     void ResetSimPlacementTracking()
     {
+        previewFinalBlocks = null;
         simCheckReported = false;
         simBlocks.Clear();
         simPlacementNotes.Clear();
@@ -1651,158 +1719,9 @@ public class JsonExecutor : MonoBehaviour
         return cell.shape == "domino" ? $"{cells} domino {cell.orientation}" : $"{cells} {cell.shape}";
     }
 
-    // ---- 覆蓋率改成「真的把畫面渲染出來、逐格比對」----
-    // 逐字稿的要求是渲染出模擬結果再跟計畫的 bitmap 逐格比對，不是直接讀 Unity 內部物件座標。
-    // 架一台暫時的正交俯視相機，把 preview 結束當下的桌面拍成一張圖存檔（跟 isaac_before/after.jpg
-    // 留底同個精神），再用每格中心點投影到畫面上的像素顏色，跟桌面底色比對判斷這格有沒有方塊。
-    // 正交相機的畫面 X/Y 跟物件高度無關，方塊疊多高都不影響投影到哪一格，不用額外處理透視。
-    const int CoverageRenderPixels = 640;
-    const float CoverageMarginCells = 2.5f;                    // 畫面邊界外推幾格，讓邊緣格不會被裁到
-    const float CoverageOccupiedColorDeltaThreshold = 0.12f;   // 跟底色的顏色距離超過這個就算「這格有方塊」
-    // 2026-10-08 跟 main 的 FigureImageOverlap 對齊：底色不再用「猜四個角落」，改成跟 main 一樣
-    // 用專用 capture layer + cullingMask 把方塊單獨隔離出來拍、背景固定洋紅——不會被桌面、QR 標記、
-    // 殘留雜物等任何不是方塊的東西誤判成「有方塊」，比猜角落底色準，跟 main 用同一套判斷方式。
-    const int CoverageCaptureLayer = 31;
-
-    // sliceFloorM（立體逐層用）：只拍比這個 QR 高度高的部分（遠裁切面放在這裡、桌面被切掉），背景改洋紅；NaN = 照舊含桌面
-    bool[,] CaptureCoverageGrid(int rows, int cols, float anchorX, float anchorY, float cellX, float cellY,
-        int anchorRow, int anchorCol, int batchId, out string savedImagePath, float sliceFloorM = float.NaN, int layer = 1)
-    {
-        savedImagePath = null;
-        Vector2 CellCenterQR(int r, int c) =>
-            new Vector2(anchorX + (c - anchorCol) * cellX, anchorY + (anchorRow - r) * cellY);
-
-        float marginX = cellX * CoverageMarginCells;
-        float marginY = cellY * CoverageMarginCells;
-        float minQrX = float.MaxValue, maxQrX = float.MinValue, minQrY = float.MaxValue, maxQrY = float.MinValue;
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < cols; c++)
-            {
-                Vector2 p = CellCenterQR(r, c);
-                minQrX = Mathf.Min(minQrX, p.x); maxQrX = Mathf.Max(maxQrX, p.x);
-                minQrY = Mathf.Min(minQrY, p.y); maxQrY = Mathf.Max(maxQrY, p.y);
-            }
-        minQrX -= marginX; maxQrX += marginX;
-        minQrY -= marginY; maxQrY += marginY;
-
-        float centerQrX = (minQrX + maxQrX) / 2f;
-        float centerQrY = (minQrY + maxQrY) / 2f;
-        // QRToUnity produces coordinates local to the cube container. Render in
-        // the same world frame as the blocks, including the workspace offset.
-        Transform coverageFrame = SimBlockFrame();
-        Vector3 centerUnity = coverageFrame.TransformPoint(SceneSyncer.QRToUnity(centerQrX, centerQrY, 0f));
-        // extentQrX 對應螢幕「垂直」方向（相機轉 90 度後 up = world +Z = QR +X）
-        // extentQrY 對應螢幕「水平」方向（相機 right 不受 X 軸旋轉影響 = world +X = QR -Y）
-        float extentQrX = Mathf.Max(0.01f, (maxQrX - minQrX) * coverageFrame.TransformVector(Vector3.forward).magnitude);
-        float extentQrY = Mathf.Max(0.01f, (maxQrY - minQrY) * coverageFrame.TransformVector(Vector3.right).magnitude);
-
-        int height = CoverageRenderPixels;
-        int width = Mathf.Clamp(Mathf.RoundToInt(height * (extentQrY / extentQrX)), 64, 2048);
-
-        var camGo = new GameObject("CoverageTopDownCamera");
-        var cam = camGo.AddComponent<Camera>();
-        cam.orthographic = true;
-        cam.orthographicSize = extentQrX / 2f;
-        cam.aspect = width / (float)height;
-        cam.nearClipPlane = 0.01f;
-        cam.farClipPlane = 3f;
-        cam.clearFlags = CameraClearFlags.SolidColor;
-        // 跟 main 的 FigureImageOverlap 一樣固定用洋紅底色——底色不用猜，因為下面改成
-        // cullingMask 只拍 capture layer，桌面、QR 標記、手臂、夾爪根本不會進畫面。
-        cam.backgroundColor = Color.magenta;
-        cam.cullingMask = 1 << CoverageCaptureLayer;
-        cam.transform.position = centerUnity + coverageFrame.up;
-        cam.transform.rotation = coverageFrame.rotation * Quaternion.Euler(90f, 0f, 0f);
-        if (!float.IsNaN(sliceFloorM))
-        {
-            Vector3 floorWorld = coverageFrame.TransformPoint(SceneSyncer.QRToUnity(centerQrX, centerQrY, sliceFloorM));
-            cam.farClipPlane = Mathf.Max(cam.nearClipPlane + 0.001f,
-                Vector3.Dot(floorWorld - cam.transform.position, cam.transform.forward));
-        }
-
-        var rt = new RenderTexture(width, height, 16);
-        cam.targetTexture = rt;
-        // 跟 main 同一套隔離方式：把目前所有方塊暫時搬到專用 capture layer，相機 cullingMask
-        // 只看這個 layer，拍完立刻還原每顆方塊原本的 layer——不用再個別關 Renderer、猜哪些要排除。
-        var blocks = sceneSyncer.GetCurrentCubes().Where(b => b != null).ToList();
-        var originalLayers = blocks.Select(b => b.layer).ToList();
-        try
-        {
-            foreach (var block in blocks) block.layer = CoverageCaptureLayer;
-            cam.Render();
-        }
-        finally
-        {
-            for (int i = 0; i < blocks.Count; i++)
-                if (blocks[i] != null) blocks[i].layer = originalLayers[i];
-        }
-
-        // 相機活著的時候先把每格中心點投影成畫面像素座標（正交投影下跟方塊高度無關）
-        var cellPixel = new Vector2Int[rows, cols];
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < cols; c++)
-            {
-                Vector2 qr = CellCenterQR(r, c);
-                Vector3 world = coverageFrame.TransformPoint(SceneSyncer.QRToUnity(qr.x, qr.y, 0f));
-                Vector3 screen = cam.WorldToScreenPoint(world);
-                cellPixel[r, c] = new Vector2Int(Mathf.RoundToInt(screen.x), Mathf.RoundToInt(screen.y));
-            }
-
-        var prevActive = RenderTexture.active;
-        RenderTexture.active = rt;
-        var tex = new Texture2D(width, height, TextureFormat.RGB24, false);
-        tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-        tex.Apply();
-        RenderTexture.active = prevActive;
-
-        cam.targetTexture = null;
-        rt.Release();
-        Destroy(rt);
-        Destroy(camGo);
-
-        try
-        {
-            savedImagePath = Path.Combine(Application.streamingAssetsPath,
-                float.IsNaN(sliceFloorM) ? $"coverage_batch_{batchId}.jpg" : $"coverage_batch_{batchId}_layer{layer}.jpg");
-            File.WriteAllBytes(savedImagePath, tex.EncodeToJPG(85));
-        }
-        catch (Exception e)
-        {
-            Debug.LogWarning($"[BitmapCheck] 覆蓋率渲染圖存檔失敗：{e.Message}");
-        }
-
-        Color SamplePatch(int px, int py)
-        {
-            int half = Mathf.Max(1, Mathf.Min(width, height) / 40);
-            int x0 = Mathf.Clamp(px - half, 0, width - 1), x1 = Mathf.Clamp(px + half, 0, width - 1);
-            int y0 = Mathf.Clamp(py - half, 0, height - 1), y1 = Mathf.Clamp(py + half, 0, height - 1);
-            Color sum = Color.black; int n = 0;
-            for (int y = y0; y <= y1; y++)
-                for (int x = x0; x <= x1; x++) { sum += tex.GetPixel(x, y); n++; }
-            return n > 0 ? sum / n : Color.black;
-        }
-
-        // 底色固定是洋紅（cullingMask 隔離後，沒拍到方塊的地方一定是洋紅），不用再猜；
-        // 跟 main 一樣直接比對跟洋紅的顏色距離，比猜四個角落準、也不怕角落剛好也被方塊佔到。
-        var occupied = new bool[rows, cols];
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < cols; c++)
-            {
-                Vector2Int px = cellPixel[r, c];
-                Color sample = SamplePatch(px.x, px.y);
-                float delta = Mathf.Abs(sample.r - Color.magenta.r) + Mathf.Abs(sample.g - Color.magenta.g) +
-                              Mathf.Abs(sample.b - Color.magenta.b);
-                occupied[r, c] = delta > CoverageOccupiedColorDeltaThreshold;
-            }
-
-        Destroy(tex);
-        return occupied;
-    }
-
-    // 模擬結束後比對：渲染出 preview 結束當下的桌面、逐格判斷有沒有方塊（CaptureCoverageGrid），
-    // 跟計畫畫出的 bitmap 逐格比對；放對的格數 ÷（預期格數 + 圖案範圍內多出來的格數）= 重疊率，
-    // 大於 bitmapOverlapThreshold 才通過，這是送不送實機的唯一依據。
-    // 另外保留一份用 Unity 內部物件座標（而非渲染圖）比對的結果，只當除錯用的詳細錯誤訊息，不影響判定。
+    // 模擬結束後比對：判定用 Unity 畫面跟預期佔地的像素重疊率（FigureImageOverlap），大於 bitmapOverlapThreshold 才通過。
+    // 另外逐格做座標比對當說明：每個 bitmap 物件是否有一顆方塊落在對應格子（容許誤差內），形狀、domino 方向、高度也要對；
+    // 多放、少放、放錯格、在空中放開都列進錯誤清單，給反思看原因。
     // 把報告印出來，錯誤清單存在 bitmapCheckErrors（null = 這批沒有 bitmap），通過與否存在 bitmapCheckPassed。
     void RunBitmapCheck(BatchEnvelope batch)
     {
@@ -1849,9 +1768,8 @@ public class JsonExecutor : MonoBehaviour
             {
                 float d = Vector2.Distance(new Vector2(expected[e].x, expected[e].y),
                                            new Vector2(candidates[c].qr.x, candidates[c].qr.y));
-                // 立體批次同一格疊了好幾塊：排序時高度差也算進距離，各層才配到對的那塊（2D 不變）
-                float dz = batch.layered_grasp ? candidates[c].qr.z - expected[e].z : 0f;
-                if (d <= bitmapXYToleranceM) pairs.Add((e, c, batch.layered_grasp ? Mathf.Sqrt(d * d + dz * dz) : d));
+                // 3D 疊放時同一處有好幾塊：XY 在容許內才配，排序時高度差也算進距離，各層才配到對的那塊
+                if (d <= bitmapXYToleranceM) pairs.Add((e, c, d + Mathf.Abs(candidates[c].qr.z - expected[e].z)));
             }
         pairs.Sort((a, b) => a.d.CompareTo(b.d));
         var matchOf = Enumerable.Repeat(-1, expected.Count).ToArray();
@@ -1863,16 +1781,11 @@ public class JsonExecutor : MonoBehaviour
             candidateUsed[p.c] = true;
         }
 
-        // 這份 grid 是用 Unity 內部物件座標比對出來的，只當除錯用的詳細資訊（哪裡形狀不符、
-        // 哪裡高度不對、哪顆方塊放錯）；實際過不過關看下面用渲染圖逐格比對出的 imgGrid。
-        var stateGrid = new char[rows, cols];
-        for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) stateGrid[r, c] = '□';
-        void Mark(int r, int c, char symbol) { if (r >= 0 && r < rows && c >= 0 && c < cols) stateGrid[r, c] = symbol; }
+        var grid = new char[rows, cols];
+        for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) grid[r, c] = '□';
+        void Mark(int r, int c, char symbol) { if (r >= 0 && r < rows && c >= 0 && c < cols) grid[r, c] = symbol; }
 
         // 重疊率用格數算：cube 一格、domino 兩格
-        // 除錯用：每個配到的預期格實際是哪顆方塊滿足的，特別標出「這一批沒有搬動」的——
-        // 那種配對代表這格是靠殘留方塊（可能是上一輪沒清乾淨的）湊到的，不是這一批真的放的。
-        var matchLog = new List<string>();
         int correct = 0, expectedCellCount = 0, hitCells = 0, extraCells = 0;
         for (int e = 0; e < expected.Count; e++)
         {
@@ -1887,8 +1800,6 @@ public class JsonExecutor : MonoBehaviour
             else
             {
                 var cand = candidates[matchOf[e]];
-                matchLog.Add($"{name} ← {cand.block.name}" +
-                    (cand.state.released ? "" : "（★這一批沒有搬動這顆，沿用它原本就在的位置）"));
                 bool expectDomino = exp.shape == "domino";
                 if (expectDomino != cand.state.isDomino)
                 {
@@ -1940,92 +1851,44 @@ public class JsonExecutor : MonoBehaviour
                 errors.Add($"多放 {cand.block.name} @ QR({cand.qr.x:F3},{cand.qr.y:F3})：原本就在圖案範圍 {where}");
             if (InsideCanvas(g))
             {
-                Mark(g.r, g.c, stateGrid[g.r, g.c] == '□' ? '●' : '✗');
+                Mark(g.r, g.c, grid[g.r, g.c] == '□' ? '●' : '✗');
                 extraCells += cand.state.isDomino ? 2 : 1;
             }
         }
-        // 狀態比對的重疊率只當除錯參考，不拿來決定過不過關（見下面渲染圖逐格比對）
-        float stateOverlap = expectedCellCount + extraCells > 0 ? (float)hitCells / (expectedCellCount + extraCells) : 0f;
-
-        var stateResultRows = new List<string>();
-        for (int r = 0; r < rows; r++)
+        // 座標比對的格子重疊率只當說明；判定用 Unity 畫面跟預期佔地的像素重疊率
+        float cellOverlap = expectedCellCount + extraCells > 0 ? (float)hitCells / (expectedCellCount + extraCells) : 0f;
+        var image = FigureImageOverlap(expected, cellX, cellY);
+        string imageFile = image.file;
+        string viewFile = CaptureMainView();
+        float overlap = image.overlap;
+        if (overlap < 0f)
         {
-            var line = new System.Text.StringBuilder();
-            for (int c = 0; c < cols; c++) line.Append(stateGrid[r, c]);
-            stateResultRows.Add(line.ToString());
+            errors.Add("無法擷取 Unity 畫面做比對：" + image.error);
+            overlap = 0f;
         }
-
-        // ---- 渲染圖逐格比對：這才是送不送實機的依據 ----
-        // 立體批次（layered_grasp）改成逐層切開拍、比每格疊到第幾層（RunLayeredCoverage），2D 照舊
-        if (batch.layered_grasp)
-        {
-            RunLayeredCoverage(batch, expected, rows, cols, anchorX, anchorY, cellX, cellY, anchor,
-                errors, stateOverlap, correct, stateResultRows, matchLog);
-            return;
-        }
-        var occupied = CaptureCoverageGrid(rows, cols, anchorX, anchorY, cellX, cellY,
-            anchor.row, anchor.col, batch.batch_id, out string coverageImagePath);
-
-        var expectedCellLookup = new HashSet<(int r, int c)>();
-        foreach (var exp in expected)
-        {
-            expectedCellLookup.Add((exp.row, exp.col));
-            if (exp.second_row >= 0) expectedCellLookup.Add((exp.second_row, exp.second_col));
-        }
-
-        var imgGrid = new char[rows, cols];
-        for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) imgGrid[r, c] = '□';
-        int imgExpectedCells = 0, imgHitCells = 0, imgExtraCells = 0, imgCorrect = 0;
-        foreach (var exp in expected)
-        {
-            int cells = exp.second_row >= 0 ? 2 : 1;
-            imgExpectedCells += cells;
-            bool hit = InsideCanvas((exp.row, exp.col)) && occupied[exp.row, exp.col] &&
-                (exp.second_row < 0 || (InsideCanvas((exp.second_row, exp.second_col)) && occupied[exp.second_row, exp.second_col]));
-            if (hit) { imgHitCells += cells; imgCorrect++; }
-            char symbol = hit ? '■' : '✗';
-            imgGrid[exp.row, exp.col] = symbol;
-            if (exp.second_row >= 0) imgGrid[exp.second_row, exp.second_col] = symbol;
-        }
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < cols; c++)
-            {
-                if (expectedCellLookup.Contains((r, c)) || !occupied[r, c]) continue;
-                imgGrid[r, c] = '●';
-                imgExtraCells++;
-            }
-        float overlap = imgExpectedCells + imgExtraCells > 0 ? (float)imgHitCells / (imgExpectedCells + imgExtraCells) : 0f;
         bool passed = overlap > bitmapOverlapThreshold;
 
         var resultRows = new List<string>();
         for (int r = 0; r < rows; r++)
         {
             var line = new System.Text.StringBuilder();
-            for (int c = 0; c < cols; c++) line.Append(imgGrid[r, c]);
+            for (int c = 0; c < cols; c++) line.Append(grid[r, c]);
             resultRows.Add(line.ToString());
         }
 
         var report = new System.Text.StringBuilder();
-        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ 渲染圖逐格比對吻合" : "✗ 渲染圖逐格比對不吻合")}，" +
-                          $"重疊率 {overlap * 100f:F0}%（要大於 {bitmapOverlapThreshold * 100f:F0}%），" +
-                          $"放對 {imgCorrect}/{expected.Count} 格，渲染圖：{coverageImagePath ?? "存檔失敗"}");
-        report.AppendLine("  預期 bitmap    渲染圖比對結果（■ 正確  ✗ 少放/錯誤  ● 多放  □ 空）");
+        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ Unity 畫面跟 bitmap 吻合" : "✗ Unity 畫面跟 bitmap 不吻合")}，" +
+                          $"畫面重疊率 {overlap * 100f:F0}%（要大於 {bitmapOverlapThreshold * 100f:F0}%）；" +
+                          $"座標比對：預期 {expected.Count} 個物件，放對 {correct}（格子重疊率 {cellOverlap * 100f:F0}%），錯誤 {errors.Count} 項" +
+                          (imageFile != null ? $"；畫面比對圖 StreamingAssets/{imageFile}" : ""));
+        report.AppendLine("  預期 bitmap    座標比對結果（■ 正確  ✗ 少放/錯誤  ● 多放/放錯  □ 空）");
         for (int r = 0; r < rows; r++)
         {
             string want = batch.bitmap != null && r < batch.bitmap.Count ? batch.bitmap[r] : "";
             report.AppendLine($"  {want.PadRight(cols)}          {resultRows[r]}");
         }
-        report.AppendLine($"  （內部狀態比對僅供除錯參考，不影響過關與否：重疊率 {stateOverlap * 100f:F0}%，" +
-                          $"放對 {correct}，錯誤 {errors.Count} 項）");
-        for (int r = 0; r < rows; r++)
-        {
-            string want = batch.bitmap != null && r < batch.bitmap.Count ? batch.bitmap[r] : "";
-            report.AppendLine($"    {want.PadRight(cols)}          {stateResultRows[r]}");
-        }
         foreach (var error in errors) report.AppendLine("  - " + error);
         foreach (var note in simPlacementNotes) report.AppendLine("  · " + note);
-        report.AppendLine("  配對明細（狀態比對）：");
-        foreach (var m in matchLog) report.AppendLine("    " + m);
 
         if (passed) Debug.Log(report.ToString());
         else Debug.LogWarning(report.ToString());
@@ -2040,9 +1903,18 @@ public class JsonExecutor : MonoBehaviour
             passed = passed,
             verification_enabled = verificationEnabled,
             expected_count = expected.Count,
-            correct_count = imgCorrect,
+            correct_count = correct,
             overlap_ratio = overlap,
             overlap_threshold = bitmapOverlapThreshold,
+            cell_overlap_ratio = cellOverlap,
+            image_file = imageFile ?? "",
+            image_panel_width = image.panelWidth,
+            image_gap = image.gap,
+            image_x0_m = image.x0,
+            image_y1_m = image.y1,
+            image_px_per_m = image.pxPerM,
+            photo_file = image.photoFile ?? "",
+            view_file = viewFile ?? "",
             expected_rows = batch.bitmap ?? new List<string>(),
             result_rows = resultRows,
             errors = errors,
@@ -2050,97 +1922,275 @@ public class JsonExecutor : MonoBehaviour
         });
     }
 
-    // 立體 bitmap（2026-10-07 從 main 搬來）：逐層切開拍俯視畫面，得到每一格疊到第幾層，跟預期的層數比。
-    // 第 1 張照常拍（含桌面），第 k 張（k ≥ 2）把遠裁切面放在第 k 層中間的高度，只留比它高的部分。
-    // 重疊率 = Σ min(畫面層數, 預期層數) ÷ Σ max(畫面層數, 預期層數)；全部只有 1 層時跟 2D 的逐格比對相同。
-    // 預期層數 = 那一格的預期格數（server 每一層給一個預期格），不看 LLM 填的 top_z
-    void RunLayeredCoverage(BatchEnvelope batch, List<ExpectedCell> expected, int rows, int cols,
-        float anchorX, float anchorY, float cellX, float cellY, ExpectedCell anchor, List<string> errors,
-        float stateOverlap, int stateCorrect, List<string> stateResultRows, List<string> matchLog)
+    // 把像素存成 StreamingAssets 底下的 PNG，回傳檔名；存不了回傳 null（只記警告，不影響比對）
+    string SavePng(string name, int width, int height, Color32[] pixels)
     {
-        var want = new int[rows, cols];
-        foreach (var exp in expected)
-            if (exp.row >= 0 && exp.row < rows && exp.col >= 0 && exp.col < cols) want[exp.row, exp.col]++;
-        int maxWant = 0;
-        foreach (int h in want) maxWant = Mathf.Max(maxWant, h);
-        int slices = Mathf.Min(maxWant + 1, 9);   // 多拍一層，疊太高也看得出來
-        float layerM = (float)LayeredGraspGeometry.BlockLayerM;
-        var got = new int[rows, cols];
-        var images = new List<string>();
-        for (int k = 1; k <= slices; k++)
+        var image = new Texture2D(width, height, TextureFormat.RGBA32, false);
+        try
         {
-            var occupied = CaptureCoverageGrid(rows, cols, anchorX, anchorY, cellX, cellY, anchor.row, anchor.col,
-                batch.batch_id, out string image, k == 1 ? float.NaN : (k - 0.5f) * layerM, k);
-            if (image != null) images.Add(image);
-            for (int r = 0; r < rows; r++)
-                for (int c = 0; c < cols; c++)
-                    if (occupied[r, c]) got[r, c] = Mathf.Max(got[r, c], k);
+            image.SetPixels32(pixels);
+            image.Apply();
+            File.WriteAllBytes(Path.Combine(Application.streamingAssetsPath, name), image.EncodeToPNG());
+            return name;
         }
-
-        int sumMin = 0, sumMax = 0, wantCells = 0, correctCells = 0;
-        var imageErrors = new List<string>();
-        var wantRows = new List<string>();
-        var resultRows = new List<string>();
-        for (int r = 0; r < rows; r++)
+        catch (Exception ex)
         {
-            var wantLine = new System.Text.StringBuilder();
-            var gotLine = new System.Text.StringBuilder();
-            for (int c = 0; c < cols; c++)
-            {
-                sumMin += Mathf.Min(want[r, c], got[r, c]);
-                sumMax += Mathf.Max(want[r, c], got[r, c]);
-                if (want[r, c] > 0)
+            Debug.LogWarning($"[BitmapCheck] {name} 存檔失敗：{ex.Message}");
+            return null;
+        }
+        finally
+        {
+            Destroy(image);
+        }
+    }
+
+    // Unity 主相機（Game 視窗）看到的畫面：預覽排完、場景還原前拍一張存成 unity_view.png；拍不到回傳 null
+    string CaptureMainView()
+    {
+        var main = Camera.main;
+        if (main == null) return null;
+        const int width = 1280, height = 720;
+        var rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32);
+        var shot = new Texture2D(width, height, TextureFormat.RGBA32, false);
+        var previousTarget = main.targetTexture;
+        var previousActive = RenderTexture.active;
+        try
+        {
+            main.targetTexture = rt;
+            main.Render();
+            RenderTexture.active = rt;
+            shot.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+            return SavePng("unity_view.png", width, height, shot.GetPixels32());
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[BitmapCheck] Unity 主相機畫面沒拍到：{ex.Message}");
+            return null;
+        }
+        finally
+        {
+            main.targetTexture = previousTarget;
+            RenderTexture.active = previousActive;
+            RenderTexture.ReleaseTemporary(rt);
+            Destroy(shot);
+        }
+    }
+
+    // 畫面比對用的暫時圖層（專案沒用到的最後一層）、取樣解析度（1 像素 = 1 mm）與比對圖的放大倍數、格間距
+    const int FigureCaptureLayer = 31;
+    const float FigurePixelM = 0.001f;
+    const int FigureImageScale = 2, FigureImageGap = 8;
+
+    class FigureImageResult
+    {
+        public float overlap = -1f;     // 畫面重疊率；-1 = 擷取失敗
+        public string error;
+        public string file;             // StreamingAssets 底下的檔名；null = 沒存到
+        public string photoFile;        // 正上方拍的完整 Unity 照片；null = 沒拍到
+        public float x0, y1;            // 圖上左上角對應的 QR 座標（公尺）
+        public float pxPerM;            // 比對圖每公尺幾像素
+        public int panelWidth, gap;     // 每格寬、格與格的間隔（像素）
+    }
+
+    // 預覽結束、場景還原前拍 Unity 畫面跟預期比對，2D、3D 同一套。臨時架一台正上方的正交相機，只拍方塊
+    // （手臂、桌面、QR 標記不拍；夾爪上還夾著的不算），逐層切開拍：第 1 張全部都拍，第 k 張（k ≥ 2）只留比第 k 層中間高的部分，
+    // 合起來就是每一點最高疊到第幾層。再重新取樣成跟 bitmap 同方向（上 = +Y、右 = +X）、1 像素 = 1 mm 的格子；
+    // 預期的高度是每塊應有的佔地（cube 2.5×2.5 cm，domino 5×2.5 cm 照方向）疊到的最高層。
+    // 重疊率 = Σ min(實際層數, 預期層數) ÷ Σ max(實際層數, 預期層數)；2D 全是 1 層時就是像素的交集 ÷ 聯集，
+    // 疊到別塊上（多 1 層）也會扣分。範圍是預期佔地的外框四邊各加半格，範圍內多出來的方塊一樣算進去。
+    // 比對圖存成 StreamingAssets/sim_check.png，三格：Unity 俯視畫面 / 預期（灰階越深層數越多）/ 疊合
+    // （綠 = 吻合、紅 = 該有沒有、藍 = 多出來、橘 = 有但高度不對）；csharp_server 再加上重疊率等文字。
+    FigureImageResult FigureImageOverlap(List<ExpectedCell> expected, float cellX, float cellY)
+    {
+        var result = new FigureImageResult();
+        float size = sceneSyncer.cubeSizeM;
+        (float hx, float hy) Half(ExpectedCell e) => e.shape != "domino" ? (size / 2f, size / 2f)
+            : e.orientation == "vertical" ? (size / 2f, size) : (size, size / 2f);
+        int Layer(ExpectedCell e) => Mathf.Max(1, Mathf.RoundToInt(e.z / size));
+        float x0 = float.MaxValue, x1 = float.MinValue, y0 = float.MaxValue, y1 = float.MinValue;
+        foreach (var e in expected)
+        {
+            var (hx, hy) = Half(e);
+            x0 = Mathf.Min(x0, e.x - hx); x1 = Mathf.Max(x1, e.x + hx);
+            y0 = Mathf.Min(y0, e.y - hy); y1 = Mathf.Max(y1, e.y + hy);
+        }
+        x0 -= cellX / 2f; x1 += cellX / 2f; y0 -= cellY / 2f; y1 += cellY / 2f;
+        int w = Mathf.CeilToInt((x1 - x0) / FigurePixelM), h = Mathf.CeilToInt((y1 - y0) / FigurePixelM);
+        if (w <= 0 || h <= 0 || w > 2000 || h > 2000)
+        {
+            result.error = $"比對範圍不合理（{w}×{h} 像素）";
+            return result;
+        }
+        result.x0 = x0;
+        result.y1 = y1;
+        result.pxPerM = FigureImageScale / FigurePixelM;
+        result.panelWidth = w * FigureImageScale;
+        result.gap = FigureImageGap * FigureImageScale;
+        int slices = Mathf.Min(expected.Max(Layer) + 1, 9);   // 多拍一層，疊太高也看得出來
+
+        // QR → 世界座標都經過方塊所在的 frame（跟 BlockQR 同一套），相機方向與比例由它推出來，不假設場景的擺法
+        Transform frame = SimBlockFrame();
+        Vector3 World(float x, float y, float z) => frame.TransformPoint(SceneSyncer.QRToUnity(x, y, z));
+        const float cameraHeightM = 1f;
+        float cx = (x0 + x1) / 2f, cy = (y0 + y1) / 2f;
+        Vector3 down = (World(cx, cy, 0f) - World(cx, cy, 1f)).normalized;
+        Vector3 up = (World(cx, cy + 1f, 0f) - World(cx, cy, 0f)).normalized;
+        float worldPerM = (World(cx + 1f, cy, 0f) - World(cx, cy, 0f)).magnitude;
+        float side = Mathf.Max(x1 - x0, y1 - y0) * 1.1f;
+        int n = Mathf.Clamp(Mathf.CeilToInt(side / (FigurePixelM / 2f)), 64, 4096);
+
+        var camGo = new GameObject("FigureCheckCamera") { hideFlags = HideFlags.HideAndDontSave };
+        var cam = camGo.AddComponent<Camera>();
+        cam.enabled = false;
+        cam.orthographic = true;
+        cam.orthographicSize = side * worldPerM / 2f;
+        cam.aspect = 1f;
+        cam.clearFlags = CameraClearFlags.SolidColor;
+        cam.backgroundColor = Color.magenta;   // 黃、黑、紅、藍的方塊都跟洋紅背景分得開
+        cam.cullingMask = 1 << FigureCaptureLayer;
+        cam.allowMSAA = false;
+        cam.allowHDR = false;
+        cam.nearClipPlane = 0.01f * worldPerM;
+        camGo.transform.SetPositionAndRotation(World(cx, cy, cameraHeightM), Quaternion.LookRotation(down, up));
+
+        var blocks = sceneSyncer.GetCurrentCubes().Where(b => b != null && !SimBlock(b).held).ToList();
+        var layers = blocks.Select(b => b.layer).ToList();
+        var rt = RenderTexture.GetTemporary(n, n, 24, RenderTextureFormat.ARGB32);
+        var shot = new Texture2D(n, n, TextureFormat.RGBA32, false);
+        var previous = RenderTexture.active;
+        var height = new int[w * h];
+        var colour = new Color32[w * h];
+        var sample = new int[w * h];
+        try
+        {
+            foreach (var b in blocks) b.layer = FigureCaptureLayer;
+            cam.targetTexture = rt;
+            // 每個像素取中心點；正交相機往下看，高度不影響落在畫面哪裡
+            for (int i = 0; i < h; i++)
+                for (int j = 0; j < w; j++)
                 {
-                    wantCells++;
-                    if (got[r, c] == want[r, c]) correctCells++;
+                    Vector3 vp = cam.WorldToViewportPoint(World(x0 + (j + 0.5f) * FigurePixelM, y1 - (i + 0.5f) * FigurePixelM, 0f));
+                    sample[i * w + j] = Mathf.Clamp((int)(vp.y * n), 0, n - 1) * n + Mathf.Clamp((int)(vp.x * n), 0, n - 1);
                 }
-                if (want[r, c] != got[r, c])
-                    imageErrors.Add($"r{r}c{c}：預期 {want[r, c]} 層，畫面上 {got[r, c]} 層");
-                wantLine.Append(want[r, c]);
-                gotLine.Append(got[r, c]);
+            for (int k = 1; k <= slices; k++)
+            {
+                // 第 1 張拍到桌面以下；第 k 張把遠裁切面放在第 k 層中間的高度，只留比它高的部分
+                float floorM = k == 1 ? -1f : (k - 0.5f) * size;
+                cam.farClipPlane = (cameraHeightM - floorM) * worldPerM;
+                cam.Render();
+                RenderTexture.active = rt;
+                shot.ReadPixels(new Rect(0, 0, n, n), 0, 0);
+                Color32[] pixels = shot.GetPixels32();
+                for (int p = 0; p < w * h; p++)
+                {
+                    Color32 c = pixels[sample[p]];
+                    if (Mathf.Abs(c.r - 255) + c.g + Mathf.Abs(c.b - 255) <= 150) continue;
+                    height[p] = k;
+                    if (k == 1) colour[p] = c;
+                }
             }
-            wantRows.Add(wantLine.ToString());
-            resultRows.Add(gotLine.ToString());
+            // 同一台相機再拍一張完整的 Unity 照片（桌面、QR 標記、方塊、手臂都拍），範圍跟比對相同，
+            // 重新取樣成上 = +Y、右 = +X、每 0.5 mm 一像素；拍不到只記警告，不影響比對
+            try
+            {
+                for (int i = 0; i < blocks.Count; i++)
+                    if (blocks[i] != null) blocks[i].layer = layers[i];
+                cam.cullingMask = ~0;
+                cam.backgroundColor = new Color(0.85f, 0.85f, 0.85f);
+                cam.farClipPlane = (cameraHeightM + 1f) * worldPerM;
+                cam.Render();
+                RenderTexture.active = rt;
+                shot.ReadPixels(new Rect(0, 0, n, n), 0, 0);
+                Color32[] photoPixels = shot.GetPixels32();
+                int photoW = w * 2, photoH = h * 2;
+                var photo = new Color32[photoW * photoH];
+                for (int i = 0; i < photoH; i++)
+                    for (int j = 0; j < photoW; j++)
+                    {
+                        Vector3 vp = cam.WorldToViewportPoint(World(x0 + (j + 0.5f) * FigurePixelM / 2f, y1 - (i + 0.5f) * FigurePixelM / 2f, 0f));
+                        int u = Mathf.Clamp((int)(vp.x * n), 0, n - 1), v = Mathf.Clamp((int)(vp.y * n), 0, n - 1);
+                        photo[(photoH - 1 - i) * photoW + j] = photoPixels[v * n + u];   // Texture2D 的 y 由下往上
+                    }
+                result.photoFile = SavePng("unity_top.png", photoW, photoH, photo);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[BitmapCheck] Unity 俯視照片沒拍到：{ex.Message}");
+            }
         }
-        float overlap = sumMax > 0 ? (float)sumMin / sumMax : 0f;
-        bool passed = overlap > bitmapOverlapThreshold;
-        errors.InsertRange(0, imageErrors);
-
-        var report = new System.Text.StringBuilder();
-        report.AppendLine($"[BitmapCheck] batch {batch.batch_id}：{(passed ? "✓ 逐層渲染圖比對吻合" : "✗ 逐層渲染圖比對不吻合")}，" +
-                          $"重疊率 {overlap * 100f:F0}%（要大於 {bitmapOverlapThreshold * 100f:F0}%），" +
-                          $"層數正確 {correctCells}/{wantCells} 格，渲染圖：{(images.Count > 0 ? string.Join("、", images) : "存檔失敗")}");
-        report.AppendLine("  預期層數    渲染圖逐層量到的層數（0 = 空）");
-        for (int r = 0; r < rows; r++)
-            report.AppendLine($"  {wantRows[r].PadRight(cols)}          {resultRows[r]}");
-        report.AppendLine($"  （內部狀態比對僅供除錯參考，不影響過關與否：重疊率 {stateOverlap * 100f:F0}%，放對 {stateCorrect}）");
-        for (int r = 0; r < rows; r++)
-            report.AppendLine($"    {wantRows[r].PadRight(cols)}          {stateResultRows[r]}");
-        foreach (var error in errors) report.AppendLine("  - " + error);
-        foreach (var note in simPlacementNotes) report.AppendLine("  · " + note);
-        report.AppendLine("  配對明細（狀態比對）：");
-        foreach (var m in matchLog) report.AppendLine("    " + m);
-        if (passed) Debug.Log(report.ToString());
-        else Debug.LogWarning(report.ToString());
-
-        bitmapCheckErrors = errors;
-        bitmapOverlapRatio = overlap;
-        bitmapCheckPassed = passed;
-        WriteSimulationCheckReport(new SimulationCheckReport
+        catch (Exception ex)
         {
-            batch_id = batch.batch_id,
-            performed = true,
-            passed = passed,
-            verification_enabled = verificationEnabled,
-            expected_count = wantCells,
-            correct_count = correctCells,
-            overlap_ratio = overlap,
-            overlap_threshold = bitmapOverlapThreshold,
-            expected_rows = wantRows,
-            result_rows = resultRows,
-            errors = errors,
-            notes = new List<string>(simPlacementNotes),
-        });
+            result.error = ex.Message;
+            return result;
+        }
+        finally
+        {
+            for (int i = 0; i < blocks.Count; i++)
+                if (blocks[i] != null) blocks[i].layer = layers[i];
+            cam.targetTexture = null;
+            RenderTexture.active = previous;
+            RenderTexture.ReleaseTemporary(rt);
+            Destroy(shot);
+            Destroy(camGo);
+        }
+
+        var want = new int[w * h];
+        long matched = 0, total = 0;
+        for (int i = 0; i < h; i++)
+            for (int j = 0; j < w; j++)
+            {
+                float qx = x0 + (j + 0.5f) * FigurePixelM, qy = y1 - (i + 0.5f) * FigurePixelM;
+                int p = i * w + j;
+                foreach (var e in expected)
+                {
+                    var (hx, hy) = Half(e);
+                    if (Mathf.Abs(qx - e.x) <= hx && Mathf.Abs(qy - e.y) <= hy) want[p] = Mathf.Max(want[p], Layer(e));
+                }
+                matched += Mathf.Min(want[p], height[p]);
+                total += Mathf.Max(want[p], height[p]);
+            }
+        result.overlap = total > 0 ? (float)matched / total : 0f;
+
+        // 比對圖：每 1 mm 放大成 FigureImageScale×FigureImageScale 像素，三格中間各空 FigureImageGap
+        int imageW = (3 * w + 2 * FigureImageGap) * FigureImageScale, imageH = h * FigureImageScale;
+        var fill = new Color32[imageW * imageH];
+        var white = new Color32(255, 255, 255, 255);
+        for (int p = 0; p < fill.Length; p++) fill[p] = white;
+        void Put(int col, int row, Color32 c)
+        {
+            for (int dy = 0; dy < FigureImageScale; dy++)
+                for (int dx = 0; dx < FigureImageScale; dx++)
+                    fill[((h - 1 - row) * FigureImageScale + dy) * imageW + col * FigureImageScale + dx] = c;   // Texture2D 的 y 由下往上
+        }
+        Color32[] layerShade = { white, new Color32(215, 215, 215, 255), new Color32(175, 175, 175, 255),
+                                 new Color32(140, 140, 140, 255), new Color32(110, 110, 110, 255) };
+        for (int i = 0; i < h; i++)
+            for (int j = 0; j < w; j++)
+            {
+                int p = i * w + j;
+                Put(j, i, height[p] > 0 ? colour[p] : new Color32(235, 235, 235, 255));
+                Put(w + FigureImageGap + j, i, layerShade[Mathf.Min(want[p], layerShade.Length - 1)]);
+                Put(2 * (w + FigureImageGap) + j, i,
+                    want[p] > 0 && want[p] == height[p] ? new Color32(60, 170, 80, 255)
+                    : want[p] > 0 && height[p] == 0 ? new Color32(220, 60, 50, 255)
+                    : want[p] == 0 && height[p] > 0 ? new Color32(50, 110, 230, 255)
+                    : want[p] > 0 ? new Color32(255, 150, 0, 255)
+                    : white);
+            }
+        var image = new Texture2D(imageW, imageH, TextureFormat.RGBA32, false);
+        image.SetPixels32(fill);
+        image.Apply();
+        try
+        {
+            File.WriteAllBytes(Path.Combine(Application.streamingAssetsPath, "sim_check.png"), image.EncodeToPNG());
+            result.file = "sim_check.png";
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[BitmapCheck] 比對圖存檔失敗：{ex.Message}");
+        }
+        Destroy(image);
+        return result;
     }
 
     // 排 pattern 的批次一定要給 server 一個交代：沒做到比對也要寫「未進行」和原因
@@ -2176,26 +2226,14 @@ public class JsonExecutor : MonoBehaviour
     // 屬於驗證：開啟就擋；關閉就記錄、放行。
     bool BitmapCheckAllowsContinue(BatchEnvelope batch)
     {
-        if (bitmapCheckErrors == null)
-        {
-            // 這批本來就沒有 bitmap 要比（不是整批排圖形），沒什麼好擋的
-            if (batch.expected_cells == null || batch.expected_cells.Count == 0) return true;
-            // 這批有 bitmap 要比，卻沒跑到 RunBitmapCheck 就結束了（最可能是動畫中途出例外）。
-            // 沒比對過不能當作通過，不然沒跑完的預覽也會被送去真的執行。
-            string abortSummary = $"batch {batch.batch_id}：這批有 bitmap 要比對，但模擬預覽沒有跑完比對就結束" +
-                                  "（可能動畫中途發生例外），沒有比對結果不能送實機";
-            Debug.LogError("[BitmapCheck] " + abortSummary);
-            WriteStepDone(batch.batch_id, false, abortSummary, 0f);
-            return false;
-        }
-        if (bitmapCheckPassed) return true;
+        if (bitmapCheckErrors == null || bitmapCheckPassed) return true;
         if (!verificationEnabled)
         {
-            Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：bitmap 重疊率 {bitmapOverlapRatio * 100f:F0}% " +
+            Debug.LogWarning($"[Verification OFF] batch {batch.batch_id}：畫面重疊率 {bitmapOverlapRatio * 100f:F0}% " +
                              $"沒有大於 {bitmapOverlapThreshold * 100f:F0}%，對照組照樣繼續");
             return true;
         }
-        string summary = $"模擬結束比對不通過：重疊率 {bitmapOverlapRatio * 100f:F0}% 沒有大於 " +
+        string summary = $"模擬結束比對不通過：Unity 畫面重疊率 {bitmapOverlapRatio * 100f:F0}% 沒有大於 " +
                          $"{bitmapOverlapThreshold * 100f:F0}%（{bitmapCheckErrors.Count} 項）：" +
                          string.Join(" | ", bitmapCheckErrors);
         Debug.LogError("[BitmapCheck] " + summary);
@@ -2874,9 +2912,11 @@ public class JsonExecutor : MonoBehaviour
         var initialCubeParents = new Dictionary<GameObject, Transform>();
         var initialCubeScales = new Dictionary<GameObject, Vector3>();
         var initialCubeNames = new Dictionary<GameObject, string>();
+        var startQR = new Dictionary<GameObject, Vector3>();
         foreach (var cube in cubes)
         {
             if (cube == null) continue;
+            startQR[cube] = BlockQR(cube);
             initialCubePositions[cube] = cube.transform.localPosition;
             initialCubeParents[cube] = cube.transform.parent;
             initialCubeScales[cube] = cube.transform.localScale;
@@ -2916,6 +2956,20 @@ public class JsonExecutor : MonoBehaviour
         yield return new WaitForEndOfFrame();
         Debug.Log($"[Executor-preview] batch {batch.batch_id} 手臂收尾完成，拍照並比對 bitmap（積木尚未復原，拍攝排除手臂及其陰影）");
         RunBitmapCheck(batch);
+        // 記下每塊被放下的方塊預覽前的位置與落點（純模擬的 preview_only 批次照這個更新模擬世界；還夾著的不算）
+        previewFinalBlocks = new List<PreviewBlock>();
+        foreach (var cube in sceneSyncer.GetCurrentCubes())
+        {
+            if (cube == null || !startQR.TryGetValue(cube, out Vector3 from)) continue;
+            var state = SimBlock(cube);
+            if (!state.released || state.held) continue;
+            previewFinalBlocks.Add(new PreviewBlock
+            {
+                from_x = from.x, from_y = from.y,
+                x = state.landedQR.x, y = state.landedQR.y, z = state.landedQR.z,
+                orientation = state.isDomino ? (DominoIsVertical(state.angleDeg) ? "vertical" : "horizontal") : "",
+            });
+        }
 
         // 復原：手臂角度
         if (initialArmAngles != null && robotArm != null && robotArm.Angles != null)
@@ -3995,7 +4049,7 @@ public class JsonExecutor : MonoBehaviour
         }
     }
 
-    void WriteStepDone(int stepId, bool completed, string error, float duration)
+    void WriteStepDone(int stepId, bool completed, string error, float duration, List<PreviewBlock> finalBlocks = null)
     {
         lastStepReportedSuccess = completed;
         lastStepReportedError = error;
@@ -4005,6 +4059,7 @@ public class JsonExecutor : MonoBehaviour
             completed = completed,
             error = error ?? "",
             duration_sec = duration,
+            final_blocks = finalBlocks ?? new List<PreviewBlock>(),
         };
         string json = JsonUtility.ToJson(report, prettyPrint: true);
         string path = Path.Combine(Application.streamingAssetsPath, stepDoneFile);

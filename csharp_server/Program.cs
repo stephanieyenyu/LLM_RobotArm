@@ -6,7 +6,7 @@ Directory.CreateDirectory(assets);
 var output = Path.GetFullPath("outputs/experiments");
 Directory.CreateDirectory(output);
 using var http = new HttpClient { BaseAddress = new Uri("http://localhost:5000/"), Timeout = Timeout.InfiniteTimeSpan };
-// 純模擬（Unity「模擬模式」按鈕）：場景與照片改由 Isaac Sim 提供，格式同 perception_server；紀錄另存，不跟實機成功率混在一起
+// 純模擬（Unity「模式」按鈕）：場景與照片改由 Isaac Sim 提供，格式同 perception_server；紀錄另存，不跟實機成功率混在一起
 using var simPerception = new HttpClient { BaseAddress = IsaacSimExecutor.PerceptionBaseUri, Timeout = Timeout.InfiniteTimeSpan };
 var simOutput = Path.GetFullPath("outputs/experiments_sim");
 var perception = http;
@@ -15,8 +15,12 @@ string? loadedSimScene = null;
 // 純模擬沒開 Isaac Sim 時，2D 改用 csharp_server 內建的虛擬世界（VirtualSimWorld）；上次留下的世界檔先清掉
 VirtualSimWorld? virtualWorld = null;
 VirtualSimWorld.Delete(assets);
-// 3D 正式執行沿用驗證過的整批軌跡；驗證後來源積木位置變動超過這個距離（相機抖動以外）就不執行
-const double VerifiedSourceDriftM = 0.010;
+// 驗證流程（三個版本相同，2026-10-08）：相機只在收到指令時拍一次（場景與照片），之後的驗證都看模擬畫面。
+//   2D：Unity 模擬整批（只預覽）→ Unity 畫面重疊率 > 90% ＋ LLM 看 Unity 主相機畫面判 PASS → 才送實體手臂。
+//       純模擬：Unity 模擬通過就算執行完成，不需要 Isaac。
+//   3D：Unity 只把軌跡轉送 URSim（不預覽），Isaac 跟隨 URSim 做物理 → Isaac 物理檢查 ＋ 畫面重疊率（整體對齊 ±5 mm 後 > 90%）
+//       ＋ LLM 看 Isaac 畫面判 PASS → 才送實體手臂（純模擬送 URSim）。
+//   手臂做完就算成功，不再用相機驗證；手臂執行到一半失敗時桌面已改變，這個任務直接結束。
 var json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true, WriteIndented = true };
 var model = Environment.GetEnvironmentVariable("ROBOT_MODEL") ?? "gpt-5";
 var llm = new ExperimentLlm(model);
@@ -57,14 +61,17 @@ while (true)
     var run = Path.Combine(root, $"{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}");
     Directory.CreateDirectory(run);
     File.WriteAllText(Path.Combine(run, "task.txt"), goal);
-    if (sim) Console.WriteLine($"[純模擬] 動作只送 URSim；場景與畫面來自 Isaac Sim，沒開 Isaac 時 2D 改用內建的虛擬世界；紀錄在 {simOutput}。");
+    if (sim) Console.WriteLine($"[純模擬] 2D 由 Unity 模擬驗證（畫面重疊率＋LLM 看 Unity 畫面），通過就算執行，不需要 Isaac；" +
+                               $"3D 由 Isaac Sim 模擬驗證（物理檢查＋畫面重疊率＋LLM 看 Isaac 畫面），通過後正式執行送 URSim。" +
+                               $"場景來自 Isaac Sim，沒開 Isaac 時 2D 改用內建的虛擬世界；紀錄在 {simOutput}。");
     Save(run, "config.json", new { model, max_attempts = (int?)null, unbounded_attempts = true, reflection = false,
         reset_between_tasks = !sim && fixedBaseline,
         initial_scene_source = sim ? (mode.ResetEachTask ? "sim_scene_file" : "sim_continued")
             : fixedBaseline ? "fixed_baseline" : "table_at_command",
         run_mode = sim ? "sim" : "real", sim_scene = sim ? mode.Scene : null,
         reset_within_task = false, reset_xy_m = ExperimentChecks.ResetXYToleranceM, reset_z_m = ExperimentChecks.ResetZToleranceM,
-        rule_scope = "none", evaluation = "independent_visual_model", started_utc = DateTime.UtcNow });
+        rule_scope = "none", evaluation = "simulation_overlap_and_visual_model", camera_observations = "task_start_only",
+        started_utc = DateTime.UtcNow });
     bool success = false;
     bool executionPending = false;
     string status = "failed";
@@ -151,6 +158,11 @@ while (true)
         if (waitForBaseline && baseline == null) { baseline = initial; Save(output, "initial_scene.json", baseline); }
         Save(run, "initial_scene.json", initial);
         Console.WriteLine($"[任務開始] 初始桌面已確認（{SceneInventory(initial)}）；本任務內不再重置。");
+        // 相機只在收到指令時拍一次：之後每一輪規劃都用這一張照片與這一份場景，驗證一律看模擬畫面
+        var initialImage = await Frame(run, "initial.jpg");
+        var camera = await CameraInfo();
+        // 把真實場景投影到 Isaac Sim（背景），3D 驗證前就看得到積木。純模擬時 Isaac 本身就是世界，不投影
+        if (!sim) IsaacSimExecutor.SyncRealScene(initial, camera);
         // 不限次數：沒有 Reflection 可以收斂，純靠窮舉撞到覆蓋率門檻，所以不設上限，直到成功或任務被手動中止。
         for (int attempt = 1; ; attempt++)
         {
@@ -161,7 +173,6 @@ while (true)
             string failure = "", failureKind = "", plan = "";
             var local = new List<VerifyResult>();
             var isaacDir = Path.Combine(dir, "isaac_sim");
-            JsonElement? camera = null;
             // 系統實際走過的流程，只用來寫進這一輪的 feedback.txt 存證；沒有 Reflection，不會帶到下一輪。
             var trace = new List<string>();
             string stage = "觀測場景";
@@ -173,15 +184,10 @@ while (true)
             int robotOperations = 0;
             try
             {
-                var before = await Scene();
-                if (before.Count == 0) throw new SceneUnavailableException("沒有有效場景觀測。");
-                Save(dir, "before_scene.json", before);
-                var image = await Frame(dir, "before.jpg");
-                camera = await CameraInfo();
-                // 收到指令就先把目前真實場景投影到 Isaac Sim（背景），不必等 LLM 規劃完才看得到積木。
-                // 純模擬時 Isaac 本身就是世界，重新投影會把歪掉的積木擺正，不投影。
-                if (!sim) IsaacSimExecutor.SyncRealScene(before, camera);
-                trace.Add($"觀測到 {before.Count} 個物件");
+                // 相機只在任務開始拍一次；前幾輪停在執行前（模擬驗證沒過），手臂沒動，桌面還是任務開始的樣子
+                var before = initial;
+                var image = initialImage;
+                trace.Add($"沿用任務開始時的觀測（{before.Count} 個物件）");
                 stage = "拆解子任務";
                 llm.CanonicalBitmap = true;
                 var hierarchy = await llm.Decompose(goal, before, NoPriorFeedback, image, dir);
@@ -277,36 +283,35 @@ while (true)
                             TargetPosition = step.Target, ActionSequence = step.Actions, Comment = "3D 疊放 URSim 驗證",
                             SourceTopM = heights[k].SourceTopM, TargetTopM = heights[k].TargetTopM });
                     }
-                    Console.WriteLine($"[Isaac Sim] 3D 疊放：{ursimSteps.Count} 步先在 URSim 執行，Isaac Sim 跟隨驗證。");
+                    Console.WriteLine($"[Isaac Sim] 3D 疊放：{ursimSteps.Count} 步先在 URSim 執行（Unity 只轉送、不預覽），Isaac Sim 跟隨模擬並驗證。");
                     stage = "URSim 執行";
                     stageKind = "simulation";
+                    // 畫面重疊率的預期：有立體 bitmap 時用 LLM 宣告的 bitmap_grid 座標系裡的高度圖（每一格每一層一個預期格），
+                    // 沒有時用計畫的高度圖（含壓在底下沒被搬的支撐）；交給 Isaac 跟模擬結果比
+                    List<ExpectedCell> heightCells;
+                    double cell3dX, cell3dY;
+                    if (bitmapLayout != null)
+                        (heightCells, cell3dX, cell3dY) = (bitmapLayout.Value.Cells, bitmapLayout.Value.CellXM, bitmapLayout.Value.CellYM);
+                    else
+                    {
+                        var figure3d = PlannedFigure(translated.Steps, before, withSupports: true).Values.ToList();
+                        (_, heightCells, cell3dX, cell3dY) = FigureBitmap.HeightMap(figure3d, figure3d.Select(LayerOf).ToList());
+                    }
                     // 純模擬：Isaac 就是世界，驗證會真的移動積木。先記下位姿，驗證結束（不論通過與否）放回去，
                     // 正式執行才從驗證前的狀態開始，跟實機模式「驗證不動到真實積木」一致。
                     if (sim) await IsaacSimExecutor.SnapshotWorldAsync();
                     try
                     {
-                        await IsaacSimExecutor.BeginVerifyAsync(before, translated.Steps, camera, image, isaacDir, useCurrentWorld: sim);
+                        await IsaacSimExecutor.BeginVerifyAsync(before, translated.Steps, camera, image, isaacDir, useCurrentWorld: sim,
+                            expectedCells: heightCells, cellXM: cell3dX, cellYM: cell3dY);
                         int ursimBatchId = ++stepId;
+                        // 3D 不用 Unity 模擬：Unity 只把軌跡轉送 URSim（SkipPreview：不播預覽、不比對），驗證交給 Isaac
                         var ursimBatch = new BatchEnvelope { BatchId = ursimBatchId, Steps = ursimSteps,
-                            Comment = "3D 疊放 URSim 驗證", RobotTarget = "ursim", LayeredGrasp = true };
-                        // 立體 bitmap：Unity 預覽結束逐層切開拍，跟 LLM 宣告座標系裡的高度圖比對，重疊率過門檻才讓 URSim 動
-                        if (bitmapLayout != null)
-                        {
-                            ursimBatch.Bitmap = bitmapLayout.Value.Rows;
-                            ursimBatch.ExpectedCells = bitmapLayout.Value.Cells;
-                            ursimBatch.CellSizeM = bitmapLayout.Value.CellXM;
-                            ursimBatch.CellSizeXM = bitmapLayout.Value.CellXM;
-                            ursimBatch.CellSizeYM = bitmapLayout.Value.CellYM;
-                        }
+                            Comment = "3D 疊放 URSim 驗證", RobotTarget = "ursim", LayeredGrasp = true, SkipPreview = true };
                         Save(isaacDir, "ursim_batch.json", ursimBatch);
-                        var simCheckPath3d = Path.Combine(assets, "sim_check.json");
-                        if (File.Exists(simCheckPath3d)) File.Delete(simCheckPath3d);
                         AtomicWrite(Path.Combine(assets, "current_step.json"), ursimBatch);
                         var ursimExecution = await Wait(attempt, ursimBatchId);
                         Save(isaacDir, "ursim_execution.json", ursimExecution);
-                        var simCheck3d = bitmapLayout != null ? ReadSimulationCheck(simCheckPath3d, ursimBatchId, isaacDir) : null;
-                        if (simCheck3d is { Performed: true })
-                            trace.Add($"Unity 預覽逐層比對立體 bitmap {(simCheck3d.Passed ? "通過" : "未通過")}（重疊率 {simCheck3d.OverlapRatio * 100:F0}%）");
                         if (ursimExecution == null || !ursimExecution.Completed)
                         {
                             string reason = ursimExecution?.Error ?? "沒有回報原因";
@@ -314,13 +319,19 @@ while (true)
                             throw new InvalidOperationException("URSim 執行失敗（實機未動）：" + reason);
                         }
                         trace.Add("URSim 執行完成");
-                        stage = "Isaac Sim 幾何驗證";
+                        stage = "Isaac Sim 物理檢查與畫面重疊率";
                         var report = await IsaacSimExecutor.EndVerifyAsync(isaacDir);
+                        if (report.OverlapRatio is double overlap3d)
+                        {
+                            Console.WriteLine($"[Isaac Sim] 畫面重疊率 {overlap3d * 100:F0}%（整體對齊後，要大於 90%）；比對圖 {Path.Combine(isaacDir, "isaac_overlap.png")}");
+                            trace.Add($"Isaac 畫面重疊率 {overlap3d * 100:F0}%（整體對齊後）");
+                        }
                         if (!report.Pass)
                             throw new InvalidOperationException("Isaac Sim 驗證未通過（實機未動）：" + string.Join("；", report.Reasons));
-                        trace.Add("Isaac Sim 幾何驗證通過");
+                        trace.Add("Isaac Sim 物理檢查與畫面重疊率通過");
                         stage = "Isaac Sim 模擬畫面判定";
-                        var isaacVerdict = await llm.Validate(goal, before, report.Scene, report.Frame, isaacDir);
+                        var isaacVerdict = await llm.Validate(goal, before, report.Scene, report.Frame, isaacDir,
+                            ExperimentLlm.IsaacImageNote, "isaac_validation");
                         if (isaacVerdict.Split('\n')[0].Trim() != "PASS")
                             throw new InvalidOperationException("Isaac Sim 模擬畫面判定未通過（實機未動）：" + isaacVerdict);
                         trace.Add("Isaac Sim 模擬畫面判定通過");
@@ -334,30 +345,18 @@ while (true)
                                           : "[Isaac Sim] 3D 驗證通過，開始送實體手臂。");
 
                     // 正式執行整批一次送：步驟、來源位置、積木高度都跟 URSim 驗證的那一批相同，實機跑的就是
-                    // Isaac 驗證過的同一條關節軌跡。逐步送的話每一步結束都要回 Ready，那些收尾路徑驗證時沒有，
-                    // 有些位置回不去（肘關節奇異點）。步驟之間不再重新觀測與局部驗證，最後由整體驗證判定。
-                    stage = "3D 疊放整批執行前檢查";
-                    stageKind = "precheck";
-                    var current = await Scene();
-                    for (int k = 0; k < translated.Steps.Count; k++)
-                    {
-                        if (!ExperimentChecks.Resolve(translated.Steps[k], before, current, out var now, out var error))
-                            throw new InvalidOperationException($"第 {k + 1} 個操作：{error}");
-                        var verified = ursimSteps[k].SourcePosition!;
-                        double driftM = Math.Sqrt(Math.Pow(now.Source!.X - verified.X, 2) + Math.Pow(now.Source.Y - verified.Y, 2));
-                        if (driftM > VerifiedSourceDriftM)
-                            throw new InvalidOperationException(
-                                $"第 {k + 1} 個操作的來源 {now.Source.Name} 在驗證後移動了 {driftM * 1000:F0} mm，不能沿用驗證過的軌跡。");
-                    }
+                    // Isaac 驗證過的同一條關節軌跡。相機只在任務開始拍一次，送出前不再重新觀測
                     stage = "3D 疊放整批在實體手臂執行";
                     stageKind = "execution";
                     var executionSteps = ursimSteps.Select(s => new StepEnvelope { StepId = ++stepId, SourcePosition = s.SourcePosition,
                         TargetPosition = s.TargetPosition, ActionSequence = s.ActionSequence, Comment = "自由規劃實驗",
                         SourceTopM = s.SourceTopM, TargetTopM = s.TargetTopM }).ToList();
                     int batchId3d = ++stepId;
-                    // 純模擬時「實機」就是 URSim：標 robot_target = "ursim"，Unity 不會連實體手臂
+                    // 純模擬時「實機」就是 URSim：標 robot_target = "ursim"，Unity 不會連實體手臂。
+                    // 3D 不用 Unity 模擬，這批也不預覽（SkipPreview）
                     var batch3d = new BatchEnvelope { BatchId = batchId3d, Steps = executionSteps,
-                        Comment = "3D 疊放正式執行（整批，同驗證軌跡）", LayeredGrasp = true, RobotTarget = sim ? "ursim" : "" };
+                        Comment = "3D 疊放正式執行（整批，同驗證軌跡）", LayeredGrasp = true, RobotTarget = sim ? "ursim" : "",
+                        SkipPreview = true };
                     Save(dir, $"batch_{batchId3d}.json", batch3d);
                     AtomicWrite(Path.Combine(assets, "current_step.json"), batch3d);
                     Console.WriteLine($"[實驗] 第 {attempt} 輪已送出 3D 整批（{executionSteps.Count} 個操作）：batch {batchId3d}。");
@@ -376,16 +375,14 @@ while (true)
                     robotOperations = executionSteps.Count;
                     trace.Add($"3D 疊放 {executionSteps.Count} 個操作整批由實體手臂執行完成");
                 }
-                // 2D：整批一次送。Unity 先預覽整批，模擬結束跟計畫畫出的 bitmap 比對（重疊率要大於門檻），
-                // 通過才整批送實機，不通過實機完全不動。步驟之間不重新觀測、不做局部驗證（跟 3D 相同），
-                // 最後由整體驗證判定。2D 的夾取深度與參數不變（不帶 layered_grasp）。
+                // 2D：Unity 先只預覽整批（preview_only，手臂不動），模擬結束拍 Unity 畫面跟計畫畫出的 bitmap 比對（畫面重疊率要大於門檻），
+                // 再讓 LLM 看 Unity 主相機的畫面判定；兩項都通過才把同一批送實體手臂（SkipPreview，不再預覽），不需要 Isaac。
+                // 純模擬：預覽通過就算執行完成。步驟之間不重新觀測。2D 的夾取深度與參數不變（不帶 layered_grasp）。
                 if (!stacked3d)
                 {
-                    trace.Add("判定為 2D 平面擺放，整批先在 Unity 預覽並比對 bitmap，通過才整批執行");
+                    trace.Add("判定為 2D 平面擺放：Unity 模擬整批，畫面重疊率與 LLM 看 Unity 畫面都通過才送手臂");
                     var batchSteps = new List<StepEnvelope>();
                     var operationOf = new Dictionary<int, string>();
-                    // 這一批實際要搬的放置（純模擬的內建虛擬世界在執行完成後照這個更新）
-                    var placements = new List<(int Source, SceneObject Target, double TopM)>();
                     // 圖形裡的每個物件（含已經在目標上、不用搬的），畫 bitmap 與 Unity 比對用；
                     // 同一塊被搬兩次時只算最後放下的位置（key = 場景 index）
                     var figure = new Dictionary<int, SceneObject>();
@@ -431,89 +428,115 @@ while (true)
                             $"({assignment.Source.X:F3}, {assignment.Source.Y:F3}) → target ({step.Target!.X:F3}, {step.Target.Y:F3})）";
                         if (places) figure[step.SourceIndex] = FigureObject(step.Target!, heights2d[k].TargetTopM);
                         else figure.Remove(step.SourceIndex);
-                        if (places) placements.Add((step.SourceIndex, step.Target!, heights2d[k].TargetTopM));
                     }
-                    if (batchSteps.Count == 0) trace.Add("所有操作的來源都已在目標 2 公分內，手臂不用動");
+                    if (batchSteps.Count == 0)
+                    {
+                        stage = "執行前檢查（沒有要移動的操作）";
+                        stageKind = "precheck";
+                        throw new InvalidOperationException("執行前檢查：所有操作的來源都已在目標 2 公分內，沒有要在模擬中驗證的動作。");
+                    }
+                    if (bitmapLayout == null && figure.Count == 0)
+                    {
+                        stage = "執行前檢查（沒有放下物件）";
+                        stageKind = "precheck";
+                        throw new InvalidOperationException("執行前檢查：計畫沒有放下任何物件，Unity 沒有可以比對的圖形。");
+                    }
+                    int previewBatchId = ++stepId;
+                    var batch2d = new BatchEnvelope { BatchId = previewBatchId, Steps = batchSteps,
+                        Comment = "2D 整批 Unity 模擬驗證（只預覽，手臂不動）", PreviewOnly = true, RobotTarget = sim ? "ursim" : "" };
+                    var (rows, cells, cellX, cellY) = bitmapLayout ?? FigureBitmap.Build(figure.Values.ToList());
+                    batch2d.Bitmap = rows;
+                    batch2d.ExpectedCells = cells;
+                    batch2d.CellSizeM = cellX;
+                    batch2d.CellSizeXM = cellX;
+                    batch2d.CellSizeYM = cellY;
+                    FigureBitmap.Print($"[Bitmap] 第 {attempt} 輪計畫的圖形（{figure.Count} 個物件，格距 X {cellX * 1000:F0} mm、" +
+                                       $"Y {cellY * 1000:F0} mm，跟相機畫面同方向：上 = +Y、右 = +X）：", rows);
+                    // 排字母時每個字母最多 5×5 格：超過就不送，算執行前檢查失敗
+                    var sizeProblem = bitmapPlan == null ? FigureBitmap.LetterSizeProblem(FigureBitmap.LetterCount(goal), rows) : null;
+                    if (sizeProblem != null)
+                    {
+                        stage = "執行前檢查（字母 bitmap 大小）";
+                        stageKind = "precheck";
+                        throw new InvalidOperationException("執行前檢查：" + sizeProblem);
+                    }
+                    Save(dir, $"batch_{previewBatchId}.json", batch2d);
+                    stage = "2D 整批 Unity 模擬";
+                    stageKind = "simulation";
+                    var simCheckPath = Path.Combine(assets, "sim_check.json");
+                    ClearSimulationCheckFiles();
+                    AtomicWrite(Path.Combine(assets, "current_step.json"), batch2d);
+                    Console.WriteLine($"[實驗] 第 {attempt} 輪已送出 2D 整批給 Unity 模擬（{batchSteps.Count} 個操作，手臂不動）：batch {previewBatchId}。");
+                    var preview = await Wait(attempt, previewBatchId);
+                    Save(dir, $"execution_{previewBatchId}.json", preview);
+                    var simCheck = ReadSimulationCheck(simCheckPath, previewBatchId, dir);
+                    if (preview == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
+                    if (simCheck is { Performed: true })
+                        trace.Add($"Unity 畫面重疊率 {simCheck.OverlapRatio * 100:F0}%（{(simCheck.Passed ? "通過" : "未通過")}）");
+                    if (!preview.Completed)
+                    {
+                        if (simCheck is { Performed: true, Passed: false })
+                        {
+                            stage = "2D Unity 畫面重疊率";
+                            throw new InvalidOperationException(
+                                $"Unity 模擬的畫面跟計畫畫出的 bitmap 不吻合（手臂未動）：畫面重疊率 {simCheck.OverlapRatio * 100:F0}%，" +
+                                $"要大於 {simCheck.OverlapThreshold * 100:F0}%；" + string.Join("；", simCheck.Errors));
+                        }
+                        // Unity 的錯誤用內部 step_id，換成第幾個操作與它的來源、目標，反思才對得上計畫
+                        throw new InvalidOperationException($"2D 整批 Unity 模擬失敗（手臂未動）：{preview.Error ?? "沒有回報原因"}" +
+                            $"\n（Unity 的 step_id：{string.Join("；", operationOf.Select(p => $"{p.Key} = {p.Value}"))}；座標只適用本輪觀測）");
+                    }
+                    if (simCheck is not { Performed: true, Passed: true })
+                    {
+                        stage = "2D Unity 畫面重疊率";
+                        throw new InvalidOperationException("Unity 模擬沒有回報畫面重疊率，不能送手臂。");
+                    }
+                    // LLM 視覺驗證：看 Unity 模擬結束時主相機的畫面；目前場景 = 預覽落點更新後的位置
+                    stage = "2D Unity 模擬畫面判定";
+                    var previewScene = PreviewScene(preview.FinalBlocks, before).Scene;
+                    Save(dir, "preview_scene.json", previewScene);
+                    var viewPath = string.IsNullOrEmpty(simCheck.ViewFile) ? null : Path.Combine(dir, simCheck.ViewFile);
+                    byte[]? unityView = viewPath != null && File.Exists(viewPath) ? File.ReadAllBytes(viewPath) : null;
+                    var unityVerdict = await llm.Validate(goal, before, previewScene, unityView, dir,
+                        ExperimentLlm.UnityImageNote, "unity_validation");
+                    if (unityVerdict.Split('\n')[0].Trim() != "PASS")
+                        throw new InvalidOperationException("Unity 模擬畫面判定未通過（手臂未動）：" + unityVerdict);
+                    trace.Add("Unity 模擬畫面判定通過");
+                    if (sim)
+                    {
+                        // 純模擬：Unity 模擬驗證通過就是執行完成；模擬世界照預覽的實際落點更新（不是計畫的座標）
+                        int moved = await ApplyPreviewResult(preview.FinalBlocks, before);
+                        Console.WriteLine($"[實驗] 第 {attempt} 輪純模擬：Unity 模擬驗證通過，2D 整批 batch {previewBatchId} 算執行完成，" +
+                                          $"模擬世界照預覽落點更新了 {moved} 個物件（沒有連 URSim 或實體手臂）。");
+                        trace.Add($"純模擬：Unity 模擬驗證通過就算執行完成，模擬世界照預覽落點更新了 {moved} 個物件");
+                    }
                     else
                     {
-                        int batchId2d = ++stepId;
-                        // 純模擬時「實機」就是 URSim：標 robot_target = "ursim"，Unity 不會連實體手臂
-                        var batch2d = new BatchEnvelope { BatchId = batchId2d, Steps = batchSteps,
-                            Comment = "2D 整批（Unity 預覽比對 bitmap 通過才執行）", RobotTarget = sim ? "ursim" : "" };
-                        if (bitmapLayout != null || figure.Count > 0)
-                        {
-                            var (rows, cells, cellX, cellY) = bitmapLayout
-                                ?? FigureBitmap.Build(figure.Values.ToList());
-                            batch2d.Bitmap = rows;
-                            batch2d.ExpectedCells = cells;
-                            batch2d.CellSizeM = cellX;
-                            batch2d.CellSizeXM = cellX;
-                            batch2d.CellSizeYM = cellY;
-                            FigureBitmap.Print($"[Bitmap] 第 {attempt} 輪計畫的圖形（{figure.Count} 個物件，格距 X {cellX * 1000:F0} mm、" +
-                                               $"Y {cellY * 1000:F0} mm，跟相機畫面同方向：上 = +Y、右 = +X）：", rows);
-                            // 排字母時每個字母最多 5×5 格：超過就不送，算執行前檢查失敗
-                            var sizeProblem = bitmapPlan == null ? FigureBitmap.LetterSizeProblem(FigureBitmap.LetterCount(goal), rows) : null;
-                            if (sizeProblem != null)
-                            {
-                                stage = "執行前檢查（字母 bitmap 大小）";
-                                stageKind = "precheck";
-                                throw new InvalidOperationException("執行前檢查：" + sizeProblem);
-                            }
-                        }
-                        Save(dir, $"batch_{batchId2d}.json", batch2d);
-                        stage = "2D 整批：Unity 預覽、bitmap 比對與實體手臂執行";
+                        // 正式執行：同一批步驟送實體手臂，不再預覽（SkipPreview）
+                        stage = "2D 整批在實體手臂執行";
                         stageKind = "execution";
-                        var simCheckPath = Path.Combine(assets, "sim_check.json");
-                        if (File.Exists(simCheckPath)) File.Delete(simCheckPath);
-                        AtomicWrite(Path.Combine(assets, "current_step.json"), batch2d);
-                        Console.WriteLine($"[實驗] 第 {attempt} 輪已送出 2D 整批（{batchSteps.Count} 個操作）：batch {batchId2d}。");
+                        var executionSteps = batchSteps.Select(s => new StepEnvelope { StepId = ++stepId, SourcePosition = s.SourcePosition,
+                            TargetPosition = s.TargetPosition, ActionSequence = s.ActionSequence, Comment = s.Comment }).ToList();
+                        int batchId2d = ++stepId;
+                        var execution2dBatch = new BatchEnvelope { BatchId = batchId2d, Steps = executionSteps,
+                            Comment = "2D 整批正式執行（Unity 模擬驗證已通過）", SkipPreview = true };
+                        Save(dir, $"batch_{batchId2d}.json", execution2dBatch);
+                        AtomicWrite(Path.Combine(assets, "current_step.json"), execution2dBatch);
+                        Console.WriteLine($"[實驗] 第 {attempt} 輪 Unity 模擬驗證通過，已送出 2D 整批給實體手臂（{executionSteps.Count} 個操作）：batch {batchId2d}。");
                         executionPending = true;
                         var execution2d = await Wait(attempt, batchId2d);
                         if (execution2d != null) executionPending = false;
                         Save(dir, $"execution_{batchId2d}.json", execution2d);
-                        var simCheck = ReadSimulationCheck(simCheckPath, batchId2d, dir);
                         if (execution2d == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
-                        if (simCheck is { Performed: true })
-                            trace.Add($"Unity 預覽的 bitmap 比對{(simCheck.Passed ? "通過" : "未通過")}（重疊率 {simCheck.OverlapRatio * 100:F0}%）");
-                        if (execution2d.Completed && simCheck is { Performed: true, Passed: true })
-                        {
-                            success = true;
-                            status = "success";
-                            attemptOutcomes.Add("success");
-                            trace.Add("bitmap overlap 達標，本次任務結束");
-                            Save(dir, "attempt_result.json", new { attempt, success = true,
-                                success_basis = "unity_bitmap_overlap", overlap_ratio = simCheck.OverlapRatio,
-                                robot_operations = 0 });
-                            File.WriteAllText(Path.Combine(dir, "feedback.txt"), string.Join(" → ", trace));
-                            Console.WriteLine($"[實驗] 成功！第 {attempt} 輪 bitmap 重疊率 {simCheck.OverlapRatio * 100:F0}%，本次任務結束。");
-                            break;
-                        }
                         if (!execution2d.Completed)
                         {
-                            if (simCheck is { Performed: true, Passed: false, VerificationEnabled: true })
-                            {
-                                stage = "2D 整批 Unity 預覽的 bitmap 比對";
-                                stageKind = "simulation";
-                                throw new InvalidOperationException(
-                                    $"Unity 預覽的結果跟計畫畫出的 bitmap 不吻合（實機未動）：重疊率 {simCheck.OverlapRatio * 100:F0}%，" +
-                                    $"要大於 {simCheck.OverlapThreshold * 100:F0}%；" + string.Join("；", simCheck.Errors));
-                            }
-                            // Unity 的錯誤用內部 step_id，換成第幾個操作與它的來源、目標，反思才對得上計畫
-                            var executionError = $"2D 整批執行失敗：{execution2d.Error ?? "沒有回報原因"}" +
-                                $"\n（Unity 的 step_id：{string.Join("；", operationOf.Select(p => $"{p.Key} = {p.Value}"))}；座標只適用本輪觀測）";
+                            var executionError = $"2D 整批執行失敗：{execution2d.Error ?? "沒有回報原因"}";
                             Console.WriteLine($"[實驗] 第 {attempt} 輪 Unity/UR3 退回：{executionError}");
                             throw new InvalidOperationException(executionError);
                         }
                         Console.WriteLine($"[實驗] 第 {attempt} 輪 Unity/UR3 已完成 2D 整批 batch {batchId2d}。");
-                        robotOperations = batchSteps.Count;
-                        if (sim && virtualWorld != null)
-                        {
-                            // 內建虛擬世界沒有物理：通過 bitmap 比對、URSim 跑完，就照計畫把放下的物件移過去
-                            foreach (var (source, target, topM) in placements) virtualWorld.Place(source, target, topM);
-                            virtualWorld.Write(assets);
-                            trace.Add($"內建虛擬世界依計畫更新了 {placements.Count} 個物件的位置（沒有物理模擬）");
-                        }
-                        trace.Add($"2D {batchSteps.Count} 個操作整批由實體手臂執行完成");
+                        robotOperations = executionSteps.Count;
+                        trace.Add($"2D {executionSteps.Count} 個操作整批由實體手臂執行完成");
                     }
                 }
             }
@@ -525,22 +548,30 @@ while (true)
                 trace.Add($"在「{stage}」停止");
                 Console.WriteLine($"[實驗] 第 {attempt} 輪轉譯失敗：{failure}");
             }
-            catch (InvalidOperationException ex) { failure = ex.Message; failureKind = stageKind; trace.Add($"在「{stage}」停止"); }
-            trace.Add($"實體手臂完整執行了 {robotOperations} 個操作");
-            var after = await Scene();
-            Save(dir, "after_scene.json", after);
-            // 跟 Unity SceneSyncer 執行後刷新場景對應：把這次嘗試的真實結果投影回 Isaac Sim（背景）。純模擬不投影。
-            if (!sim) IsaacSimExecutor.SyncRealScene(after, camera);
-            var afterImage = await Frame(dir, "after.jpg");
-            var verdict = await llm.Validate(goal, initial, after, afterImage, dir);
-            var attemptFeedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n執行／局部觀察：{failure}\n整體觀察：{verdict}";
+            catch (InvalidOperationException ex)
+            {
+                failure = ex.Message;
+                failureKind = stageKind;
+                trace.Add($"在「{stage}」停止");
+                // 執行階段的退回原因在送出的地方就印過了
+                if (stageKind != "execution")
+                    Console.WriteLine($"[實驗] 第 {attempt} 輪在「{stage}」停止：{failure}");
+            }
+            trace.Add(sim ? $"純模擬沒有實體手臂；URSim 執行了 {robotOperations} 個操作" : $"實體手臂完整執行了 {robotOperations} 個操作");
+            // 執行完不再用相機驗證：模擬驗證都通過、手臂（純模擬：模擬）做完就算成功
+            var attemptFeedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n模擬驗證或執行的問題：{(string.IsNullOrEmpty(failure) ? "無" : failure)}";
             File.WriteAllText(Path.Combine(dir, "feedback.txt"), attemptFeedback);
-            success = string.IsNullOrEmpty(failure) && after.Count > 0 && afterImage != null && verdict.Split('\n')[0].Trim() == "PASS";
-            if (!success && string.IsNullOrEmpty(failureKind)) failureKind = "global_validation";
+            success = string.IsNullOrEmpty(failure);
             attemptOutcomes.Add(success ? "success" : failureKind);
             Save(dir, "attempt_result.json", new { attempt, success, failure_kind = success ? null : failureKind,
                 failure_stage = string.IsNullOrEmpty(failure) ? null : stage, failure = string.IsNullOrEmpty(failure) ? null : failure });
-            if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標。"); break; }
+            if (success) { status = "success"; Console.WriteLine($"[實驗] 第 {attempt} 次達標（模擬驗證通過、執行完成）。"); break; }
+            // 手臂執行到一半失敗：桌面已經變了，相機又只在任務開始拍一次，不能再照舊的觀測重新嘗試
+            if (failureKind == "execution")
+            {
+                Console.WriteLine($"[實驗] 第 {attempt} 輪手臂執行失敗，桌面狀態已改變；相機只在任務開始拍一次，這個任務結束。");
+                break;
+            }
             // 沒有 Reflection：不產生規則、不帶任何本輪資訊到下一輪，直接用全新的獨立嘗試重來。
             Console.WriteLine($"[實驗] 第 {attempt} 次未達標，不使用 Reflection，直接以全新獨立嘗試重新規劃。");
         }
@@ -570,7 +601,43 @@ void AtomicWrite(string path, object value)
     File.Move(path + ".tmp", path, true);
 }
 // Unity 預覽結束比對 bitmap 的報告（StreamingAssets/sim_check.json，Unity 在送實機之前寫）：印在 terminal，存進這一輪
-SimulationCheckReport? ReadSimulationCheck(string path, int batchId, string dir)
+// 純模擬的 2D：把 Unity 預覽結束時方塊的落點寫回模擬世界，回傳更新了幾個物件。Unity 回報每塊被放下的方塊
+// 預覽前、後的位置，依預覽前的位置對回場景 index（2 cm 內最近的那塊）。內建虛擬世界直接改位置；
+// 開著 Isaac 時 Isaac 就是世界，用同樣的物件清單重新載入（方塊直接放到落點，沒有物理過程）
+async Task<int> ApplyPreviewResult(List<PreviewBlock>? blocks, List<SceneObject> scene)
+{
+    var (updated, changed) = PreviewScene(blocks, scene);
+    if (changed.Count == 0) return 0;
+    if (virtualWorld != null)
+    {
+        foreach (int i in changed) virtualWorld.Place(i, updated[i], updated[i].Z);
+        virtualWorld.Write(assets);
+    }
+    else await IsaacSimExecutor.LoadSimSceneAsync(updated, null);
+    return changed.Count;
+}
+// 預覽結束時的場景（2D 的 LLM 視覺驗證與更新模擬世界共用）：被放下的方塊換成預覽落點，回傳更新後的場景與改到的 index
+static (List<SceneObject> Scene, HashSet<int> Changed) PreviewScene(List<PreviewBlock>? blocks, List<SceneObject> scene)
+{
+    var updated = scene.Select(o => new SceneObject { Name = o.Name, Shape = o.Shape, Orientation = o.Orientation,
+        X = o.X, Y = o.Y, Z = o.Z, SkewDeg = o.SkewDeg }).ToList();
+    var changed = new HashSet<int>();
+    foreach (var b in blocks ?? new List<PreviewBlock>())
+    {
+        double Distance(int i) => Math.Sqrt(Math.Pow(scene[i].X - b.FromX, 2) + Math.Pow(scene[i].Y - b.FromY, 2));
+        int index = Enumerable.Range(0, scene.Count).Where(i => !changed.Contains(i) && Distance(i) <= 0.02)
+            .OrderBy(Distance).DefaultIfEmpty(-1).First();
+        if (index < 0) continue;
+        updated[index].X = b.X;
+        updated[index].Y = b.Y;
+        updated[index].Z = b.Z;
+        updated[index].SkewDeg = 0;
+        if (!string.IsNullOrEmpty(b.Orientation)) updated[index].Orientation = b.Orientation;
+        changed.Add(index);
+    }
+    return (updated, changed);
+}
+SimulationCheckReport? ReadSimulationCheck(string path, int batchId, string dir, IReadOnlyList<ExpectedCell>? cells = null)
 {
     if (!File.Exists(path)) return null;
     SimulationCheckReport? report;
@@ -578,11 +645,41 @@ SimulationCheckReport? ReadSimulationCheck(string path, int batchId, string dir)
     catch (Exception ex) when (ex is IOException or JsonException) { return null; }
     if (report == null || report.BatchId != batchId) return null;
     File.Copy(path, Path.Combine(dir, "sim_check.json"), true);
-    // Unity 渲染出來逐格比對用的那張圖，跟 sim_check.json 放在同個資料夾，留底進這一輪方便事後對照
-    string coverageImage = Path.Combine(Path.GetDirectoryName(path)!, $"coverage_batch_{batchId}.jpg");
-    if (File.Exists(coverageImage)) File.Copy(coverageImage, Path.Combine(dir, $"coverage_batch_{batchId}.jpg"), true);
-    PrintSimulationCheck(report);
+    // 比對圖跟 sim_check.json 放在同一個 StreamingAssets；加上重疊率與說明後存進這一輪的資料夾，加註失敗就存原圖
+    string? image = null;
+    var imageSource = string.IsNullOrEmpty(report.ImageFile) ? null : Path.Combine(Path.GetDirectoryName(path)!, report.ImageFile);
+    if (imageSource != null && File.Exists(imageSource))
+    {
+        image = Path.Combine(dir, report.ImageFile!);
+        try { SimCheckImage.Annotate(imageSource, image, report, cells); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Bitmap 比對] 比對圖加註失敗，存原圖：{ex.Message}");
+            File.Copy(imageSource, image, true);
+        }
+    }
+    // Unity 拍的照片原樣存進這一輪的資料夾
+    var photos = new List<string>();
+    foreach (var name in new[] { report.PhotoFile, report.ViewFile })
+    {
+        if (string.IsNullOrEmpty(name)) continue;
+        var source = Path.Combine(Path.GetDirectoryName(path)!, name);
+        if (!File.Exists(source)) continue;
+        File.Copy(source, Path.Combine(dir, name), true);
+        photos.Add(Path.Combine(dir, name));
+    }
+    PrintSimulationCheck(report, image);
+    if (photos.Count > 0) Console.WriteLine($"           Unity 照片（正上方 / 主相機）：{string.Join("、", photos)}");
     return report;
+}
+// 送出要比對的批次前，刪掉上一批留下的比對結果與照片，免得讀到舊的
+void ClearSimulationCheckFiles()
+{
+    foreach (var name in new[] { "sim_check.json", "sim_check.png", "unity_top.png", "unity_view.png" })
+    {
+        var file = Path.Combine(assets, name);
+        if (File.Exists(file)) File.Delete(file);
+    }
 }
 // 場景、照片：實機來自相機（perception_server），純模擬來自 Isaac Sim（同格式）
 async Task<List<SceneObject>> Scene()
@@ -713,7 +810,7 @@ static SceneObject FigureObject(SceneObject target, double topM) => new()
     Name = target.Name, Shape = target.Shape, Orientation = target.Orientation,
     X = target.X, Y = target.Y, Z = topM, SkewDeg = target.SkewDeg
 };
-static void PrintSimulationCheck(SimulationCheckReport report)
+static void PrintSimulationCheck(SimulationCheckReport report, string? image)
 {
     var previousColor = Console.ForegroundColor;
     if (!report.Performed)
@@ -725,9 +822,10 @@ static void PrintSimulationCheck(SimulationCheckReport report)
     }
     Console.ForegroundColor = report.Passed ? ConsoleColor.Green : ConsoleColor.Red;
     Console.WriteLine($"[Bitmap 比對] batch {report.BatchId}：{(report.Passed ? "✓ 吻合" : "✗ 不吻合")} — " +
-                      $"重疊率 {report.OverlapRatio * 100:F0}%（要大於 {report.OverlapThreshold * 100:F0}%），" +
-                      $"{report.CorrectCount}/{report.ExpectedCount} 個物件放對");
+                      $"Unity 畫面重疊率 {report.OverlapRatio * 100:F0}%（要大於 {report.OverlapThreshold * 100:F0}%）；" +
+                      $"座標比對 {report.CorrectCount}/{report.ExpectedCount} 個物件放對");
     Console.ForegroundColor = previousColor;
+    if (image != null) Console.WriteLine($"           比對圖（左：Unity 俯視畫面；右：綠 重疊、紅 該有沒有、藍 多出來）：{image}");
     if (!report.Passed)
         Console.WriteLine(report.VerificationEnabled
             ? "           實體手臂不會動作"
@@ -736,7 +834,7 @@ static void PrintSimulationCheck(SimulationCheckReport report)
     if (rows > 0)
     {
         int width = report.ExpectedRows.Concat(report.ResultRows).Max(r => r.Length);
-        Console.WriteLine("           預期 bitmap / 模擬結果（■ 正確  ✗ 少放或錯誤  ● 多放或放錯  □ 空）");
+        Console.WriteLine("           預期 bitmap / 座標比對結果（■ 正確  ✗ 少放或錯誤  ● 多放或放錯  □ 空）");
         for (int r = 0; r < rows; r++)
         {
             string want = r < report.ExpectedRows.Count ? report.ExpectedRows[r] : "";

@@ -2,17 +2,17 @@
 
 以中文自然語言指令控制 UR3e 機械手臂的框架。RealSense D435i 即時偵測工作台物件 → OpenAI gpt-5 解析指令 → Unity 送 URScript 到手臂。
 
-目前每輪採獨立自由規劃，不使用 Reflection；每個任務以收到指令時的桌面為起點（設 `FIXED_BASELINE=1` 則要求每個任務先恢復同一個固定配置），不限嘗試次數，成功或手動中止才結束。操作方式、重置基準與評分限制見 [實驗協定](docs/experiment_protocol.md)。
+目前每輪採獨立自由規劃，不使用 Reflection；每個任務以收到指令時的桌面為起點（設 `FIXED_BASELINE=1` 則要求每個任務先恢復同一個固定配置），不限嘗試次數，成功或手動中止才結束；2026-10-08 起手臂執行到一半失敗時桌面已改變，任務也直接結束。操作方式、重置基準與評分限制見 [實驗協定](docs/experiment_protocol.md)。
 
 ## 系統流程
 
-每個移動動作的 `tcp_pose`（x、y、z、rx、ry、rz）由 LLM 決定。位置使用 QR 工作座標公尺，方向使用 UR 基座的旋轉向量弧度。Unity 只套用校正座標平移，透過 URSim 30002 的 secondary URScript 查詢 `get_inverse_kin`，經 RTDE 30004 接收暫存器 24～29 的六軸解，以同一組解進行預覽和後續執行；本地運動學只作 FK 與關節碰撞檢查，不為這條路徑求 IK、不另補 TCP 點或方向。查詢程式不含移動指令，不替換 URSim 的主程式。控制器須支援外部 RTDE 暫存器及帶 tcp 參數的 `get_inverse_kin_has_solution`。查詢無逾時限制，可用手動中止或退出 Play 取消。原本的自動 Ready/Home 收尾不再附加到此路徑，最後位置由 LLM 的最後一個移動決定。
+每個移動動作的 `tcp_pose`（x、y、z、rx、ry、rz）由 LLM 決定。位置使用 QR 工作座標公尺，方向使用 UR 基座的旋轉向量弧度。Unity 只套用校正座標平移，把 TCP 姿態解成六軸關節角，以同一組解進行預覽和後續執行，不另補 TCP 點或方向。2026-10-08 起 2D 批次用 Unity 本地 IK（`UR3eKinematics.cs`，同 main、rulebased：從上一個姿勢的關節角找最近的解），不用開 URSim；3D 批次照舊透過 URSim 30002 的 secondary URScript 查詢 `get_inverse_kin`，經 RTDE 30004 接收暫存器 24～29 的六軸解（3D 本來就要開 URSim 給 Isaac Sim 跟隨）。JsonExecutor 的 `Unity Ik For 2D` 關掉時 2D 也改回 URSim 解。在這之前 2D 也由 URSim 解，本地運動學只作 FK 與關節碰撞檢查。URSim 的查詢程式不含移動指令，不替換 URSim 的主程式。控制器須支援外部 RTDE 暫存器及帶 tcp 參數的 `get_inverse_kin_has_solution`。查詢無逾時限制，可用手動中止或退出 Play 取消。原本的自動 Ready/Home 收尾不再附加到此路徑，最後位置由 LLM 的最後一個移動決定。
 
 2D 圖形的 bitmap 生成採用 `LLM_RobotArm.zip` 的 `PatternDesigner` 雙模型流程：OpenAI（gpt-5）與 Gemini 各自生成、互相審查並提供修正版，多個候選以 OpenAI 80% / Gemini 20% 匿名評分選出，最多兩輪。2026-10-07 起決選只剩一張（另一張沒過互審，或兩張一樣被合併）時，兩個模型仍要替它打分，OpenAI 80%、Gemini 20% 加權達 0.5 才採用，沒達到就進下一輪重畫；之前只剩一張時直接採用、不投票。需設定 `OPENAI_API_KEY` 與 `GEMINI_API_KEY`；`GEMINI_MODEL` 可覆寫 zip 預設的 `gemini-3.1-flash-lite`。選出的圖形存於每輪的 `canonical_bitmap.json`。bitmap 最多 5 列 × 5 欄，生成候選與審查修正版均受尺寸檢查；庫存計算包含目前場景全部積木，不劃供料區，也不由程式預選顏色。
 
-後續 LLM 依目前場景自行找空位、選來源積木並決定原點、X/Y 格距與放置座標；以 `bitmap_grid(left_x, top_y, cell_x, cell_y, top_z)` 描述自行選出的座標系，記錄在 `bitmap_layout.json`。程式只將原始 bitmap 映射到該座標系供 Unity 比對，不再固定 target 或執行前強制對齊固定座標。Unity 跑完整批模擬及手臂收尾後，在還原積木之前拍攝覆蓋率照片；拍攝期間排除手臂模型與其陰影。模擬畫面轉成 bitmap，再與原始目標 bitmap 比較 overlap，公式與門檻維持原樣。比對通過就顯示成功並結束本次任務，不再送出手臂動作、不呼叫 global_validation、不進入下一輪；服務繼續等待新的使用者指令。
+後續 LLM 依目前場景自行找空位、選來源積木並決定原點、X/Y 格距與放置座標；以 `bitmap_grid(left_x, top_y, cell_x, cell_y, top_z)` 描述自行選出的座標系，記錄在 `bitmap_layout.json`。程式只將原始 bitmap 映射到該座標系供 Unity 比對，不再固定 target 或執行前強制對齊固定座標。2026-10-08 起驗證照 main 的方式（三個版本相同，見下方「模擬驗證」）：預期格是原始 bitmap 映射到這個座標系的位置，Unity 模擬整批後只拍方塊（背景洋紅、1 mm 一格）比畫面重疊率（Σ min ÷ Σ max，要大於 90%），再由 LLM 看 Unity 的模擬畫面判 PASS，兩關都過才把同一批送實體手臂。之前的覆蓋率照片（方塊蓋住格子中心才算那格有方塊，放對的格數 ÷（預期格數 + 多出來的格數））與「比對通過就顯示成功、不送手臂」已移除。
 
-立體圖形（2026-10-07 從 main 搬來）：拆解的 LLM 判斷需要排出往上疊、立起來的圖形時，另寫一行「需要立體 bitmap」（平面仍是「需要平面 bitmap」），就用 release 260917 的 `SpatialPatternDesigner` 畫俯視高度圖（每格的數字 = 那格疊幾層；prompt 是 260917 原文，生成的 prompt 最後多一行說明 column_heights 的列、欄各對應哪個方向，畫布照 260917 的正面一排 × 3 欄 × 3 層），跟平面一樣 OpenAI／Gemini 各畫一張、互審對方的正面圖、80/20 匿名評分，最多兩輪。規劃一樣自己選位置並寫 `bitmap_grid`，`top_z` 是放在桌面那一層的頂面，往上每層加一塊積木高；每一格的每一層各是一個預期格。目標是立體時一律走 3D：Unity 預覽結束後逐層切開拍（第 1 張含桌面，第 k 張只留比第 k 層中間高的部分），量出每格疊到第幾層，重疊率 = Σ min(畫面層數, 預期層數) ÷ Σ max(…)，過門檻才送 URSim 給 Isaac 驗證；2D 那種「比對通過就結束」只適用平面，立體照舊由 Isaac 幾何、畫面判定與整體驗證決定成不成功。3D 批次的手臂自撞改用手臂模型外型（`ArmMeshSelfCollision.cs`，手臂與夾爪的模型檔要開 Read/Write），Isaac 驗證期間也用 USD 碰撞體檢查自撞，碰到就判驗證不通過、實機不動。
+立體圖形（2026-10-07 從 main 搬來）：拆解的 LLM 判斷需要排出往上疊、立起來的圖形時，另寫一行「需要立體 bitmap」（平面仍是「需要平面 bitmap」），就用 release 260917 的 `SpatialPatternDesigner` 畫俯視高度圖（每格的數字 = 那格疊幾層；prompt 是 260917 原文，生成的 prompt 最後多一行說明 column_heights 的列、欄各對應哪個方向，畫布照 260917 的正面一排 × 3 欄 × 3 層），跟平面一樣 OpenAI／Gemini 各畫一張、互審對方的正面圖、80/20 匿名評分，最多兩輪。規劃一樣自己選位置並寫 `bitmap_grid`，`top_z` 是放在桌面那一層的頂面，往上每層加一塊積木高；每一格的每一層各是一個預期格。目標是立體時一律走 3D（2026-10-08 起）：Unity 不預覽，只把軌跡轉送 URSim，Isaac 跟隨 URSim 做物理；Isaac 的物理檢查、畫面重疊率（預期格是原始高度圖映射到 `bitmap_grid` 的每一層，整體對齊 ±5 mm 後 Σ min ÷ Σ max 要大於 90%）與 LLM 看 Isaac 畫面都通過才送實體手臂。之前是先在 Unity 預覽逐層切開比對，再由 Isaac 幾何、畫面判定與整體驗證決定。3D 批次的手臂自撞改用手臂模型外型（`ArmMeshSelfCollision.cs`，手臂與夾爪的模型檔要開 Read/Write），Isaac 驗證期間也用 USD 碰撞體檢查自撞，碰到就判驗證不通過、實機不動。
 
 ```
 Unity UI（輸入指令）
@@ -26,14 +26,16 @@ perception_server (Python + Flask)
    ↓
 LLM 自由拆解子任務 → 自然語言操作計畫
    ↓  LLM 執行資料規劃 → JSON（來源、目標、動作順序與參數由 LLM 決定）
-MotionPlanValidator + 積木重疊檢查 → Unity 整批（2D 先預覽並比對 bitmap；3D 先在 URSim/Isaac 驗證）
+MotionPlanValidator + 積木重疊檢查
    ↓
-獨立視覺模型整體驗證
-   └─ 未達標：全新獨立嘗試（不限次數，不使用 Reflection）
-   ↓  StreamingAssets/current_step.json（robot function sequence）
+模擬驗證（相機只在收到指令時拍一次，之後都看模擬畫面）
+   ├─ 2D：Unity 整批模擬 → Unity 畫面重疊率 > 90% ＋ LLM 看 Unity 畫面判 PASS（不需要 Isaac Sim、URSim）
+   ├─ 3D：Unity 只轉送 URSim、Isaac Sim 跟隨做物理 → 物理檢查 ＋ 畫面重疊率（整體對齊 ±5 mm）> 90% ＋ LLM 看 Isaac 畫面判 PASS
+   └─ 未通過：全新獨立嘗試（不限次數，不使用 Reflection）
+   ↓  通過才送：StreamingAssets/current_step.json（robot function sequence）
 Unity JsonExecutor（高階 function → URScript）
    ↓  TCP 30002 URScript
-UR3e
+UR3e（做完就算成功，執行後不再用相機驗證）
 ```
 
 ## 檔案總覽
@@ -91,18 +93,27 @@ dotnet run
 
 **Debug**：瀏覽器 `http://localhost:5000/debug/live` 看即時偵測畫面。
 
-## 3D 疊放驗證：URSim + Isaac Sim
+## 模擬驗證：2D 用 Unity、3D 用 URSim + Isaac Sim
 
-- **2D 平面移動**：所有步驟包成一批，Unity 先預覽整批，模擬結果跟計畫畫出的 bitmap 比對（重疊率要大於 90%，`JsonExecutor.bitmapOverlapThreshold`），通過才整批送實體手臂；bitmap 與比對結果印在 csharp_server 的 terminal。
-- **3D 疊放**（任一步的目標壓在另一塊積木上，或比來源高出半層）：
-  1. csharp_server 把真實場景投影到 Isaac Sim（積木、相機、桌面與 QR1-4 範圍）。
-  2. 整輪步驟以 `robot_target = "ursim"` 交給 Unity，Unity 用同一套關節軌跡只在 **URSim** 執行，實體手臂不動。
+2026-10-08 起 main、zero-constraint、rulebased 三個版本用同一套驗證流程。相機（純模擬：虛擬場景）只在收到指令時讀一次
+場景、照片與相機位姿，之後的驗證都看模擬畫面；手臂做完就算成功，執行後不再拍照驗證。手臂執行到一半失敗時桌面已經變了，
+這個任務直接結束。給 LLM 驗證者的畫面附一句說明它看的是 Unity 或 Isaac 的模擬畫面（`ExperimentLlm.UnityImageNote` /
+`IsaacImageNote`），驗證者的 system prompt 不變。這個版本由 LLM 給 TCP 姿態，2D 用 Unity 本地 IK 解，
+不用開 URSim；3D 照舊由 URSim 解 IK。
+
+- **2D 平面移動**：所有步驟包成一批，Unity 先模擬整批（只預覽，手臂不動），預覽結束用正上方的正交相機只拍方塊（背景洋紅、1 mm 一格），跟原始 bitmap 映射到 `bitmap_grid` 的預期格（沒有 `bitmap_grid` 時用計畫畫出的 bitmap）比畫面重疊率（Σ min ÷ Σ max，2D 就是交集 ÷ 聯集，要大於 90%，`JsonExecutor.bitmapOverlapThreshold`；比對圖存成 `sim_check.png`）。通過後由獨立的結果驗證者（LLM）看 Unity 主相機的模擬畫面（`unity_view.png`）與預覽後的場景判 PASS，兩關都過才把同一批（`skip_preview`，不再預覽）送實體手臂。不需要 Isaac Sim；bitmap 與比對結果印在 csharp_server 的 terminal。
+- **3D 疊放**（目標是立體，或任一步的目標壓在另一塊積木上、比來源高出半層）：
+  1. csharp_server 把收到指令時的場景投影到 Isaac Sim（積木、相機、桌面與 QR1-4 範圍）；純模擬時 Isaac 本身就是世界。
+  2. 整輪步驟以 `robot_target = "ursim"`、`skip_preview` 交給 Unity，Unity 不預覽，只用同一套關節軌跡轉送 **URSim** 執行，實體手臂不動。
   3. Isaac Sim 的手臂即時跟隨 URSim（唯讀埠 30013 的關節角 + DO4 夾爪），積木用物理模擬被夾起、放下。
-  4. URSim 跑完，Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定度、指尖是否低於桌面），
-     再由 LLM 看模擬畫面；都通過才把同一批（同樣的步驟、來源位置與積木高度）整批送實體手臂，
-     實機跑的就是 Isaac 驗證過的同一條關節軌跡。不通過就算這次嘗試失敗、進 Reflection。
-     整批送出前會確認來源積木在驗證後沒被移動（超過 1 cm 就不執行）；步驟之間不重新觀測、不做局部驗證，
-     由最後的整體驗證判定。逐步送會讓每一步結束都回 Ready，那些收尾路徑驗證時沒有，靠近手臂的目標位置常回不去。
+  4. URSim 跑完，Isaac 做物理檢查（位置、層高、傾斜、撞動其他積木、穩定度、指尖是否低於桌面、手臂有沒有自撞），
+     再比畫面重疊率：Isaac 量到的積木位姿依頂面高度換算層數，投影成 1 mm 一格的俯視高度圖，跟預期的高度圖
+     比 Σ min ÷ Σ max，要大於 90%（比對圖 `isaac_overlap.png`）。先把整個圖形在 ±5 mm 內平移對齊再算：
+     Isaac 的物理落點常整體偏約 2 mm，不對齊時放對也只有約 85%；對齊只容許整體平移，少一層、多一塊或轉 8° 仍不通過。
+     最後由 LLM 看 Isaac 的模擬畫面判 PASS。
+  5. 都通過才把同一批（同樣的步驟、來源位置與積木高度，`skip_preview`）整批送實體手臂，實機跑的就是 Isaac 驗證過的
+     同一條關節軌跡。任何一關不通過就算這次嘗試失敗、直接重新嘗試（不使用 Reflection），實機不動。步驟之間不重新觀測；
+     逐步送會讓每一步結束都回 Ready，那些收尾路徑驗證時沒有，靠近手臂的目標位置常回不去。
 
 **夾爪**：實體夾爪張開時兩指內側只有約 3.5 cm，每根手指厚、寬各約 1.5 cm（2026-09-30 實測），只跨得住 2.5 cm 的邊。
 手指沿工具 X 開合：夾 cube 時在 ±X 兩側；domino 一律跨短邊夾，橫放（長邊沿 X）的夾爪轉 90°、直放的用 0°
@@ -116,7 +127,7 @@ Isaac 啟動時把資產手指換成實測大小的直方塊（`--finger_thickne
 Unity 的夾爪模型沒有改，只用來顯示；Unity 的碰撞檢查只看手臂連桿對桌面與連桿之間，不看手指跟旁邊積木。
 
 Isaac Sim 不連實體手臂。URSim / Isaac 無法使用時記為 `infrastructure_error`（不計成功率）。
-URSim 驗證途中觸發安全停止時，Unity 最多等 300 秒讓人在 URSim 解除，逾時這一輪算失敗（`simulation`）並進 Reflection；
+URSim 驗證途中觸發安全停止時，Unity 最多等 300 秒讓人在 URSim 解除，逾時這一輪算失敗（`simulation`），直接重新嘗試；
 實體手臂的安全停止則無限期等待人工在 Teach Pendant 解除。
 
 **3D 分層夾取（只有 3D 批次）**：3D 的每一批（URSim 與通過後的實機）帶 `layered_grasp`，每一步帶
@@ -165,13 +176,13 @@ csharp_server 每個任務開始時讀一次，整個任務都用同一個模式
 |---|---|---|
 | 場景與照片 | perception_server（相機） | Isaac Sim 的 `/perception/*`（同格式）；沒開 Isaac 時 2D 用 csharp_server 內建的虛擬世界（俯視示意圖） |
 | 初始桌面 | 收到指令時的真實桌面 | 虛擬場景檔 `sim_scenes/*.json`：切換的當下載入並顯示，每個任務開始時再重建 Isaac 世界 |
-| 動作 | 實體 UR3e（3D 先在 URSim + Isaac 驗證） | 全部送 URSim，Isaac 跟隨 URSim 讓積木依物理移動 |
+| 動作 | 實體 UR3e（2D 先在 Unity、3D 先在 URSim + Isaac 驗證） | 2D：Unity 模擬驗證（畫面重疊率＋LLM 看 Unity 畫面）通過就算執行（不連 URSim、不需要 Isaac），模擬世界照預覽落點更新；3D：Isaac 驗證通過後正式執行也送 URSim，Isaac 跟隨 URSim 讓積木依物理移動 |
 | 紀錄 | `csharp_server/outputs/experiments/` | `csharp_server/outputs/experiments_sim/`（成功率另算） |
 
-沒開 Isaac Sim 時，csharp_server 每個任務開始連不到 Isaac 就改用內建的虛擬世界（`VirtualSimWorld.cs`），只支援 2D：起點是場景檔，2D 整批通過 Unity 預覽的 bitmap 比對、URSim 跑完後，照計畫把放下的物件移過去（沒有物理，不會被推動或傾倒）；給 LLM 的畫面是依座標畫的俯視示意圖（`TopViewRenderer.cs`，跟相機同方向）。世界寫在 `StreamingAssets/sim_world.json`，Unity 連不上 Isaac 時從這裡顯示積木、做預覽。遇到 3D 疊放會停下來並說明需要 Isaac（記為 infrastructure_error）。每個任務用哪一種記在 `sim_backend.txt`。
+沒開 Isaac Sim 時，csharp_server 每個任務開始連不到 Isaac 就改用內建的虛擬世界（`VirtualSimWorld.cs`），只支援 2D：起點是場景檔，2D 整批通過 Unity 模擬驗證（畫面重疊率＋LLM 看 Unity 畫面）就把方塊移到預覽的落點（沒有物理，不會被推動或傾倒）；收到指令時給 LLM 的畫面是依座標畫的俯視示意圖（`TopViewRenderer.cs`，跟相機同方向）。世界寫在 `StreamingAssets/sim_world.json`，Unity 連不上 Isaac 時從這裡顯示積木、做預覽。遇到 3D 疊放會停下來並說明需要 Isaac（記為 infrastructure_error）。每個任務用哪一種記在 `sim_backend.txt`。
 
 啟動（純模擬不用開 perception_server）：
-1. URSim 虛擬機開機、切 Remote Control。
+1. URSim 虛擬機開機、切 Remote Control（3D 疊放才需要；2D 用 Unity 本地 IK）。
 2. `D:\isaacsim\python.bat isaac_sim\isaac_sim_server.py --ursim_ip 192.168.50.221 --gui`（3D 疊放才需要；2D 沒開 Isaac 時自動改用內建的虛擬世界）
 3. `cd csharp_server` 後 `dotnet run`
 4. Unity Play → 下方指令列的「模式」切成純模擬 →「場景」按鈕輪流切換 `sim_scenes/` 裡的檔案 → 輸入指令。
@@ -183,7 +194,7 @@ csharp_server 每個任務開始時讀一次，整個任務都用同一個模式
 
 3D 疊放在純模擬裡照樣先驗證：驗證前 Isaac 記下積木位姿（`/sim/snapshot`），驗證跑完不論結果都放回去
 （`/sim/restore`），正式執行從驗證前的狀態開始，跟實機模式「驗證不會動到真實積木」一致。
-URSim 在純模擬途中安全停止時，Unity 最多等 300 秒，逾時這一輪算失敗。
+URSim（只有 3D 會動）在純模擬途中安全停止時，Unity 最多等 300 秒，逾時這一輪算失敗。
 
 虛擬場景檔格式（座標跟相機場景相同：QR 座標、公尺，z 是頂面高度，桌上一層 0.025、第二層 0.05）：
 ```json
@@ -201,7 +212,7 @@ URSim 在純模擬途中安全停止時，Unity 最多等 300 秒，逾時這一
   目前是從 2026-09-30 實拍畫面的 QR1-4 估計的）。相機或 QR 貼紙移動過，接上相機後執行
   `python isaac_sim/save_sim_camera.py` 換成 RealSense 的真實參數。
 - `run_mode.json` 的 `reset_each_task` 改成 false，之後的任務就接續目前的模擬世界，不重建。
-- 內建三個：`two_cubes`（黑、黃方塊各一）、`letter_blocks`（15 塊黃方塊排在桌面左側，前方與右側留空排字母）、`domino_cubes`。
+- 內建兩個，三個版本（main、zero-constraint、rulebased）的檔案完全相同：`yellow_cubes_15`（預設；15 塊黃方塊排成 5 欄 × 3 排，中心間距 6 cm，X 0.08～0.32、Y 0.06～0.18）、`domino_cube`（一塊橫放的黃 domino 在 (0.20, 0.10)、一塊黃方塊在 (0.12, 0.18)）。`run_mode.json` 指定的場景檔不存在時改用預設場景（2026-10-08 起；之前是 `two_cubes`、`letter_blocks`、`domino_cubes`）。
 
 限制：模擬回報的是 Isaac 的精確位置，沒有相機的偵測誤差、遮擋與高度偏差，結果會比實機樂觀；
 適合測 LLM 的規劃能力，不能取代實機成功率。

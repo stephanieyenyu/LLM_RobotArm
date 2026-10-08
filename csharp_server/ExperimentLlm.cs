@@ -40,7 +40,7 @@ public sealed class ExperimentLlm
         $"環境：QR 座標為公尺，X/Y 在桌面上，Z 向上；物件 Z 為頂面高度。{CoordinateDirections}cube 尺寸 0.025m，domino 為 0.05×0.025×0.025m。{WorkspaceFacts}{FigureAcceptance}{(CanonicalBitmap ? "" : LetterDesign)}{ImageNote}場景 index 只適用本輪目前清單，重新觀測後可能重排。\n" +
         "每一輪 operation plan 都必須在文字中完整列出每個 target 的實際 (x,y,z) 數值；不得只寫「沿用 P0~P4」、「維持既定目標點」或其他需要查舊輪上下文的代號。\n" +
         "執行介面提供 move_above(location,height_m)、descend(location)、grasp()、release()、lift(location,height_m)、wait(seconds)。location 可為 source 或 target；source 是本次操作所選的來源物件，target 是把來源物件放到的位置，target 的 Z 指來源物件放好後的頂面高度（與場景物件 Z 同一慣例）；height_m 是端點上方的距離。" +
-        "每個移動動作的 TCP 位置與方向都由你決定：列出 tcp_pose(x,y,z,rx,ry,rz)。x/y/z 為 QR 工作座標的實際 TCP 座標（公尺），不是積木頂面；rx/ry/rz 為 UR 基座座標的旋轉向量（弧度），不是 Euler 角。URSim 負責 IK，不要提供關節角度。請自行決定所有需要的中間 TCP 點，執行器不另補避障路徑。\n" +
+        "每個移動動作的 TCP 位置與方向都由你決定：列出 tcp_pose(x,y,z,rx,ry,rz)。x/y/z 為 QR 工作座標的實際 TCP 座標（公尺），不是積木頂面；rx/ry/rz 為 UR 基座座標的旋轉向量（弧度），不是 Euler 角。執行器負責 IK，不要提供關節角度。請自行決定所有需要的中間 TCP 點，執行器不另補避障路徑。\n" +
         "參數範圍：height_m 0.05～0.15 m，seconds 0.1～3；單次最多 50 個操作，每個操作最多 20 個函式。同一個操作內的函式依序執行，中途不會重新感知；每個操作開始前系統會重新觀測來源物件位置。" +
         GripperFacts +
         "介面不提供條件分支或同輪失敗後續跑；每輪只能提交一條確定且可執行的動作路徑，執行失敗後由下一輪根據新觀測重規劃。整批最後的 TCP 位置與方向仍由你決定，執行器不附加 Ready/Home 收尾。規劃內不得自行加入 go_home。這只是設備能力說明，不規定任務拆解、動作順序或完成方式。\n" +
@@ -68,7 +68,7 @@ public sealed class ExperimentLlm
             每筆 Actions 包含 function、location、height_m、seconds；不用的參數填 null。
             每個 move_above、descend、lift 動作必須另有 tcp_pose 物件，包含你決定的完整 x,y,z,rx,ry,rz。非移動動作 tcp_pose=null。
             tcp_pose 的 x/y/z 是 QR 工作座標的實際 TCP 位置（公尺），z 是 TCP 本身高度，不是物件頂面。rx/ry/rz 是 UR 基座座標的旋轉向量（弧度），不是 Euler 角。
-            URSim 依此姿態自動計算關節 IK。每個 TCP 點都是你的決定，程式不改方向、不補抬升或中間避障點。若需要中間點，請自行列出額外移動動作。
+            執行器依此姿態自動計算關節 IK。每個 TCP 點都是你的決定，程式不改方向、不補抬升或中間避障點。若需要中間點，請自行列出額外移動動作。
             可用 function：move_above、descend、grasp、release、lift、wait。
             move_above/lift 使用 location=source或target 及 height_m；descend 使用 location；grasp/release 無參數；wait 使用 seconds。
             height_m 是端點上方的距離，範圍 0.05～0.15 公尺；seconds 範圍 0.1～3。單批最多 50 個操作，每個操作最多 20 個函式。
@@ -92,16 +92,20 @@ public sealed class ExperimentLlm
             throw new TranslationContractException("LLM 執行資料不是有效 JSON：" + ex.Message, ex);
         }
     }
-    public Task<string> Validate(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image, string dir) => Call(
+    // 驗證看的是模擬畫面（2026-10-08 起相機只在任務開始拍一次）：2D 看 Unity 模擬結束時的主相機畫面，3D 看 Isaac Sim 的畫面
+    public const string UnityImageNote = "附圖是 Unity 模擬（預覽）結束時主相機的畫面，不是相機照片；方塊位置是模擬算出的落點。";
+    public const string IsaacImageNote = "附圖是 Isaac Sim 模擬（URSim 執行完這一批）結束時的畫面，模擬相機的位置與內參跟實體相機相同。";
+    public Task<string> Validate(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image, string dir,
+        string? imageNote = null, string name = "global_validation") => Call(
         "你是獨立的結果驗證者。只根據原始目標、初始場景及目前實際觀測判斷，不提供操作解法。檢查整體目標與局部幾何完整度（包含直線、連接與堆疊）。若目標要求平移、對齊、放置到座標或距離，實際結果與目標值在 0.02 m（2 公分）以內的量測誤差可接受，不得只因 2 公分內的座標偏差判定失敗；超過 2 公分或方向明顯錯誤才視為幾何未達標。沒有足夠觀測證據或目標含糊時不可通過。第一行僅寫 PASS 或 FAIL，後續自然語言描述觀測問題與不確定性。",
-        $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n環境：{CoordinateDirections}{FigureAcceptance}\n" + (image == null ? "影像不可取得，證據不足，不能通過。" : SchematicImage ? SchematicImageNote : "附圖是目前實際相機畫面。"), image, dir, "global_validation");
+        $"原始目標：{goal}\n初始場景：{SceneText(initial)}\n目前場景：{SceneText(current)}\n環境：{CoordinateDirections}{FigureAcceptance}\n" + (image == null ? "影像不可取得，證據不足，不能通過。" : imageNote ?? (SchematicImage ? SchematicImageNote : "附圖是目前實際相機畫面。")), image, dir, name);
     async Task<string> Call(string system, string user, byte[]? image, string dir, string name,
         bool jsonResponse = false)
     {
         File.WriteAllText(Path.Combine(dir, name + ".system.txt"), system);
         File.WriteAllText(Path.Combine(dir, name + ".user.txt"), user);
         var parts = new List<ChatMessageContentPart> { ChatMessageContentPart.CreateTextPart(user) };
-        if (image != null) parts.Add(ChatMessageContentPart.CreateImagePart(BinaryData.FromBytes(image), "image/jpeg"));
+        if (image != null) parts.Add(ChatMessageContentPart.CreateImagePart(BinaryData.FromBytes(image), ImageMediaType(image)));
         Console.WriteLine($"[LLM] {name}…（API 無逾時限制，等待回覆）");
         using var progress = new CancellationTokenSource();
         Task reporter = ReportProgress(name, progress.Token);
@@ -123,6 +127,10 @@ public sealed class ExperimentLlm
         File.WriteAllText(Path.Combine(dir, name + ".usage.json"), JsonSerializer.Serialize(completion.Usage));
         return text;
     }
+
+    // Unity 存的畫面是 PNG，相機與 Isaac 是 JPEG
+    static string ImageMediaType(byte[] image) =>
+        image.Length > 3 && image[0] == 0x89 && image[1] == 0x50 && image[2] == 0x4E && image[3] == 0x47 ? "image/png" : "image/jpeg";
 
     static async Task ReportProgress(string name, CancellationToken cancellationToken)
     {

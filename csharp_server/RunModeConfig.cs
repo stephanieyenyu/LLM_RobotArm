@@ -16,8 +16,11 @@ public sealed class RunModeConfig
     public string Mode { get; set; } = "real";
 
     // 虛擬場景檔，相對 repo 根目錄
+    // 三個版本相同的兩個場景：yellow_cubes_15.json（預設）、domino_cube.json
+    public const string DefaultScene = "sim_scenes/yellow_cubes_15.json";
+
     [JsonPropertyName("scene")]
-    public string Scene { get; set; } = "sim_scenes/two_cubes.json";
+    public string Scene { get; set; } = DefaultScene;
 
     // true：每個任務開始時都重建成場景檔的配置；false：只在換場景檔或服務剛啟動時重建，之後接續模擬結果
     [JsonPropertyName("reset_each_task")]
@@ -42,6 +45,12 @@ public sealed class RunModeConfig
                 var config = JsonSerializer.Deserialize<RunModeConfig>(File.ReadAllText(path)) ?? new RunModeConfig();
                 if (!config.IsSim && !string.Equals(config.Mode, "real", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException($"mode 只能是 sim 或 real，讀到 \"{config.Mode}\"");
+                // 場景檔換過名字或被刪掉（2026-10-08 起只剩兩個場景）：改用預設場景，不讓任務因為舊設定停住
+                if (!File.Exists(config.ScenePath(streamingAssetsDir)))
+                {
+                    Console.WriteLine($"[模式] 找不到虛擬場景檔 {config.Scene}，改用預設的 {DefaultScene}。");
+                    config.Scene = DefaultScene;
+                }
                 return config;
             }
             catch (Exception ex) when (ex is IOException or JsonException)
