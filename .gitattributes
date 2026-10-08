@@ -1,0 +1,2 @@
+# cmd 批次檔一定要 CRLF，不然 goto、標籤會讀錯
+*.bat text eol=crlf
