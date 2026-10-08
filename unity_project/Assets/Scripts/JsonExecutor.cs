@@ -1657,8 +1657,12 @@ public class JsonExecutor : MonoBehaviour
     // 留底同個精神），再用每格中心點投影到畫面上的像素顏色，跟桌面底色比對判斷這格有沒有方塊。
     // 正交相機的畫面 X/Y 跟物件高度無關，方塊疊多高都不影響投影到哪一格，不用額外處理透視。
     const int CoverageRenderPixels = 640;
-    const float CoverageMarginCells = 2.5f;                    // 畫面邊界外推幾格，確保四角落在圖案外面能當底色參考
+    const float CoverageMarginCells = 2.5f;                    // 畫面邊界外推幾格，讓邊緣格不會被裁到
     const float CoverageOccupiedColorDeltaThreshold = 0.12f;   // 跟底色的顏色距離超過這個就算「這格有方塊」
+    // 2026-10-08 跟 main 的 FigureImageOverlap 對齊：底色不再用「猜四個角落」，改成跟 main 一樣
+    // 用專用 capture layer + cullingMask 把方塊單獨隔離出來拍、背景固定洋紅——不會被桌面、QR 標記、
+    // 殘留雜物等任何不是方塊的東西誤判成「有方塊」，比猜角落底色準，跟 main 用同一套判斷方式。
+    const int CoverageCaptureLayer = 31;
 
     // sliceFloorM（立體逐層用）：只拍比這個 QR 高度高的部分（遠裁切面放在這裡、桌面被切掉），背景改洋紅；NaN = 照舊含桌面
     bool[,] CaptureCoverageGrid(int rows, int cols, float anchorX, float anchorY, float cellX, float cellY,
@@ -1703,7 +1707,10 @@ public class JsonExecutor : MonoBehaviour
         cam.nearClipPlane = 0.01f;
         cam.farClipPlane = 3f;
         cam.clearFlags = CameraClearFlags.SolidColor;
-        cam.backgroundColor = Color.black;
+        // 跟 main 的 FigureImageOverlap 一樣固定用洋紅底色——底色不用猜，因為下面改成
+        // cullingMask 只拍 capture layer，桌面、QR 標記、手臂、夾爪根本不會進畫面。
+        cam.backgroundColor = Color.magenta;
+        cam.cullingMask = 1 << CoverageCaptureLayer;
         cam.transform.position = centerUnity + coverageFrame.up;
         cam.transform.rotation = coverageFrame.rotation * Quaternion.Euler(90f, 0f, 0f);
         if (!float.IsNaN(sliceFloorM))
@@ -1711,55 +1718,23 @@ public class JsonExecutor : MonoBehaviour
             Vector3 floorWorld = coverageFrame.TransformPoint(SceneSyncer.QRToUnity(centerQrX, centerQrY, sliceFloorM));
             cam.farClipPlane = Mathf.Max(cam.nearClipPlane + 0.001f,
                 Vector3.Dot(floorWorld - cam.transform.position, cam.transform.forward));
-            cam.backgroundColor = Color.magenta;   // 黃、黑方塊都跟洋紅背景分得開
         }
 
         var rt = new RenderTexture(width, height, 16);
         cam.targetTexture = rt;
-        // Coverage measures blocks on the table. Exclude the arm and its shadows
-        // only for this synchronous render, then restore every renderer state.
-        var blockRenderers = new HashSet<Renderer>();
-        foreach (var block in sceneSyncer.GetCurrentCubes())
-            if (block != null)
-                foreach (var renderer in block.GetComponentsInChildren<Renderer>(true))
-                    blockRenderers.Add(renderer);
-        var armRenderers = new HashSet<Renderer>();
-        if (robotArm != null)
-        {
-            foreach (var renderer in robotArm.GetComponentsInChildren<Renderer>(true))
-                armRenderers.Add(renderer);
-            if (robotArm.Transforms != null)
-                foreach (var joint in robotArm.Transforms)
-                    if (joint != null)
-                        foreach (var renderer in joint.GetComponentsInChildren<Renderer>(true))
-                            armRenderers.Add(renderer);
-            if (robotArm.TCP != null)
-                foreach (var renderer in robotArm.TCP.GetComponentsInChildren<Renderer>(true))
-                    armRenderers.Add(renderer);
-        }
-        foreach (var gripper in FindObjectsOfType<SyncGripper>())
-            foreach (var renderer in gripper.GetComponentsInChildren<Renderer>(true))
-                armRenderers.Add(renderer);
-        armRenderers.ExceptWith(blockRenderers);
-        var rendererStates = armRenderers.Select(renderer => (
-            renderer, enabled: renderer.enabled, shadows: renderer.shadowCastingMode)).ToList();
+        // 跟 main 同一套隔離方式：把目前所有方塊暫時搬到專用 capture layer，相機 cullingMask
+        // 只看這個 layer，拍完立刻還原每顆方塊原本的 layer——不用再個別關 Renderer、猜哪些要排除。
+        var blocks = sceneSyncer.GetCurrentCubes().Where(b => b != null).ToList();
+        var originalLayers = blocks.Select(b => b.layer).ToList();
         try
         {
-            foreach (var state in rendererStates)
-            {
-                state.renderer.enabled = false;
-                state.renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-            }
+            foreach (var block in blocks) block.layer = CoverageCaptureLayer;
             cam.Render();
         }
         finally
         {
-            foreach (var state in rendererStates)
-                if (state.renderer != null)
-                {
-                    state.renderer.enabled = state.enabled;
-                    state.renderer.shadowCastingMode = state.shadows;
-                }
+            for (int i = 0; i < blocks.Count; i++)
+                if (blocks[i] != null) blocks[i].layer = originalLayers[i];
         }
 
         // 相機活著的時候先把每格中心點投影成畫面像素座標（正交投影下跟方塊高度無關）
@@ -1807,17 +1782,16 @@ public class JsonExecutor : MonoBehaviour
             return n > 0 ? sum / n : Color.black;
         }
 
-        // 底色：取四個角落的平均色（留白夠大，角落保證落在圖案外面、沒有方塊）
-        Color bg = (SamplePatch(8, 8) + SamplePatch(width - 8, 8) +
-                    SamplePatch(8, height - 8) + SamplePatch(width - 8, height - 8)) / 4f;
-
+        // 底色固定是洋紅（cullingMask 隔離後，沒拍到方塊的地方一定是洋紅），不用再猜；
+        // 跟 main 一樣直接比對跟洋紅的顏色距離，比猜四個角落準、也不怕角落剛好也被方塊佔到。
         var occupied = new bool[rows, cols];
         for (int r = 0; r < rows; r++)
             for (int c = 0; c < cols; c++)
             {
                 Vector2Int px = cellPixel[r, c];
                 Color sample = SamplePatch(px.x, px.y);
-                float delta = Mathf.Abs(sample.r - bg.r) + Mathf.Abs(sample.g - bg.g) + Mathf.Abs(sample.b - bg.b);
+                float delta = Mathf.Abs(sample.r - Color.magenta.r) + Mathf.Abs(sample.g - Color.magenta.g) +
+                              Mathf.Abs(sample.b - Color.magenta.b);
                 occupied[r, c] = delta > CoverageOccupiedColorDeltaThreshold;
             }
 
