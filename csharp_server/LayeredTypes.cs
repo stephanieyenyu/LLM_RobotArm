@@ -198,7 +198,7 @@ public class BatchEnvelope
     public string RobotTarget { get; set; } = "";
 
     // 3D 疊放的批次（URSim 驗證與通過後的實機執行）才設 true：Unity 的 descend 改成積木頂面對齊
-    // 2.5 cm 層高、指尖停在頂面下 19 mm。false 時不寫出這個欄位，2D 批次送給 Unity 的 JSON
+    // 2.5 cm 層高、指尖停在頂面下 12.5 mm（積木高度正中間）。false 時不寫出這個欄位，2D 批次送給 Unity 的 JSON
     // 跟加欄位前逐字相同；舊版 Unity 讀不到時也是 false，行為不變。
     [JsonPropertyName("layered_grasp")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]

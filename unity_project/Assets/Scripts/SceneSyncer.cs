@@ -61,10 +61,10 @@ public class SceneSyncer : MonoBehaviour
     [Header("手臂 base 在 QR frame 中的位置（把 workspace 對齊到手臂）")]
     // 預設值 = -JsonExecutor.QR1_X / -QR1_Y（Teach Pendant 實測值）
     // 手臂 base 在 robot (0,0,0)，QR1 在 robot (QR1_X, QR1_Y)，所以在 QR frame 裡
-    // 手臂座標 = (-QR1_X, -QR1_Y) = (0.39337, 0.35747)
+    // 手臂座標 = (-QR1_X, -QR1_Y) = (0.38637, 0.35747)
     // Inspector 也可以手動蓋掉這個值；MainScene 存了一份，改 QR1_X/Y 時要一起改（只影響畫面上工作區的位置，
     // 模擬夾取與放置的判定都在 QR 座標計算，不受影響）
-    public float armBaseAtQrX = -JsonExecutor.QR1_X;   // 0.39337
+    public float armBaseAtQrX = -JsonExecutor.QR1_X;   // 0.38637
     public float armBaseAtQrY = -JsonExecutor.QR1_Y;   // 0.35747
     // 桌面（QR 平面）比手臂安裝面高 QR1_Z，所以手臂 base 在 QR frame 的 Z 是 -QR1_Z
     public float armBaseAtQrZ = -JsonExecutor.QR1_Z;   // -0.030

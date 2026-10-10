@@ -288,7 +288,7 @@ MonoBehaviour:
   pollIntervalSec: 0.3
   workspaceWidthM: 0.85
   workspaceDepthM: 0.375
-  armBaseAtQrX: 0.39337
+  armBaseAtQrX: 0.38637
   armBaseAtQrY: 0.35747
   armBaseAtQrZ: -0.03
   planeMarginM: 0.15
