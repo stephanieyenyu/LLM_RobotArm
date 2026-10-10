@@ -1617,7 +1617,7 @@ async Task<bool> Run2DVerifiedAsync(string userCommand, string label, List<StepE
     string verdict;
     try
     {
-        verdict = await simulationImageJudge.JudgeAsync(userCommand, scene, previewScene, view, dir,
+        verdict = await simulationImageJudge.JudgeMajorityAsync(userCommand, scene, previewScene, view, dir,
             SimulationImageJudge.UnityImageNote, "unity_judge");
     }
     catch (Exception ex)
@@ -1626,6 +1626,7 @@ async Task<bool> Run2DVerifiedAsync(string userCommand, string label, List<StepE
         SendDone();
         return false;
     }
+    Console.WriteLine($"[2D 模擬驗證] 畫面判定{verdict.Split('\n')[0].Trim()}（{verdict.Split('\n').ElementAtOrDefault(1)?.Trim()}）");
     bool passed = report.Passed && verdict.Split('\n')[0].Trim() == "PASS";
     if (verdict.Split('\n')[0].Trim() != "PASS")
     {
@@ -1750,7 +1751,7 @@ async Task<bool> Run3DVerifiedAsync(string userCommand, string label, List<StepE
         string verdict;
         try
         {
-            verdict = await simulationImageJudge.JudgeAsync(userCommand, scene, report.Scene, report.Frame, verifyDir,
+            verdict = await simulationImageJudge.JudgeMajorityAsync(userCommand, scene, report.Scene, report.Frame, verifyDir,
                 SimulationImageJudge.IsaacImageNote, "isaac_judge");
         }
         catch (Exception ex)
@@ -1759,6 +1760,7 @@ async Task<bool> Run3DVerifiedAsync(string userCommand, string label, List<StepE
             SendDone();
             return false;
         }
+        Console.WriteLine($"[3D 模擬驗證] 畫面判定{verdict.Split('\n')[0].Trim()}（{verdict.Split('\n').ElementAtOrDefault(1)?.Trim()}）");
         if (verdict.Split('\n')[0].Trim() != "PASS")
         {
             Console.WriteLine($"[3D 模擬驗證] Isaac Sim 模擬畫面判定未通過，{halt}：");

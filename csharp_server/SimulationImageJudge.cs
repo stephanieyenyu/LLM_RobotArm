@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using OpenAI.Chat;
 
@@ -48,6 +49,35 @@ public sealed class SimulationImageJudge
         File.WriteAllText(Path.Combine(dir, name + ".txt"), text);
         return text;
     }
+
+    /// <summary>
+    /// 同一張畫面判定最多 votes 次，過半就停（通常 2 次）。LLM 對同一個圖形的判斷不一定一致（2026-10-10：同樣完整的 W，
+    /// 一種字形判 PASS、另一種判 FAIL），用多數決減少隨機性；prompt 不變。每次的 prompt 與回覆存成 name_1、name_2…，
+    /// name.txt 存合併結果：第一行是多數決的 PASS / FAIL，後面附票數與每一次的判定全文。
+    /// </summary>
+    public async Task<string> JudgeMajorityAsync(string goal, List<SceneObject> initial, List<SceneObject> current, byte[]? image,
+        string dir, string? imageNote = null, string name = "isaac_judge", int votes = 3)
+    {
+        if (image == null) votes = 1;                 // 沒有影像一定判不通過，不用重複問
+        int need = votes / 2 + 1, pass = 0, fail = 0;
+        var verdicts = new List<string>();
+        for (int i = 1; i <= votes && pass < need && fail < need; i++)
+        {
+            string text = await JudgeAsync(goal, initial, current, image, dir, imageNote, $"{name}_{i}");
+            verdicts.Add(text);
+            if (FirstLine(text) == "PASS") pass++; else fail++;
+        }
+        var combined = new StringBuilder();
+        combined.AppendLine(pass >= need ? "PASS" : "FAIL");
+        combined.AppendLine($"多數決：{pass} 次 PASS、{fail} 次 FAIL（最多判定 {votes} 次，過半就停）");
+        for (int i = 0; i < verdicts.Count; i++)
+            combined.AppendLine($"--- 第 {i + 1} 次：{verdicts[i].Trim()}");
+        string result = combined.ToString().TrimEnd();
+        File.WriteAllText(Path.Combine(dir, name + ".txt"), result);
+        return result;
+    }
+
+    static string FirstLine(string text) => text.Split('\n')[0].Trim();
 
     // Unity 存的畫面是 PNG，相機與 Isaac 是 JPEG
     static string ImageMediaType(byte[] image) =>

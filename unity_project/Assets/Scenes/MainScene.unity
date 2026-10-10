@@ -288,8 +288,8 @@ MonoBehaviour:
   pollIntervalSec: 0.3
   workspaceWidthM: 0.85
   workspaceDepthM: 0.375
-  armBaseAtQrX: 0.38824
-  armBaseAtQrY: 0.35473
+  armBaseAtQrX: 0.38637
+  armBaseAtQrY: 0.35747
   armBaseAtQrZ: -0.03
   planeMarginM: 0.15
   cubeSizeM: 0.025
@@ -695,6 +695,7 @@ MonoBehaviour:
   currentStepFile: current_step.json
   stepDoneFile: step_done.json
   urIP: 192.168.50.204
+  ursimIP: 192.168.50.221
   pollIntervalSec: 0.3
   perceptionModeUrl: http://localhost:5000/scene/mode
   uiManager: {fileID: 0}
@@ -758,8 +759,13 @@ MonoBehaviour:
   sharedMovejAcceleration: 0.4
   sharedMovejVelocity: 0.55
   allowTopLeftCubeYaw180OnHardware: 1
+  contactStopOnPlace: 1
+  contactApproachM: 0.01
+  contactSpeedMps: 0.01
+  contactForceN: 8
   bitmapXYToleranceM: 0.01
   bitmapZToleranceM: 0.01
+  bitmapOverlapThreshold: 0.9
   simGraspToleranceM: 0.015
   pickOffsetX: 0.002
   pickOffsetY: 0.002

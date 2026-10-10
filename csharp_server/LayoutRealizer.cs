@@ -137,8 +137,9 @@ if (dominosNeeded > dominoBudget)
     internal static bool AreTargetsWithinSafeReach(
         IReadOnlyList<TargetCell> targets, WorkspaceBounds ws)
     {
-        const double qrToRobotX = -0.38824;
-        const double qrToRobotY = -0.35473;
+        // QR1 在 UR 基座座標的位置，同 JsonExecutor.QR1_X/Y（2026-10-10 統一）
+        const double qrToRobotX = -0.38637;
+        const double qrToRobotY = -0.35747;
         const double minReach = 0.18;
         const double maxReach = 0.48;
         const double placementMaxX = 0.74;

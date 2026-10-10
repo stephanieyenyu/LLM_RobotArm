@@ -44,6 +44,7 @@ main、zero-constraint、rulebased 三個版本用同一套驗證流程。相機
   先把整個圖形在 ±5 mm 內平移對齊再算（Isaac 的物理落點常整體偏約 2 mm），要大於 90%（比對圖 `isaac_overlap.png`）。
   最後由 LLM 看 Isaac 的模擬畫面判 PASS，全部通過才把同一批送實體手臂（純模擬送 URSim）。紀錄存在 `csharp_server/outputs/isaac_<時間>_<名稱>/`。
 - 給 LLM 的畫面附一句說明它看的是 Unity 或 Isaac 的模擬畫面；判定的 system prompt 不變（main 的獨立結果驗證者原文）。
+  2026-10-10 起同一張畫面最多判定 3 次取多數（兩次一樣就停，通常只問 2 次），因為同樣完整的字母，LLM 對不同字形的判斷不一致。每次的紀錄存成 `unity_judge_1.txt`、`unity_judge_2.txt`…（3D 是 `isaac_judge_*`），`unity_judge.txt` 是合併結果：第一行是多數決的 PASS / FAIL，後面附票數與每一次的判定。
 - **「Unity驗證」開關**保留，預設開啟：關掉（對照組）時 2D 的畫面重疊率與 LLM 畫面判定只記錄、照常送手臂；3D 的 Isaac 驗證不受開關影響。
 - 2026-10-08 之前：2D、3D 都先在 Unity 預覽逐塊比對位置與高度，每一步之後重讀相機場景驗證；Isaac 驗證時才讀相機位姿；
   純模擬一定要開 Isaac Sim 與 URSim。
@@ -83,7 +84,8 @@ CommandRouter 判斷為 `arrange_3d_pattern`（指令明確說立體、3D、upri
 3. **Layer 3 分派與順序**：先鋪第 1 層，用 2D 的 `TaskAssigner`（遠端優先、補貨區裡離目標最近的 cube、不拿已規劃的格子）；第 2 層起整層疊完才疊下一層，同層也是遠端優先，來源與放開高度照 `SingleObjectTaskBuilder.BuildStackOntoLocation`（補貨區最低、最近的 cube；目標高度 = 累積塔頂 + 來源高度 + 0.008 m 放開間隙）。任何一格排不出來就整批取消，不送半成品。
 4. **Layer 4 動作**：每一步由 `MotionPlanner` 組白名單函式，`MotionPlanValidator` 檢查（疊放要有足夠的高度）。
 5. **預期格**：整批附上每一層的預期格（格距用 `SpatialCellSize`），交給 Isaac 比畫面重疊率（見上方「模擬驗證」）；Unity 不預覽。2026-10-08 之前是 Unity 模擬結束逐塊比對位置、高度、是否在空中放開，「Unity驗證：開」時不通過就不讓手臂動。
-6. **3D 分層夾取**：3D 批次帶 `layered_grasp`，Unity 用實測指尖長度 179 mm、實測桌面高度（QR1_Z − 30 mm）規劃，夾取與放置時指尖停在積木真實頂面下 19 mm（頂面高度由 server 依固定布局給 `source_top_m` / `target_top_m`），碰撞模型的手指段只檢查指尖離桌 3 mm；數字在 `LayeredGraspGeometry.cs`，Unity 與 server 共用。
+6. **3D 分層夾取**：3D 批次帶 `layered_grasp`，Unity 用實測指尖長度 179 mm、實測桌面高度（QR1_Z − 30 mm）規劃，夾取與放置時指尖停在積木真實頂面下 12.5 mm，也就是積木高度正中間（2026-10-10 之前是 19 mm；頂面高度由 server 依固定布局給 `source_top_m` / `target_top_m`），碰撞模型的手指段只檢查指尖離桌 3 mm；數字在 `LayeredGraspGeometry.cs`，Unity 與 server 共用。
+   實機放置可以開 JsonExecutor 的「碰到就停」（`contactStopOnPlace`，預設關，2026-10-10 加）：放方塊時先停在計算高度上方 `contactApproachM`（10 mm），再以 `contactSpeedMps`（10 mm/s）往下，Z 方向受力超過 `contactForceN`（8 N）就停下放開，最多降到計算高度。用來吸收「下層實際比計算高」的誤差，避免擠壓下層造成保護性停止或推倒。只在實機的 3D 批次生效；URSim、Isaac 驗證與 Unity 預覽照原本的軌跡。Unity Console 會印出每次比計算高度提早幾 mm 碰到（`[ContactPlace]`）。門檻要先在空中慢速下降量力的雜訊再設。
 7. **手臂自撞**：3D 批次規劃時自撞改用畫面上手臂與夾爪模型的外型（`ArmMeshSelfCollision.cs`，手臂與夾爪的 .dae/.obj 已開 Read/Write）；Isaac 驗證期間也用 USD 碰撞體檢查自撞。
 8. **模擬驗證（URSim + Isaac Sim）**：整批先以 `robot_target = "ursim"` 只在 URSim 執行（Unity 不預覽，只轉送），Isaac Sim 的手臂即時跟隨 URSim、積木用物理模擬；URSim 跑完 Isaac 做幾何檢查（位置、層高、傾斜、撞動其他積木、穩定、指尖撞桌、手臂自撞）與畫面重疊率（整體對齊 ±5 mm 後要大於 90%），通過後再讓 LLM 看 Isaac 的模擬畫面判定（`SimulationImageJudge.cs`，system prompt 是 main 的獨立結果驗證者原文，第一行 PASS 才算通過）。收到指令時 server 讀一次 perception_server 的 `/camera`（相機內參與相機在 QR 座標系的位姿），Isaac 把模擬相機擺到跟實體相機同一個位置，畫面判定看到的角度才跟實體相機一致；讀不到時沿用 Isaac 上次的相機。全部通過才把同一批（同樣的步驟與高度、`skip_preview` 不再預覽）送實體手臂；任何一關沒過、或 Isaac / URSim 不可用，實體手臂都不動。Isaac 驗證不受「Unity驗證」開關影響。紀錄存在 `csharp_server/outputs/isaac_<時間>_<pattern>/`。
 

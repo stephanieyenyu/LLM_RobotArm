@@ -233,8 +233,8 @@ LLM 只能輸出以下 function：
 <summary><strong>Unity Executor / 硬體安全限制</strong></summary>
 
 - QR1 校正座標目前設定：
-  - QR1_X = -0.39337 m
-  - QR1_Y = -0.35247 m
+  - QR1_X = -0.38637 m
+  - QR1_Y = -0.35747 m
   - QR1_Z = 0.030 m
 - 基本安全抬升 offset = 0.08 m。
 - workspace 上方 travel Z = 0.24 m。
