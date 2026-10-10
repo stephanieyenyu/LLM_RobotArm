@@ -256,6 +256,19 @@ public class JsonExecutor : MonoBehaviour
     public float sharedMovejVelocity = 0.55f;
     public bool allowTopLeftCubeYaw180OnHardware = true;
 
+    [Header("3D 放置：碰到就停（實機力感測，預設關）")]
+    [Tooltip("3D 疊放批次在實機放方塊時，最後一段改成慢慢往下、UR3e 力感測器一感覺到接觸就停，再放開。" +
+             "URSim、Isaac 驗證與 Unity 預覽不受影響（URSim 沒有力感測，照計算高度走完）。")]
+    public bool contactStopOnPlace = false;
+    [Tooltip("從計算的放置高度上方多少公尺開始慢速下降；最多只降到計算高度，不會更低")]
+    public float contactApproachM = 0.010f;
+    [Tooltip("慢速下降的速度（公尺/秒）")]
+    public float contactSpeedMps = 0.010f;
+    [Tooltip("Z 方向受力超過幾牛頓就停。先在空中慢速下降看雜訊，再設得比雜訊高、比保護性停止低")]
+    public float contactForceN = 8f;
+    // 正在執行的整批是不是 3D 疊放（layered_grasp）；ExecuteBatch 每一步開始前設定
+    bool executingLayeredBatch;
+
     [Header("模擬結束比對 bitmap（屬於驗證，受一鍵驗證開關控制）")]
     // 落點中心離 bitmap 格子中心多遠以內算放對（公尺）。格距 4 cm、方塊 2.5 cm，間隙只有 1.5 cm；
     // 2 cm 是半個格距，再大就會跟相鄰格子重疊
@@ -278,8 +291,8 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
-    public const float QR1_X = -0.38637f-0.007f;
-    public const float QR1_Y = -0.35747f; //+0.005f
+    public const float QR1_X = -0.38637f;   // 2026-10-10 拿掉 X 的 -7 mm 校正（同 rulebased），Isaac --qr1 一起改
+    public const float QR1_Y = -0.35747f;
     public const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -754,6 +767,7 @@ public class JsonExecutor : MonoBehaviour
             currentStepId = env.step_id;
             long stepEpoch = ++executionEpoch;
             RobotArm.FreezeVisualFeedback = false;
+            executingLayeredBatch = false;
             currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch));
             yield return currentStepCoroutine;
             currentStepCoroutine = null;
@@ -1004,6 +1018,7 @@ public class JsonExecutor : MonoBehaviour
             currentStepId = env.step_id;
             long stepEpoch = ++executionEpoch;
             // perception mode 由整批統一管理，單步不自己切換
+            executingLayeredBatch = batch.layered_grasp;
             currentStepCoroutine = StartCoroutine(ExecuteStep(env, stepEpoch, managePerceptionMode: false));
             yield return currentStepCoroutine;
             currentStepCoroutine = null;
@@ -1330,7 +1345,7 @@ public class JsonExecutor : MonoBehaviour
                 }
                 else if (action.function == "descend")
                 {
-                    // 3D 疊放：指尖停在積木真實頂面（csharp_server 算好的層高）下 19 mm，
+                    // 3D 疊放：指尖停在積木真實頂面（csharp_server 算好的層高）下 GraspDepthBelowTopM（12.5 mm，積木高度正中間），
                     // 取代「感知頂面 + Z_CORRECTION」；2D 不進這裡
                     if (batch.layered_grasp)
                         z = planningTableZ + (source ? env.source_top_m : env.target_top_m)
@@ -3115,7 +3130,11 @@ public class JsonExecutor : MonoBehaviour
                  action.function == "lift" || action.function == "go_home");
             if (sharedMotion)
             {
-                yield return ExecuteSharedJointAction(env.step_id, i, tag, stepEpoch);
+                // 3D 疊放在實機放方塊：最後一段改成碰到就停（contactStopOnPlace），其餘照共用軌跡
+                if (action.function == "descend" && !source && holdingObject && UseContactStopOnPlace())
+                    yield return ExecuteSharedPlaceWithContactStop(env.step_id, i, tag, stepEpoch);
+                else
+                    yield return ExecuteSharedJointAction(env.step_id, i, tag, stepEpoch);
             }
             else switch (action.function)
             {
@@ -3224,6 +3243,153 @@ public class JsonExecutor : MonoBehaviour
                 $"{tag} 共用軌跡 {i + 1}/{action.targets.Count}", stepEpoch, stepId);
             if (!lastMotionSucceeded) yield break;
         }
+    }
+
+    // 碰到就停只用在實機的 3D 疊放批次：URSim 批次（urListener 換成 URSim 連線）與純模擬都照原本的共用軌跡
+    bool UseContactStopOnPlace() =>
+        contactStopOnPlace && executingLayeredBatch && !RunMode.IsSim &&
+        !(ursimListener != null && urListener == ursimListener);
+
+    // 3D 放置的最後一段（實機）：共用軌跡的路徑點照送，但已經低於「放置點上方 contactApproachM」的跳過；
+    // 先停在放置點正上方 contactApproachM，再慢慢往下，力感測一感覺到接觸就停（最多降到計算高度）。
+    IEnumerator ExecuteSharedPlaceWithContactStop(int stepId, int actionIndex, string tag, long stepEpoch)
+    {
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+        if (!sharedTrajectory.TryGetValue(stepId, out var actions) ||
+            actionIndex < 0 || actionIndex >= actions.Count || actions[actionIndex].targets.Count == 0)
+        {
+            lastMotionError = $"第 {stepId} 步第 {actionIndex + 1} 個動作沒有共用軌跡";
+            yield break;
+        }
+        var targets = actions[actionIndex].targets;
+        double[] final = targets[targets.Count - 1];
+        if (!TryRaisedJointTarget(final, contactApproachM, out double[] approach, out double finalTipZ))
+        {
+            Debug.LogWarning($"[ContactPlace] {tag}：算不出放置點上方 {contactApproachM * 1000f:F0} mm 的關節角，改用原本的軌跡");
+            yield return ExecuteSharedJointAction(stepId, actionIndex, tag, stepEpoch);
+            yield break;
+        }
+        for (int i = 0; i < targets.Count - 1; i++)
+        {
+            if (FingertipZ(targets[i]) <= finalTipZ + contactApproachM + 0.001) continue;
+            yield return SendExplicitJointTarget(targets[i], $"{tag} 共用軌跡 {i + 1}/{targets.Count}", stepEpoch, stepId);
+            if (!lastMotionSucceeded) yield break;
+        }
+        yield return SendExplicitJointTarget(approach, $"{tag} 放置點上方 {contactApproachM * 1000f:F0} mm", stepEpoch, stepId);
+        if (!lastMotionSucceeded) yield break;
+        yield return SendContactDescend(tag, stepEpoch, stepId, finalTipZ);
+    }
+
+    // 慢慢往下（speedl，每 8 ms 檢查一次），Z 方向受力超過 contactForceN 或已經降了 contactApproachM 就停。
+    // 提早停下時關節角到不了原本的目標，所以用「程式跑完」判斷完成，再用實際關節角算停在哪個高度。
+    IEnumerator SendContactDescend(string tag, long stepEpoch, int stepId, double plannedTipZ)
+    {
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+        // 不直接對函式回傳值取索引（get_actual_tcp_pose()[2]），先存成變數；結尾多停 0.3 s，
+        // 就算一開始就碰到，Unity 也一定看得到程式在跑
+        string program = string.Join("\n",
+            "def contact_place():",
+            "  zero_ftsensor()",
+            "  sleep(0.2)",
+            "  pose = get_actual_tcp_pose()",
+            "  start_z = pose[2]",
+            "  moved = 0.0",
+            "  contact = False",
+            $"  while (not contact) and (moved < {contactApproachM:F4}):",
+            $"    speedl([0, 0, {-contactSpeedMps:F4}, 0, 0, 0], 0.5, 0.008)",
+            "    force = get_tcp_force()",
+            $"    if norm(force[2]) > {contactForceN:F1}:",
+            "      contact = True",
+            "    end",
+            "    pose = get_actual_tcp_pose()",
+            "    moved = start_z - pose[2]",
+            "  end",
+            "  stopl(0.5)",
+            "  sleep(0.3)",
+            "end");
+        Debug.Log($"  [{tag}] SEND CONTACT DESCEND：最多往下 {contactApproachM * 1000f:F0} mm、" +
+                  $"{contactSpeedMps * 1000f:F0} mm/s，Z 受力 > {contactForceN:F1} N 就停");
+        float sentAt = Time.realtimeSinceStartup;
+        urListener.SendCommand(program);
+        yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
+
+        float startedAt = Time.realtimeSinceStartup;
+        float limit = contactApproachM / Mathf.Max(0.001f, contactSpeedMps) + 10f;
+        bool seenRunning = false;
+        while (Time.realtimeSinceStartup - startedAt < limit)
+        {
+            if (!IsExecutionCurrent(stepEpoch, stepId))
+            {
+                lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
+                yield break;
+            }
+            if (!urListener.Connected)
+            {
+                lastMotionError = $"UR 在「{tag}」途中斷線";
+                yield break;
+            }
+            if (IsEmergencyStop() || IsRecoverableSafetyStop())
+            {
+                lastMotionError = $"UR 在「{tag}」慢速下降途中安全停止";
+                yield break;
+            }
+            bool running = urListener.RobotModeData.isProgramRunning;
+            if (running) seenRunning = true;
+            else if (!seenRunning && Time.realtimeSinceStartup - startedAt > 2f)
+            {
+                // 程式根本沒跑（例如控制器拒絕這段 URScript）：不能當作完成在上方放開，停止放置
+                lastMotionError = $"UR 沒有執行「{tag}」的慢速下降程式（2 秒內沒開始跑，可能是控制器拒絕這段 URScript），停止放置";
+                yield break;
+            }
+            else if (seenRunning)
+            {
+                var joints = urListener.JointData.AsArray;
+                var q = new double[6];
+                for (int k = 0; k < 6; k++) q[k] = joints[k].q_actual;
+                double earlyMm = (FingertipZ(q) - plannedTipZ) * 1000.0;
+                // 送出到結束約 1.5 s = 真的往下走完 10 mm；約 0.6 s = 一開始就判定碰到
+                string took = $"（送出到程式結束 {Time.realtimeSinceStartup - sentAt:F1} s）";
+                Debug.Log((earlyMm > 0.5
+                    ? $"[ContactPlace] {tag}：比計算高度提早 {earlyMm:F1} mm 碰到，停下放開"
+                    : $"[ContactPlace] {tag}：降到計算高度都沒碰到（差 {earlyMm:F1} mm），照原本高度放開") + took);
+                lastMotionSucceeded = true;
+                yield break;
+            }
+            yield return new WaitForSeconds(0.05f);
+        }
+        lastMotionError = $"UR 執行「{tag}」慢速下降逾時";
+    }
+
+    // 關節角 → 指尖高度（UR 基座座標；3D 用實測指尖長度）
+    double FingertipZ(double[] q)
+    {
+        double saved = UR3eKinematics.toolOffsetZ;
+        UR3eKinematics.toolOffsetZ = LayeredGraspGeometry.FingertipLengthM;
+        try { return UR3eKinematics.FK(q)[2, 3]; }
+        finally { UR3eKinematics.toolOffsetZ = saved; }
+    }
+
+    // 同一個工具姿態、正上方 raiseM 的關節角（從 finalQ 找最近的解；任一關節要轉超過 15° 就當作找不到）
+    bool TryRaisedJointTarget(double[] finalQ, double raiseM, out double[] raisedQ, out double finalTipZ)
+    {
+        raisedQ = null;
+        finalTipZ = FingertipZ(finalQ);
+        double saved = UR3eKinematics.toolOffsetZ;
+        UR3eKinematics.toolOffsetZ = LayeredGraspGeometry.FingertipLengthM;
+        try
+        {
+            var pose = UR3eKinematics.FKPose(finalQ);
+            pose.z += raiseM;
+            var solution = UR3eKinematics.IKNearest(pose, finalQ);
+            if (!solution.ok) return false;
+            for (int k = 0; k < 6; k++)
+                if (Math.Abs(solution.q[k] - finalQ[k]) > 15.0 * Math.PI / 180.0) return false;
+            raisedQ = (double[])solution.q.Clone();
+            return true;
+        }
+        finally { UR3eKinematics.toolOffsetZ = saved; }
     }
 
     IEnumerator SendExplicitJointTarget(double[] target, string tag, long stepEpoch, int stepId)

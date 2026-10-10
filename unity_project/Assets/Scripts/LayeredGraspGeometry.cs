@@ -19,9 +19,9 @@ public static class LayeredGraspGeometry
     // perception 頂面系統性偏低，對齊層高前先補這段。桌面上的積木一律是第 1 層（下限），所以這個值只影響
     // 疊起來的積木；黑色的偏差太大（實測 −32～+3 mm），層數主要靠 csharp_server LayeredHeights 的場景結構判斷。
     public const double LayerSnapOffsetM = 0.0075;
-    // 指尖停在積木頂面下方 19 mm（離積木底面 6 mm）。放置用同一個深度：積木底面剛好落在下層頂面，
-    // 指尖停在下層頂面上方 6 mm，不碰下層。
-    public const double GraspDepthBelowTopM = 0.019;
+    // 指尖停在積木頂面下方 12.5 mm，夾在積木高度的正中間（2026-10-10 起；之前是 19 mm，離積木底面只有 6 mm，夾得太低）。
+    // 放置用同一個深度：積木底面剛好落在下層頂面，指尖停在下層頂面上方 12.5 mm，不碰下層。
+    public const double GraspDepthBelowTopM = 0.0125;
     // 碰撞模型：夾爪本體（半徑 35 mm 的圓柱）只量到手指根部，手指這一段只檢查指尖離桌面的距離。
     // 前提：實體手指（指尖到夾爪本體底面）至少這麼長。
     public const double FingerLengthM = 0.030;

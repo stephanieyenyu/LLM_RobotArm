@@ -138,6 +138,23 @@ WATERSHED_MIN_PART_AREA_FACTOR = 0.45
 # --- Part B: QR + solvePnP 3D 座標對應 ---
 QR_SIZE_M = 0.073                    # ArUco 實際邊長，公尺
 OBJECT_HEIGHT_OFFSET_M = 0.025       # 2.5 cm 立方體頂面；只在深度讀失敗時當 fallback
+BLOCK_HEIGHT_M = 0.025               # cube / domino 的高度
+CUBE_SIZE_M = 0.025
+DOMINO_LENGTH_M = 0.05
+
+# 斜拍時 HSV 遮罩是「頂面＋朝向相機的側面」整塊，中心會被側面拉向相機（2026-10-10 實測 7～12 mm，
+# 頂面只佔遮罩 43～50%）。用相機位姿算出側面造成的偏移扣掉，改用頂面中心定位；1.0 = 照幾何全扣。
+TOP_FACE_CORRECTION_GAIN = 1.0
+TOP_FACE_DEPTH_PATCH_PX = 6          # 頂面中心讀深度的取樣半徑（color 像素；depth 是 640x480 對齊上來的）
+OBJECT_Z_HISTORY = 8                 # 物件高度取最近幾幀的中位數（單幀深度雜訊 std 約 2 mm）
+OBJECT_Z_MATCH_M = 0.010             # 前後幀 XY 差這麼多以內算同一個物件
+
+# 工作平面（QR 座標系）：QR 中心的深度每幀都有雜訊，整個座標系跟著晃（2026-10-10 實測相機位姿 std 約 4 mm、
+# 轉動最多 1.2°，所有物件的 X 一起晃 std 1.5 mm）。改成取最近幾幀 QR1-3 中心的中位數；
+# 單幀差太多的不採用，連續好幾幀都差很多就當作相機或 QR 移動過，清掉重新累積。
+WORKSPACE_FRAME_HISTORY = 50         # 約 10 秒（每 0.2 秒一幀）
+WORKSPACE_FRAME_RESET_M = 0.015      # 這一幀的 QR 中心離中位數超過這個就不採用
+WORKSPACE_FRAME_RESET_FRAMES = 10    # 連續這麼多幀都超過 → 相機或 QR 移動過，重新累積
 
 # RealSense 提供真實的相機內參（fx, fy, cx, cy），這裡的值只是預設，
 # 啟動時會被真實 intrinsics 覆蓋（見 setup_realsense）
@@ -151,6 +168,9 @@ RS_INTRINSICS = None                 # pyrealsense2 intrinsics 物件（給 depr
 # 一旦算出來就存下來，之後 QR 被手臂遮住還是能繼續算物件位置。
 _cached_workspace_frame = None
 _cached_workspace_info = None
+_workspace_points = deque(maxlen=WORKSPACE_FRAME_HISTORY)   # 每幀量到的 QR1-3 中心（相機座標，3x3）
+_workspace_outlier_frames = 0
+_object_z_history = deque(maxlen=OBJECT_Z_HISTORY)          # 每幀 [(x, y, 原始 z), ...]
 
 
 # ============================================================
@@ -629,6 +649,50 @@ def project_pixel_to_workspace(pixel, camera_matrix, frame, obj_top_z_m=OBJECT_H
     }
 
 
+def project_workspace_to_pixel(x, y, z, camera_matrix, frame):
+    """QR 座標（公尺）→ 像素。跟 project_pixel_to_workspace 互為反函數（同一個相機矩陣、同一個工作平面）。"""
+    point = frame["origin"] + x * frame["x_axis"] + y * frame["z_axis"] + z * frame["normal"]
+    if point[2] <= 1e-6:
+        return None
+    uvw = camera_matrix @ point
+    return np.array([uvw[0] / uvw[2], uvw[1] / uvw[2]], dtype=np.float64)
+
+
+def top_face_center_pixel(obj, camera_matrix, frame, top_z_m=OBJECT_HEIGHT_OFFSET_M):
+    """
+    積木頂面中心的像素。HSV 遮罩的 minAreaRect 中心（center_pixel）包含朝向相機的側面，會偏向相機。
+    把一塊積木（頂面在 top_z_m、高 BLOCK_HEIGHT_M）的 8 個角投影到畫面，算出整塊輪廓中心比頂面中心
+    偏了多少像素，從偵測到的中心扣掉；積木位置跟著修正後再算一次，迭代 3 次就收斂。
+    斜放（skew_deg）只差幾度，對偏移量影響很小，不算進來。
+    """
+    if obj.get("shape") == "domino":
+        along_x = obj.get("orientation") != "vertical"
+        half_x = (DOMINO_LENGTH_M if along_x else CUBE_SIZE_M) / 2
+        half_y = (CUBE_SIZE_M if along_x else DOMINO_LENGTH_M) / 2
+    else:
+        half_x = half_y = CUBE_SIZE_M / 2
+    blob = np.array(obj["center_pixel"], dtype=np.float64)
+    pixel = blob
+    for _ in range(3):
+        pos = project_pixel_to_workspace(pixel, camera_matrix, frame, obj_top_z_m=top_z_m)
+        if pos is None:
+            return blob
+        corners = []
+        for dx in (-half_x, half_x):
+            for dy in (-half_y, half_y):
+                for z in (top_z_m - BLOCK_HEIGHT_M, top_z_m):
+                    corner = project_workspace_to_pixel(pos["x"] + dx, pos["y"] + dy, z, camera_matrix, frame)
+                    if corner is None:
+                        return blob
+                    corners.append(corner)
+        top = project_workspace_to_pixel(pos["x"], pos["y"], top_z_m, camera_matrix, frame)
+        if top is None:
+            return blob
+        (sx, sy), _, _ = cv2.minAreaRect(cv2.convexHull(np.array(corners, dtype=np.float32)))
+        pixel = blob - TOP_FACE_CORRECTION_GAIN * (np.array([sx, sy]) - top)
+    return pixel
+
+
 def read_depth_meters(depth_image, pixel, patch_radius=3, percentile=None):
     """
     對深度圖 (H, W) uint16 (單位 mm) 在指定像素周圍取樣。
@@ -681,8 +745,8 @@ def read_depth_meters_for_object(depth_image, bbox):
     return float(np.percentile(valid, 10)) / 1000.0
 
 
-def _try_build_workspace_frame(qrcodes, depth_image, image_width, image_height):
-    """試著從當下這幀的 QR 建工作平面。QR 沒偵測全或 solvePnP 失敗就回 None。"""
+def _measure_qr_points(qrcodes, depth_image, image_width, image_height):
+    """這一幀 QR1-3 中心在相機座標系的位置（3x3）。QR 沒偵測全或 solvePnP 失敗就回 None。"""
     qr_by_id = {qr["id"]: qr for qr in qrcodes}
     if not all(k in qr_by_id for k in ("QR1", "QR2", "QR3")):
         return None
@@ -708,69 +772,105 @@ def _try_build_workspace_frame(qrcodes, depth_image, image_width, image_height):
     if p1 is None or p2 is None or p3 is None:
         return None
 
-    return build_workspace_frame(p1, p2, p3)
+    return np.array([p1, p2, p3], dtype=np.float64)
+
+
+def _smoothed_workspace_frame(points):
+    """
+    把這一幀量到的 QR1-3 中心加進歷史，回傳用中位數建的工作平面；points=None（QR 被遮住）就只用歷史。
+    第二個回傳值 = 這一幀有沒有被採用。
+    """
+    global _workspace_outlier_frames
+    used = False
+    if points is not None:
+        if _workspace_points:
+            median = np.median(np.stack(_workspace_points), axis=0)
+            off = max(float(np.linalg.norm(points[i] - median[i])) for i in range(3))
+        else:
+            off = 0.0
+        if off <= WORKSPACE_FRAME_RESET_M:
+            _workspace_outlier_frames = 0
+            _workspace_points.append(points)
+            used = True
+        else:
+            _workspace_outlier_frames += 1
+            if _workspace_outlier_frames >= WORKSPACE_FRAME_RESET_FRAMES:
+                print(f"[perception] QR 位置連續 {WORKSPACE_FRAME_RESET_FRAMES} 幀都跟之前差 "
+                      f"{off * 1000:.0f} mm 以上，相機或 QR 可能移動過，工作平面重新累積")
+                _workspace_points.clear()
+                _workspace_points.append(points)
+                _workspace_outlier_frames = 0
+                used = True
+    if not _workspace_points:
+        return None, used
+    median = np.median(np.stack(_workspace_points), axis=0)
+    return build_workspace_frame(median[0], median[1], median[2]), used
 
 
 def compute_world_positions(objects, qrcodes, image_width, image_height, depth_image=None):
     """
     對每個物件計算 QR 工作平面局部座標（公尺），寫進 obj["position"]。
-    - 有 depth 且該像素有值：z 是真實高度
-    - 否則 fallback 到 ray-plane 交點，z 用 OBJECT_HEIGHT_OFFSET_M
-    - QR 被手臂遮住這一幀 → 用上一次成功的 workspace_frame 快取
-      （前提是相機和 QR 之後都固定不動）
+    - 工作平面用最近幾幀 QR 中心的中位數（_smoothed_workspace_frame）；QR 被手臂遮住時只用歷史
+      （前提是相機和 QR 之後都固定不動；移動過會自動重新累積）
+    - cube / domino：X/Y 用頂面中心的射線交 2.5 cm 平面，z 在頂面中心讀深度，再取最近幾幀的中位數
+    - 其他物件：有 depth 就全部從 depth 算，否則 fallback 到 ray-plane 交點
     """
     global _cached_workspace_frame, _cached_workspace_info
 
-    frame = _try_build_workspace_frame(qrcodes, depth_image, image_width, image_height)
-    if frame is not None:
-        # 這幀 QR 有偵測到 → 更新快取
-        _cached_workspace_frame = frame
-        _cached_workspace_info = {
-            "width_m": round(frame["width_m"], 6),
-            "depth_m": round(frame["depth_m"], 6),
-            "source": "current",
-        }
-    else:
-        # QR 被遮住或還沒偵測到 → 拿快取
-        frame = _cached_workspace_frame
-        if frame is None:
-            return None                                # 從來沒建成功過就沒辦法了
-        _cached_workspace_info = {**_cached_workspace_info, "source": "cached"}
+    points = _measure_qr_points(qrcodes, depth_image, image_width, image_height)
+    frame, used = _smoothed_workspace_frame(points)
+    if frame is None:
+        return None                                    # 從來沒建成功過就沒辦法了
+    _cached_workspace_frame = frame
+    _cached_workspace_info = {
+        "width_m": round(frame["width_m"], 6),
+        "depth_m": round(frame["depth_m"], 6),
+        "source": "current" if used else "cached",     # current = 這一幀的 QR 有算進中位數
+        "samples": len(_workspace_points),
+    }
 
     camera_matrix = build_camera_matrix(image_width, image_height)
+    block_heights = []                                 # 這一幀 cube / domino 的 (x, y, 原始 z)
 
     for obj in objects:
-        # 讀深度：中心像素周圍 3px patch、25 分位數（偏向頂面）
-        depth_m = (
-            read_depth_meters(depth_image, obj["center_pixel"], patch_radius=3, percentile=25)
-            if depth_image is not None else None
-        )
-
         shape = obj.get("shape")
         if shape in ("cube", "domino"):
-            # 已知形狀：X/Y 用射線 + 標稱 2.5 cm 平面（避免 depth 噪點傳染到 XY 定位）；
-            # Z 仍從 depth 讀（動態高度，維持「不寫死高度」的設計）
+            # 已知形狀：X/Y 用頂面中心的射線交標稱 2.5 cm 平面（避免 depth 噪點傳染到 XY 定位）；
+            # Z 在頂面中心讀 depth（動態高度，維持「不寫死高度」的設計）
+            top_px = top_face_center_pixel(obj, camera_matrix, frame)
+            obj["top_center_pixel"] = [round(float(top_px[0]), 2), round(float(top_px[1]), 2)]
             xy_pos = project_pixel_to_workspace(
-                obj["center_pixel"], camera_matrix, frame,
+                top_px, camera_matrix, frame,
                 obj_top_z_m=OBJECT_HEIGHT_OFFSET_M,
             )
             if xy_pos is None:
                 continue
 
             local_z = OBJECT_HEIGHT_OFFSET_M
+            depth_m = (
+                read_depth_meters(depth_image, top_px, patch_radius=TOP_FACE_DEPTH_PATCH_PX)
+                if depth_image is not None else None
+            )
             if depth_m is not None:
-                obj_camera = deproject_pixel_to_camera(obj["center_pixel"], depth_m)
+                obj_camera = deproject_pixel_to_camera(top_px, depth_m)
                 if obj_camera is not None:
                     rel = obj_camera - frame["origin"]
                     local_z = float(np.dot(rel, frame["normal"]))
 
+            block_heights.append((xy_pos["x"], xy_pos["y"], local_z))
             obj["position"] = {
-                "x": xy_pos["x"],                    # 射線幾何（穩）
+                "x": xy_pos["x"],                    # 頂面中心的射線幾何
                 "y": xy_pos["y"],
-                "z": round(local_z, 6),              # depth 實測（動態）
-                "source": "ray_xy+depth_z",
+                "z": round(_median_recent_z(xy_pos["x"], xy_pos["y"], local_z), 6),   # depth 實測，多幀中位數
+                "source": "top_face_xy+depth_z",
             }
             continue
+
+        # 讀深度：中心像素周圍 3px patch、25 分位數（偏向頂面）
+        depth_m = (
+            read_depth_meters(depth_image, obj["center_pixel"], patch_radius=3, percentile=25)
+            if depth_image is not None else None
+        )
 
         # 未知形狀（cup、bottle 等，沒有固定高度）→ 全部從 depth 算
         obj_camera = deproject_pixel_to_camera(obj["center_pixel"], depth_m) if depth_m else None
@@ -794,7 +894,18 @@ def compute_world_positions(objects, qrcodes, image_width, image_height, depth_i
                 pos["source"] = "ray_plane_fallback"
                 obj["position"] = pos
 
+    _object_z_history.append(block_heights)
     return _cached_workspace_info
+
+
+def _median_recent_z(x, y, z):
+    """這一幀的高度跟最近幾幀同位置（XY 差 OBJECT_Z_MATCH_M 以內）的高度取中位數；單幀深度雜訊大。"""
+    heights = [z]
+    for past in _object_z_history:
+        near = [pz for (px, py, pz) in past if abs(px - x) < OBJECT_Z_MATCH_M and abs(py - y) < OBJECT_Z_MATCH_M]
+        if near:
+            heights.append(near[0])
+    return float(np.median(heights))
 
 
 def build_workspace_polygon(qrcodes):
@@ -1210,6 +1321,10 @@ def endpoint_frame():
         cv2.rectangle(frame, (x1, y1), (x2, y2), c, 3)
         cv2.putText(frame, f"{obj['name']} {obj['confidence']:.2f}",
                     (x1, max(y1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2)
+        # cube / domino 的定位點 = 頂面中心（整塊遮罩的中心會偏向相機）
+        if obj.get("top_center_pixel"):
+            tx, ty = obj["top_center_pixel"]
+            cv2.circle(frame, (int(round(tx)), int(round(ty))), 6, (255, 0, 255), -1)
     for qr in qrs:
         cx, cy = qr["center_pixel"]
         cv2.circle(frame, (int(cx), int(cy)), 8, (0, 0, 255), -1)

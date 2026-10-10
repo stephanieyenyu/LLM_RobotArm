@@ -90,7 +90,7 @@ dotnet run
 
 **Unity**：Hub 開 `unity_project` → Play → Executor 的 `Ur IP` 填 UR3e IP。
 
-**Debug**：瀏覽器 `http://localhost:5000/debug/live` 看即時偵測畫面。
+**Debug**：瀏覽器 `http://localhost:5000/debug/live` 看即時偵測畫面。方塊上的洋紅點是定位用的頂面中心（斜拍時整塊黃色包含側面，中心會偏向相機，perception 會扣掉這段偏移）。
 
 ## 模擬驗證：2D 用 Unity、3D 用 URSim + Isaac Sim
 
@@ -126,7 +126,7 @@ Unity 的手臂與方塊都不動（以前手臂會跟著實機再動一次，�
 Isaac 啟動時把資產手指換成實測大小的直方塊（`--finger_thickness_m` / `--finger_width_m`，預設各 0.015；
 設 0 用資產原本的手指）：內側面整條放在資產指尖內側、下緣放在資產指尖，所以張開時內側 3.5 cm
 （`--gripper_open_m`）與 flange → 指尖 179 mm 都不變。資產手指（跟 Unity 的夾爪模型相同）末端外張，PhysX 用的
-是凸包：在積木頂面高度（指尖上方 19 mm）內側間距只有 28.5 mm、外側離中心 38.5 mm，比實物更容易碰到旁邊的積木。
+是凸包：在指尖上方 19 mm 處內側間距只有 28.5 mm、外側離中心 38.5 mm，比實物更容易碰到旁邊的積木。
 Unity 的夾爪模型沒有改，只用來顯示；Unity 的碰撞檢查只看手臂連桿對桌面與連桿之間，不看手指跟旁邊積木。
 
 Isaac Sim 不連實體手臂。URSim / Isaac 無法使用時記為 `infrastructure_error`（不計成功率）。
@@ -134,12 +134,14 @@ URSim 驗證途中觸發安全停止時，Unity 最多等 300 秒讓人在 URSim
 實體手臂的安全停止則無限期等待人工在 Teach Pendant 解除。
 
 **3D 分層夾取（只有 3D 批次）**：3D 的每一批（URSim 與通過後的實機）帶 `layered_grasp`，每一步帶
-`source_top_m` / `target_top_m`。descend 時指尖停在積木真實頂面下 19 mm（離下層 6 mm），取代 2D 用的
+`source_top_m` / `target_top_m`。descend 時指尖停在積木真實頂面下 12.5 mm（積木高度正中間；2026-10-10 之前是 19 mm，離下層只有 6 mm），取代 2D 用的
 「感知頂面 + Z_CORRECTION」。真實頂面由 `csharp_server/LayeredHeights.cs` 依場景結構算：
 - 佔地跟目標重疊的積木就是支撐，放置高度至少是最高支撐 + 1 層；同一批前面步驟放下的積木也算。
 - 感知 z 對齊 2.5 cm 層高，只當作下限參考（黑色積木的感知 z 在桌面上實測偏差 −32～+3 mm，超過一層）。
 - LLM 的 target.z 只能把放開高度往上調，不會讓夾爪壓進支撐。
 - 目前不支援從疊好的積木中間抽出。
+
+**3D 放置：碰到就停（可開關，預設關，2026-10-10 加，三版相同）**：JsonExecutor 的 `contactStopOnPlace` 打開時，實機在 3D 批次放方塊（手上有方塊、descend 到目標）的最後一段，先停在計算高度上方 `contactApproachM`（10 mm），再以 `contactSpeedMps`（10 mm/s）往下，Z 方向受力超過 `contactForceN`（8 N）就停下放開，最多降到計算高度。用來吸收「下層實際比計算高」的誤差，避免擠壓下層造成保護性停止或推倒。URSim、Isaac 驗證與 Unity 預覽照原本的軌跡；Unity Console 會印出每次比計算高度提早幾 mm 碰到（`[ContactPlace]`）。門檻要先在空中慢速下降量力的雜訊再設。
 
 這時 Unity 的碰撞模型只在 3D 批次把手指段改成「指尖在桌面上方 3 mm」的檢查，前提是實體手指至少 30 mm 長。
 **手臂自撞（2026-10-07 起，只有 3D）**：Unity 規劃 3D 批次時，自撞改用畫面上手臂模型（含夾爪）的 mesh 檢查

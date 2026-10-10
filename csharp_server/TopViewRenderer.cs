@@ -10,7 +10,7 @@ public static class TopViewRenderer
     const double PxPerM = 1500;
     const double MarginM = 0.06;
     const double WorkspaceX = 0.805, WorkspaceY = 0.371;
-    const double BaseX = 0.393, BaseY = 0.357;
+    const double BaseX = 0.386, BaseY = 0.357;
     const double CubeM = 0.025;
 
     public static byte[] Render(IReadOnlyList<SceneObject> objects)
