@@ -9,6 +9,8 @@ using UnityEngine;
 public class RobotArm : MonoBehaviour
 {
     public static bool FreezeVisualFeedback { get; set; } = false;
+    // 2D 純模擬只由本輪 Unity 動畫驅動；只有 URSim 執行批次可讀模擬關節回報。
+    public static bool FollowSimFeedback { get; set; } = false;
 
     public Transform TCP;
     public Transform[] Transforms;
@@ -68,6 +70,7 @@ public class RobotArm : MonoBehaviour
 
     void Start()
     {
+        FollowSimFeedback = false;
         urListener = new URPackageListener();
         EnsureBaseline();
         Outputs = new bool[18];
@@ -161,14 +164,15 @@ public class RobotArm : MonoBehaviour
 
         // 只有 followRealRobotFeedback=true 才從實機讀 Angles；
         // 模擬預覽期間 JsonExecutor 會關掉這個，自己寫 Angles
-        if (followRealRobotFeedback && urListener != null && urListener.Connected)
+        bool readFeedback = !RunMode.IsSim || FollowSimFeedback;
+        if (readFeedback && followRealRobotFeedback && urListener != null && urListener.Connected)
             for (int i = 0; i < Transforms.Length; i++)
                 Angles[i] = (float)urListener.JointData.AsArray[i].q_actual * 180f / MathF.PI;
 
         ApplyAnglesToTransforms();
 
 
-        if(urListener != null && urListener.Connected)
+        if (readFeedback && followRealRobotFeedback && urListener != null && urListener.Connected)
         {
             // TCP Position und Rotation auslesen
             Vector4 cartPosition = Robot2Unity * new Vector4((float)urListener.CartesianInfo.X, 

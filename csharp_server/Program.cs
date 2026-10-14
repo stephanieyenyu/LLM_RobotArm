@@ -467,9 +467,10 @@ while (true)
                     stageKind = "simulation";
                     var simCheckPath = Path.Combine(assets, "sim_check.json");
                     ClearSimulationCheckFiles();
+                    Console.WriteLine($"[Unity 2D] 第 {attempt}/10 輪開始模擬：batch {previewBatchId}，{batchSteps.Count} 個操作。Unity 手臂將播放本輪動作。");
                     AtomicWrite(Path.Combine(assets, "current_step.json"), batch2d);
-                    Console.WriteLine($"[實驗] 第 {attempt}/10 輪已送出 2D 整批給 Unity 模擬（{batchSteps.Count} 個操作，手臂不動）：batch {previewBatchId}。");
-                    var preview = await Wait(attempt, previewBatchId);
+                    var preview = await Wait(attempt, previewBatchId, "Unity 2D 模擬");
+                    Console.WriteLine($"[Unity 2D] batch {previewBatchId} 模擬動作已結束；接下來檢查 overlap 與圖像，手臂暫停。");
                     Save(dir, $"execution_{previewBatchId}.json", preview);
                     var simCheck = ReadSimulationCheck(simCheckPath, previewBatchId, dir);
                     if (preview == null) { status = "execution_unknown"; throw new ExecutionUnknownException(); }
@@ -742,7 +743,7 @@ async Task<JsonElement?> CameraInfo()
         return null;
     }
 }
-async Task<ExecutionResult?> Wait(int attempt, int id)
+async Task<ExecutionResult?> Wait(int attempt, int id, string phase = "Unity/UR3")
 {
     var path = Path.Combine(assets, "step_done.json");
     var started = DateTime.UtcNow;
@@ -762,7 +763,7 @@ async Task<ExecutionResult?> Wait(int attempt, int id)
         if (elapsedSeconds >= lastReportedSeconds + 15)
         {
             lastReportedSeconds = elapsedSeconds;
-            Console.WriteLine($"[Unity/UR3] 第 {attempt}/10 輪，batch {id} 仍在執行，已等待 {elapsedSeconds} 秒（無逾時限制）...");
+            Console.WriteLine($"[{phase}] 第 {attempt}/10 輪，等待 batch {id} 回報，已等待 {elapsedSeconds} 秒（無逾時限制）...");
         }
         await Task.Delay(200);
     }

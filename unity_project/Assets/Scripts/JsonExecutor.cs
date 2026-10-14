@@ -710,11 +710,13 @@ public class JsonExecutor : MonoBehaviour
                 // 3D 批次的桌面比 QR1_Z 低：預覽與執行期間畫面上的桌面、積木整組跟著移，跑完移回（2D 不動）
                 if (batch.layered_grasp && sceneSyncer != null)
                     sceneSyncer.SetTableHeightOffset((float)LayeredGraspGeometry.TableZCorrectionM);
+                RobotArm.FollowSimFeedback = useUrsim;
                 executionEpoch++;
                 currentStepCoroutine = StartCoroutine(ExecuteBatch(batch));
                 yield return currentStepCoroutine;
                 currentStepCoroutine = null;
                 currentStepId = -1;
+                RobotArm.FollowSimFeedback = false;
                 // 整批結束（成功或失敗）才解凍：Unity 手臂一次對齊實機最後的姿勢，手動控制也恢復顯示
                 RobotArm.FreezeVisualFeedback = false;
                 if (batch.layered_grasp && sceneSyncer != null)
@@ -881,7 +883,7 @@ public class JsonExecutor : MonoBehaviour
             yield break;
         }
 
-        EnsureUrConnectionStarted();
+        if (!batch.preview_only) EnsureUrConnectionStarted();
         yield return StartCoroutine(SetPerceptionMode("executing"));
         if (sceneSyncer == null)
             sceneSyncer = FindObjectOfType<SceneSyncer>();
@@ -2874,7 +2876,8 @@ public class JsonExecutor : MonoBehaviour
         }
 
         // 復原：手臂角度
-        if (initialArmAngles != null && robotArm != null && robotArm.Angles != null)
+        if (!(RunMode.IsSim && batch.preview_only) &&
+            initialArmAngles != null && robotArm != null && robotArm.Angles != null)
         {
             int n = Mathf.Min(initialArmAngles.Length, robotArm.Angles.Length);
             for (int i = 0; i < n; i++) robotArm.Angles[i] = initialArmAngles[i];
@@ -2894,7 +2897,9 @@ public class JsonExecutor : MonoBehaviour
             cube.name = initialCubeNames[cube];
         }
 
-        Debug.Log($"[Executor-preview] 動畫預覽結束，已復原場景。實機開始執行");
+        Debug.Log(batch.preview_only
+            ? $"[Executor-preview] batch {batch.batch_id}：Unity 2D 模擬動作結束，等待 CMD 圖像驗證。"
+            : $"[Executor-preview] batch {batch.batch_id}：動畫預覽結束，已復原場景，準備送出執行指令。");
     }
 
     IEnumerator AnimateSharedTrajectoryStep(StepEnvelope env, string tag, bool layeredGrasp = false)
