@@ -24,9 +24,9 @@ public static class TaskAssigner
     private const double SUPPLY_ZONE_Y_MAX = 0.25;
     // Source reach is only a candidate filter; Unity must still reject unsafe
     // full-arm trajectories before sending motion to the robot.
-    // 同 JsonExecutor.QR1_X/Y（2026-10-10 統一）
-    private const double QR1_TO_UR_X = -0.38637;
-    private const double QR1_TO_UR_Y = -0.35747;
+    // 同 JsonExecutor.QR1_X/Y（2026-10-14 指尖實測）
+    private const double QR1_TO_UR_X = -0.39024;
+    private const double QR1_TO_UR_Y = -0.36321;
     private const double MIN_SAFE_SOURCE_RADIUS_M = 0.10;
     private const double MAX_SAFE_SOURCE_RADIUS_M = 0.47;
 

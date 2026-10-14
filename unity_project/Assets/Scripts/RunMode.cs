@@ -18,7 +18,7 @@ public static class RunMode
     class Data
     {
         public string mode = "real";
-        public string scene = "sim_scenes/yellow_cubes_15.json";   // 三個版本相同的兩個場景：yellow_cubes_15（預設）、domino_cube
+        public string scene = "sim_scenes/yellow_cubes_16.json";   // 三個版本相同的兩個場景：yellow_cubes_16（預設）、domino_cube
         public bool reset_each_task = true;
         public string sim_perception_url = "http://localhost:6000/perception/";
     }

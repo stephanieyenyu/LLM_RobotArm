@@ -97,7 +97,7 @@
 - default block Z = 0.025 m。
 - target 右下角固定：
   - TargetRightX = 0.728 m
-  - TargetBottomY = 0.02 m
+  - TargetBottomY = 0.026 m（2026-10-14 由 0.02 m 改：QR1 統一後右下格距基座 0.4802 m，超過 0.48 m）
 
 ### UR 可達半徑限制
 
@@ -233,8 +233,8 @@ LLM 只能輸出以下 function：
 <summary><strong>Unity Executor / 硬體安全限制</strong></summary>
 
 - QR1 校正座標目前設定：
-  - QR1_X = -0.38637 m
-  - QR1_Y = -0.35747 m
+  - QR1_X = -0.39024 m（2026-10-14 指尖實測）
+  - QR1_Y = -0.36321 m
   - QR1_Z = 0.030 m
 - 基本安全抬升 offset = 0.08 m。
 - workspace 上方 travel Z = 0.24 m。

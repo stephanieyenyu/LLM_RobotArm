@@ -61,10 +61,10 @@ public class SceneSyncer : MonoBehaviour
     [Header("手臂 base 在 QR frame 中的位置（把 workspace 對齊到手臂）")]
     // 預設值 = -JsonExecutor.QR1_X / -QR1_Y（Teach Pendant 實測值）
     // 手臂 base 在 robot (0,0,0)，QR1 在 robot (QR1_X, QR1_Y)，所以在 QR frame 裡
-    // 手臂座標 = (-QR1_X, -QR1_Y) = (0.38637, 0.35747)
+    // 手臂座標 = (-QR1_X, -QR1_Y) = (0.39024, 0.36321)
     // Inspector 也可以手動蓋掉這個值
-    public float armBaseAtQrX = -JsonExecutor.QR1_X;   // 0.38637
-    public float armBaseAtQrY = -JsonExecutor.QR1_Y;   // 0.35747
+    public float armBaseAtQrX = -JsonExecutor.QR1_X;   // 0.39024
+    public float armBaseAtQrY = -JsonExecutor.QR1_Y;   // 0.36321
     // 桌面（QR 平面）比手臂安裝面高 QR1_Z，所以手臂 base 在 QR frame 的 Z 是 -QR1_Z
     public float armBaseAtQrZ = -JsonExecutor.QR1_Z;   // -0.030
 
@@ -80,7 +80,7 @@ public class SceneSyncer : MonoBehaviour
     [System.NonSerialized] public float supplyZoneYMin = 0.02f;
     [System.NonSerialized] public float supplyZoneYMax = 0.25f;
     [System.NonSerialized] public float targetZoneRightX = 0.728f;
-    [System.NonSerialized] public float targetZoneBottomY = 0.02f;
+    [System.NonSerialized] public float targetZoneBottomY = 0.026f;
     [System.NonSerialized] public float cellSize = 0.052f;
     [System.NonSerialized] public int gridRows = 5;
     [System.NonSerialized] public int gridCols = 5;

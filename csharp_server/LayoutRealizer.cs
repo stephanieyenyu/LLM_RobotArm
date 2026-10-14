@@ -17,6 +17,8 @@ public static class LayoutRealizer
     {
         public List<TargetCell>? Targets { get; set; }
         public string? Error { get; set; }
+        // 只印在 console 的細節（哪一格、距基座多遠）；Error 會原樣餵回重畫的 LLM，所以分開放
+        public string? Detail { get; set; }
         public double PlacementShiftX { get; set; }
         public double PlacementShiftY { get; set; }
     }
@@ -118,12 +120,14 @@ if (dominosNeeded > dominoBudget)
     };
 }
 
-        if (!AreTargetsWithinSafeReach(targets, ws))
+        string? unreachable = DescribeUnreachableTarget(targets, ws);
+        if (unreachable != null)
         {
             return new RealizeResult
             {
                 Error = $"固定右下角的圖案超出擺放區或 UR 目標半徑 0.18..0.48 m " +
                         $"(CellSize={ws.CellSize:F3} m)；不會自動平移或送出實體手臂。",
+                Detail = unreachable,
             };
         }
 
@@ -135,11 +139,16 @@ if (dominosNeeded > dominoBudget)
 
     // 立體的 SpatialLayoutRealizer 也用同一套可達檢查
     internal static bool AreTargetsWithinSafeReach(
+        IReadOnlyList<TargetCell> targets, WorkspaceBounds ws) =>
+        DescribeUnreachableTarget(targets, ws) == null;
+
+    // 第一個超出擺放區或可達半徑的目標格，例如「r4c4 (0.728, 0.020) 距基座 0.4802 m」；全部可以就回 null
+    internal static string? DescribeUnreachableTarget(
         IReadOnlyList<TargetCell> targets, WorkspaceBounds ws)
     {
-        // QR1 在 UR 基座座標的位置，同 JsonExecutor.QR1_X/Y（2026-10-10 統一）
-        const double qrToRobotX = -0.38637;
-        const double qrToRobotY = -0.35747;
+        // QR1 在 UR 基座座標的位置，同 JsonExecutor.QR1_X/Y（2026-10-14 指尖實測）
+        const double qrToRobotX = -0.39024;
+        const double qrToRobotY = -0.36321;
         const double minReach = 0.18;
         const double maxReach = 0.48;
         const double placementMaxX = 0.74;
@@ -153,9 +162,9 @@ if (dominosNeeded > dominoBudget)
             if (target.WorldX < ws.TargetZoneXMin || target.WorldX > placementMaxX ||
                 target.WorldY < placementMinY || target.WorldY > placementMaxY ||
                 radius < minReach || radius > maxReach)
-                return false;
+                return $"r{target.Row}c{target.Col} ({target.WorldX:F3}, {target.WorldY:F3}) 距基座 {radius:F4} m";
         }
-        return true;
+        return null;
     }
 
     private static TargetCell BuildCube(int r, int c, int rows, int cols, WorkspaceBounds ws, string color)

@@ -259,6 +259,7 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
             $"({workspace.CellSize:F3} m). Redraw a compact recognizable candidate whose occupied bounding box " +
             $"is at most {span} rows by {span} columns; leave remaining cells empty. " +
             "If exact recognizable identity cannot fit these constraints, report infeasible instead of forcing it.";
+        Console.WriteLine($"[Layer 2] {realize.Error}{(realize.Detail == null ? "" : $"（{realize.Detail}）")}");
         Console.WriteLine($"[Layer 2 compact retry] {compactAttempt}/2: 維持畫布與格距，佔用範圍最多 {span}x{span}；重新生成與評審。");
         try
         {
@@ -298,7 +299,7 @@ async Task RunPatternTaskBatchAsync(string userCommand, List<SceneObject> initia
 
     if (realize.Error != null || realize.Targets == null)
     {
-        Console.WriteLine($"[Layer 2] {realize.Error}");
+        Console.WriteLine($"[Layer 2] {realize.Error}{(realize.Detail == null ? "" : $"（{realize.Detail}）")}");
         WriteStepFile(new StepEnvelope { StepId = ++globalStepId, Done = true });
         return;
     }

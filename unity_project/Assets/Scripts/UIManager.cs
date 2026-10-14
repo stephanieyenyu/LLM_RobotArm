@@ -416,7 +416,9 @@ public class UIManager : MonoBehaviour
         string stepPath = Path.Combine(SHARED_DIR, "current_step.json");
         var lastWrite = File.Exists(stepPath) ? File.GetLastWriteTime(stepPath) : System.DateTime.MinValue;
 
-        float timeout = 600f;     // batch 會先完成所有 LLM motion plans 才開始執行
+        // batch 會先完成所有 LLM motion plans 才開始執行；圖案被擋時會再畫兩次（每次都是完整雙 LLM 設計），
+        // 2026-10-14 實測設計＋規劃超過 10 分鐘，所以上限給 20 分鐘
+        float timeout = 1200f;
         float waited = 0f;
         float lastLogAt = 0f;
 

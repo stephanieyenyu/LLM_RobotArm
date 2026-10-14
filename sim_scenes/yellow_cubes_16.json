@@ -1,0 +1,22 @@
+{
+  "description": "16 塊黃方塊排成 4 排 × 4 顆（同一排中心間距 5.5 cm、排距 5.5 cm，每往後一排整排往 -X 移 3.5 cm，順著手臂取料範圍的弧形帶）：X 0.065～0.335、Y 0.035～0.200，全部在 rulebased 的供料區內（X 0.05～0.35、Y 0.02～0.25）。依 2026-10-14 指尖實測的 QR1，每塊的取料位置離手臂基座 0.226～0.392 m（Unity 來源範圍 0.20～0.42 m，兩邊各留至少 2.6 cm）；夾爪閉合方向（±X）上相鄰的方塊中心相距 5.5 cm（至少要 4.5 cm），下降時碰不到旁邊的方塊；右側的擺放區留空。三個版本的這個檔案完全相同（2026-10-14 由 yellow_cubes_15 改）。",
+  "objects": [
+    { "name": "yellow_cube", "shape": "cube", "x": 0.170, "y": 0.035, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.225, "y": 0.035, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.280, "y": 0.035, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.335, "y": 0.035, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.135, "y": 0.090, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.190, "y": 0.090, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.245, "y": 0.090, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.300, "y": 0.090, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.100, "y": 0.145, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.155, "y": 0.145, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.210, "y": 0.145, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.265, "y": 0.145, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.065, "y": 0.200, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.120, "y": 0.200, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.175, "y": 0.200, "z": 0.025, "orientation": null },
+    { "name": "yellow_cube", "shape": "cube", "x": 0.230, "y": 0.200, "z": 0.025, "orientation": null }
+  ],
+  "camera": null
+}

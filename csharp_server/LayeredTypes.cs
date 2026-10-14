@@ -43,8 +43,10 @@ public class WorkspaceBounds
     // 可用工作區約為 QR frame 內的 0.32 x 0.40，以下數值保留安全邊界。
     // LayoutRealizer 會拒絕超出目標擺放半徑 0.18..0.48 m 的目標。
     // 5.2 cm 格距：相鄰積木之間留 2.7 cm 給夾爪手指。
+    // 2026-10-14：QR1 改過後，右下格 (0.728, 0.020) 距基座超過 0.48 m（指尖實測的 QR1 下是 0.4815 m），
+    // 用到右下角的圖案都會被擋；底列往 +Y 移 6 mm，5×5 每格都在 0.18..0.48 m 內（右下 0.477、左上 0.183）。
     public double TargetRightX { get; set; } = 0.728;
-    public double TargetBottomY { get; set; } = 0.02;
+    public double TargetBottomY { get; set; } = 0.026;
     public double TargetOriginX { get; set; } = 0.49; // 3D placement uses its own origin.
     public double TargetOriginY { get; set; } = 0.04;
     public double CellSize { get; set; } = 0.052;
