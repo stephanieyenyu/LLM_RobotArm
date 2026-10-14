@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sync_check import fk, read_robot_joints  # noqa: E402
 
 # 目前 Unity 的設定（JsonExecutor.cs QR1_X/Y/Z；3D 批次的桌面另加 LayeredGraspGeometry.TableZCorrectionM）
-QR1_X, QR1_Y, QR1_Z = -0.38637, -0.35747, 0.030
+QR1_X, QR1_Y, QR1_Z = -0.39024, -0.36321, 0.030
 TABLE_Z_CORRECTION_3D = -0.030
 DEFAULT_MARKERS = {"QR1": [0.0, 0.0], "QR2": [0.805, 0.0], "QR3": [0.0, 0.371], "QR4": [0.805, 0.371]}
 
@@ -78,17 +78,22 @@ def report(points):
     print(f"  只修平移、不修轉角的話，離 QR1 60 cm 處還會差約 {abs(math.sin(theta))*0.6*1000:.1f} mm")
 
 
-def perceived_block(perception, name="yellow_cube", frames=5):
-    """perception /scene 連續幾幀的平均位置（QR 座標）；找不到回傳 None。"""
+def perceived_block(perception, near, name="yellow_cube", frames=5, max_dist=0.030):
+    """perception /scene 連續幾幀的平均位置（QR 座標）；找不到回傳 None。
+    桌上有很多方塊時，取離 near（用目前 QR1 設定從指尖位置推回的 QR 座標）最近、30 mm 內的那一塊。"""
     import time
     xs = []
     for _ in range(frames):
         scene = json.loads(urllib.request.urlopen(f"{perception}/scene", timeout=5).read())
+        best = None
         for o in scene.get("objects", []):
             p = o.get("position")
             if o.get("name") == name and isinstance(p, dict):
-                xs.append((p["x"], p["y"]))
-                break
+                d = math.hypot(p["x"] - near[0], p["y"] - near[1])
+                if d <= max_dist and (best is None or d < best[0]):
+                    best = (d, p["x"], p["y"])
+        if best:
+            xs.append(best[1:])
         time.sleep(0.2)
     if len(xs) < max(2, frames // 2):
         return None
@@ -140,7 +145,8 @@ def main():
             q = read_robot_joints(args.robot_ip)
             points.append((n, markers[n], fingertip_base(q, args.tip), 0.0))
             print(f"    關節角 {[round(math.degrees(v), 2) for v in q]} → 指尖 {[round(v, 4) for v in points[-1][2]]}")
-        print("\n  接著用黃色方塊加參考點（放在不同位置、越分散越好，至少再加 1～2 個）：")
+        print("\n  接著用黃色方塊加參考點（放在不同位置、越分散越好，至少再加 1～2 個）；"
+              "桌上可以有很多方塊，會取指尖底下那一塊：")
         while True:
             ans = input("  把黃色方塊放好、手移開，指尖輕碰方塊頂面中心後按 Enter（輸入 q 結束）：").strip().lower()
             if ans == "q":
@@ -148,9 +154,9 @@ def main():
             q = read_robot_joints(args.robot_ip)
             tip_pos = fingertip_base(q, args.tip)
             input("  先把手臂抬離方塊（相機才看得到整塊），抬好按 Enter：")
-            xy = perceived_block(perception)
+            xy = perceived_block(perception, (tip_pos[0] - QR1_X, tip_pos[1] - QR1_Y))
             if xy is None:
-                print("    相機看不到 yellow_cube，這一點不算")
+                print("    相機在指尖底下 30 mm 內找不到 yellow_cube，這一點不算")
                 continue
             points.append((f"方塊{len([p for p in points if p[3] > 0]) + 1}", xy, tip_pos, 0.025))
             print(f"    方塊 QR ({xy[0]:.4f},{xy[1]:.4f}) → 指尖 {[round(v, 4) for v in tip_pos]}")

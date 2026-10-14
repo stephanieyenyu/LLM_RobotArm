@@ -282,6 +282,8 @@ public class JsonExecutor : MonoBehaviour
     public float simGraspToleranceM = 0.020f;
 
     [Header("實機夾取校正（只影響 source，不影響放置矩陣）")]
+    // 場景值 +2、+2 mm。2026-10-14 QR1 改指尖實測後試過歸零，3D 夾取手指壓到方塊頂面（閉合方向每邊只剩約 5 mm），
+    // 保留 +2、+2 的 rulebased 全部夾成功，所以留著
     public float pickOffsetX = -0.002f;
     public float pickOffsetY = 0.002f;
 
@@ -291,8 +293,8 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
-    public const float QR1_X = -0.38637f;   // 2026-10-10 拿掉 X 的 -7 mm 校正（同 rulebased），Isaac --qr1 一起改
-    public const float QR1_Y = -0.35747f;
+    public const float QR1_X = -0.39024f;   // 2026-10-14 指尖實測（isaac_sim/touch_calibrate.py，7 點；轉角 -0.18° 不修）；Isaac --qr1 一起改
+    public const float QR1_Y = -0.36321f;
     public const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;

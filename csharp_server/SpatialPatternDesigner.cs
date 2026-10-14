@@ -271,10 +271,14 @@ public sealed class SpatialPatternDesigner
         => ParseBallot(await partner.CallGemini(
             PatternDesigner.BallotPrompt(), BallotRequest(command, candidates), PatternDesigner.BallotSchema()));
 
-    // 格式同 PatternDesigner.BallotRequest
+    // 格式同 PatternDesigner.BallotRequest，另加一行說明候選圖是正面圖（2026-10-14，同 rulebased 10-08 的那一行）：
+    // 投票 prompt 是 2D 的原文，只給 0/1 矩陣時兩個模型都把 311、310 當成平面 L，因為指令寫「立體」只給 0.30／0.40，
+    // 兩輪都沒過 0.50、任務失敗。用詞取自 260917 正面方向審查 prompt
     static string BallotRequest(string command, List<Candidate> candidates)
     {
         var text = new StringBuilder($"Original user command: {command}\n");
+        text.AppendLine("Each candidate is the fixed front view of the stacked cube structure (1=voxel, 0=empty): " +
+                        "the top row is the highest +Z layer, the bottom row touches the table, and columns run left-to-right.");
         for (int i = 0; i < candidates.Count; i++)
         {
             text.AppendLine($"Candidate {i}:");

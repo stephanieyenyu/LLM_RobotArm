@@ -16,8 +16,8 @@ public sealed class RunModeConfig
     public string Mode { get; set; } = "real";
 
     // 虛擬場景檔，相對 repo 根目錄
-    // 三個版本相同的兩個場景：yellow_cubes_15.json（預設）、domino_cube.json
-    public const string DefaultScene = "sim_scenes/yellow_cubes_15.json";
+    // 三個版本相同的兩個場景：yellow_cubes_16.json（預設；2026-10-14 前是 yellow_cubes_15）、domino_cube.json
+    public const string DefaultScene = "sim_scenes/yellow_cubes_16.json";
 
     [JsonPropertyName("scene")]
     public string Scene { get; set; } = DefaultScene;
