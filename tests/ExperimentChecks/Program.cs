@@ -200,7 +200,7 @@ try { RunModeConfig.Load(modeDir); } catch (InvalidDataException) { rejected = t
 Check(rejected, "an unknown mode is refused instead of guessed (a wrong guess could move the real arm)");
 var repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../.."));
 var streamingAssets = Path.Combine(repoRoot, "unity_project", "Assets", "StreamingAssets");
-foreach (var sceneFile in new[] { "yellow_cubes_15", "domino_cube" })
+foreach (var sceneFile in new[] { "yellow_cubes_16", "domino_cube" })
 {
     var config = new RunModeConfig { Mode = "sim", Scene = $"sim_scenes/{sceneFile}.json" };
     var simScene = SimScene.Load(config.ScenePath(streamingAssets));
@@ -211,8 +211,8 @@ foreach (var sceneFile in new[] { "yellow_cubes_15", "domino_cube" })
           $"{sceneFile}.json without a camera gets the lab camera from sim_scenes/camera/default.json");
 }
 var defaultScene = SimScene.Load(new RunModeConfig { Mode = "sim" }.ScenePath(streamingAssets));
-Check(defaultScene.Objects.Count == 15 && defaultScene.Objects.All(o => o.Name == "yellow_cube"),
-      "the default virtual scene is 15 yellow cubes (same file in all three versions)");
+Check(defaultScene.Objects.Count == 16 && defaultScene.Objects.All(o => o.Name == "yellow_cube"),
+      "the default virtual scene is 16 yellow cubes (same file in all three versions)");
 var dominoScene = SimScene.Load(new RunModeConfig { Mode = "sim", Scene = "sim_scenes/domino_cube.json" }.ScenePath(streamingAssets));
 Check(dominoScene.Objects.Count == 2 && dominoScene.Objects.Count(o => o.Shape == "domino") == 1 && dominoScene.Objects.Count(o => o.Shape == "cube") == 1,
       "the other virtual scene is one domino and one cube");
