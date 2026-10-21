@@ -70,6 +70,8 @@ while (true)
     var run = Path.Combine(root, $"{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}");
     Directory.CreateDirectory(run);
     File.WriteAllText(Path.Combine(run, "task.txt"), goal);
+    // 這個任務期間 terminal 的內容另存到 console.txt（迴圈這一圈結束時停止，含 break）
+    using var consoleLog = ConsoleCapture.Start(Path.Combine(run, "console.txt"), $"指令：{goal}（{DateTime.Now:yyyy-MM-dd HH:mm:ss}）");
     if (sim) Console.WriteLine($"[純模擬] 2D 由 Unity 模擬驗證（畫面重疊率＋LLM 看 Unity 畫面），通過就算執行，不需要 Isaac；" +
                                $"3D 由 Isaac Sim 模擬驗證（物理檢查＋畫面重疊率＋LLM 看 Isaac 畫面），通過後正式執行送 URSim。" +
                                $"場景來自 Isaac Sim，沒開 Isaac 時 2D 改用內建的虛擬世界；紀錄在 {simOutput}。");
