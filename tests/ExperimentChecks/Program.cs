@@ -22,6 +22,65 @@ int passed = 0;
 void Check(bool condition, string name) { if (!condition) throw new Exception(name); Console.WriteLine("PASS " + name); passed++; }
 SceneObject Piece(double x) => new() { Name = "yellow_cube", Shape = "cube", X = x, Y = 0.1, Z = 0.025 };
 var baseline = new List<SceneObject> { Piece(0.1), Piece(0.15) };
+var supplyCases = new (double X, double Y, bool Inside)[]
+{
+    (0.20, 0.10, true),
+    (0.05, 0.02, true), (0.05, 0.25, true),
+    (0.35, 0.02, true), (0.35, 0.25, true),
+    (0.05, 0.10, true), (0.35, 0.10, true),
+    (0.20, 0.02, true), (0.20, 0.25, true),
+    (0.049999, 0.10, false), (0.350001, 0.10, false),
+    (0.20, 0.019999, false), (0.20, 0.250001, false),
+    (double.NaN, 0.10, false), (0.20, double.PositiveInfinity, false)
+};
+foreach (var c in supplyCases)
+{
+    Check(SupplyRegion.Contains(c.X, c.Y) == c.Inside &&
+          SupplyRegion.Contains((float)c.X, (float)c.Y) == c.Inside,
+          $"supply center ({c.X},{c.Y}) agrees at server/Unity precision: {c.Inside}");
+    var candidate = Piece(c.X);
+    candidate.Y = c.Y;
+    var regionAssignment = new Assignment
+    {
+        Source = candidate,
+        Target = new TargetCell { WorldX = 0.4, WorldY = 0.1, WorldZ = 0.025 }
+    };
+    var regionAccepted = MotionPlanValidator.TryValidate(
+        new MotionPlan { ActionSequence = new() { new() { Function = "grasp" } } },
+        regionAssignment, new[] { candidate }, out var regionError);
+    bool distanceAccepted = WorkspaceDistanceLimits.SourceContains(c.X, c.Y);
+    Check(c.Inside && distanceAccepted ? regionAccepted : !regionAccepted &&
+        regionError.Contains(c.Inside ? "distance limits" : "supply region"),
+        "planning gate requires both supply bounds and source distance, with target outside supply");
+}
+foreach (bool sourceDistance in new[] { true, false })
+{
+    double min = sourceDistance ? 0.10 : 0.16;
+    double max = sourceDistance ? 0.47 : 0.48;
+    foreach (var test in new[] { (min - 0.000001, false), (min, true), (min + 0.000001, true),
+                                (max - 0.000001, true), (max, true), (max + 0.000001, false) })
+    foreach (double angle in new[] { 0.0, 0.7, 1.9, 3.8 })
+    {
+        double x = WorkspaceDistanceLimits.BaseX + test.Item1 * Math.Cos(angle);
+        double y = WorkspaceDistanceLimits.BaseY + test.Item1 * Math.Sin(angle);
+        bool serverInside = sourceDistance ? WorkspaceDistanceLimits.SourceContains(x, y) : WorkspaceDistanceLimits.TargetContains(x, y);
+        bool unityInside = sourceDistance ? WorkspaceDistanceLimits.SourceContains((float)x, (float)y) : WorkspaceDistanceLimits.TargetContains((float)x, (float)y);
+        Check(serverInside == test.Item2 && unityInside == test.Item2,
+            $"{(sourceDistance ? "source" : "target")} distance {test.Item1:F6}, angle {angle}: double/float boundary agreement");
+    }
+}
+Check(!WorkspaceDistanceLimits.SourceContains(double.NaN, 0) &&
+      !WorkspaceDistanceLimits.TargetContains(0, double.PositiveInfinity), "distance filter rejects invalid coordinates");
+Check(SupplyRegion.Contains(0.05, 0.02) && !WorkspaceDistanceLimits.SourceContains(0.05, 0.02),
+    "supply corner outside 47 cm is rejected despite being inside supply");
+var tooCloseTarget = new Assignment
+{
+    Source = Piece(0.1),
+    Target = new TargetCell { WorldX = 0.38824, WorldY = 0.35473, WorldZ = 0.025 }
+};
+Check(!MotionPlanValidator.TryValidate(new MotionPlan { ActionSequence = new() { new() { Function = "grasp" } } },
+    tooCloseTarget, baseline, out var distanceError) && distanceError.Contains("distance limits"),
+    "planning gate rejects a target inside the 16 cm exclusion");
 var tcpAction = JsonSerializer.Deserialize<RobotFunctionCall>("""
     {"function":"descend","location":"target","tcp_pose":{"x":0.55,"y":0.3,"z":0.045,"rx":-1.2,"ry":2.1,"rz":0.7}}
     """);
@@ -52,8 +111,9 @@ Check(missingFrameRejected, "missing coordinate frame is reported instead of inv
 bool badSpacingRejected = false;
 try { canonicalPlan.ForUnity("bitmap_grid(0.1, 0.3, 0, 0.05, 0.025)"); } catch (TranslationContractException) { badSpacingRejected = true; }
 Check(badSpacingRejected, "invalid zero grid spacing is rejected as an interface error");
-Check(!canonicalPlan.PlanningConstraint.Contains("X <") && !canonicalPlan.PlanningConstraint.Contains("Targets:"),
-    "placement prompt does not impose supply zoning or fixed target coordinates");
+Check(canonicalPlan.PlanningConstraint.Contains(SupplyRegion.Description) &&
+      !canonicalPlan.PlanningConstraint.Contains("Targets:"),
+    "placement prompt states the shared supply bounds without fixed target coordinates");
 // 立體 bitmap（俯視高度圖）：每一格的每一層各一個預期格，Z = top_z + (層 - 1) × 積木高，位置一樣用 LLM 宣告的座標系
 var spatialPlan = new DualBitmapPlan { Rows = new() { "311" }, HeightMap = true };
 var spatialLayout = spatialPlan.ForUnity("bitmap_grid(0.50, 0.20, 0.05, 0.06, 0.025)");
@@ -65,8 +125,8 @@ Check(spatialLayout.Cells.Count == 5 && leftColumn.Count == 3 &&
       Math.Abs(spatialLayout.Cells.Single(c => c.Col == 2).X - 0.60) < 1e-9,
       "a 3D height-map bitmap expands to one expected cell per layer in the LLM-selected frame");
 Check(spatialPlan.PlanningConstraint.Contains("俯視高度圖") && spatialPlan.PlanningConstraint.Contains("\n311\n") &&
-      !spatialPlan.PlanningConstraint.Contains("X <"),
-      "the 3D planning text shows the height map without supply zoning or fixed coordinates");
+      spatialPlan.PlanningConstraint.Contains(SupplyRegion.Description),
+      "the 3D planning text shows the height map and shared supply bounds");
 Check(ExperimentChecks.Matches(baseline, new[] { Piece(0.15), Piece(0.1) }), "reset matching ignores detection order");
 Check(!ExperimentChecks.Matches(baseline, new[] { Piece(0.1), Piece(0.1) }), "duplicate detection cannot satisfy two baseline pieces");
 Check(!ExperimentChecks.Matches(baseline, new[] { Piece(0.1), Piece(0.2) }), "changed state fails reset gate");

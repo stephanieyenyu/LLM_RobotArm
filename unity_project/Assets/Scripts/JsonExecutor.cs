@@ -303,8 +303,9 @@ public class JsonExecutor : MonoBehaviour
 
     // QR1 到 UR3 base 的座標偏移（以 Teach Pendant 實際校正值為準）
     // public 讓 SceneSyncer 直接引用，workspace 視覺對齊 = 實測值單一來源
-    public const float QR1_X = -0.39024f;   // 2026-10-14 指尖實測（isaac_sim/touch_calibrate.py，7 點；轉角 -0.18° 不修）；Isaac --qr1 一起改
-    public const float QR1_Y = -0.36321f;
+    // Shared 0917 experiment frame; Isaac and the serialized scene use the same translation.
+    public const float QR1_X = -(float)WorkspaceDistanceLimits.BaseX;
+    public const float QR1_Y = -(float)WorkspaceDistanceLimits.BaseY;
     public const float QR1_Z = 0.030f;
 
     private const float SAFE_Z_OFFSET = 0.08f;
@@ -318,17 +319,15 @@ public class JsonExecutor : MonoBehaviour
     // Reject TCP targets too close to the base axis. Reaching into this cylinder
     // requires a tightly folded arm and can make adjacent UR3e links collide.
     private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
-    // Picking needs more clearance than placing because the source-side tool
-    // orientation and attached gripper can fold the wrist/forearm toward the base.
-    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.20f;
+    // Object-center candidate distances are shared with the planning server.
+    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = (float)WorkspaceDistanceLimits.SourceMinM;
     // High-plane lateral travel is routed around this radius when a direct
     // Cartesian chord would cut through the base exclusion cylinder.
     private const float BASE_DETOUR_RADIUS_M = 0.28f;
     private const float BASE_DETOUR_MAX_ANGLE_STEP_DEG = 25f;
-    // Avoid poses that make the UR3e almost fully extend. Those IK solutions are
-    // fragile and can trigger a protective stop before the TCP reaches the block.
-    private const float MAX_SOURCE_REACH_RADIUS_M = 0.42f;
-    private const float MAX_TARGET_REACH_RADIUS_M = 0.47f;
+    // IK, singularity and collision checks remain independent of these filters.
+    private const float MAX_SOURCE_REACH_RADIUS_M = (float)WorkspaceDistanceLimits.SourceMaxM;
+    private const float MAX_TARGET_REACH_RADIUS_M = (float)WorkspaceDistanceLimits.TargetMaxM;
     // Do not advance merely because a fixed delay elapsed.  Every motion is
     // confirmed against the UR secondary-interface feedback first.
     private const float MOTION_START_GRACE_SEC = 0.35f;
@@ -791,6 +790,15 @@ public class JsonExecutor : MonoBehaviour
 
     IEnumerator ExecuteBatch(BatchEnvelope batch)
     {
+        foreach (var step in batch.steps)
+        {
+            if (step == null || step.done) continue;
+            if (!ValidateObjectCenterRegions(step, out string regionError))
+            {
+                WriteStepDone(batch.batch_id, false, regionError, 0f);
+                yield break;
+            }
+        }
         if (!useSharedMovejTrajectory)
         {
             WriteStepDone(batch.batch_id, false, "LLM TCP 模式需要開啟 useSharedMovejTrajectory（關掉時的舊路徑不看 LLM 給的 TCP 姿態）。", 0f);
@@ -2653,11 +2661,11 @@ public class JsonExecutor : MonoBehaviour
             float oy = QR1_Y + env.source_position.y + pickOffsetY;
             float tx = QR1_X + env.target_position.x;
             float ty = QR1_Y + env.target_position.y;
-            if (InsideSourceBaseExclusion(ox, oy) || OutsideReachEnvelope(ox, oy, MAX_SOURCE_REACH_RADIUS_M))
-                failures.Add($"step {env.step_id} source @ UR({ox:F3},{oy:F3}) 半徑 {Mathf.Sqrt(ox * ox + oy * oy):F3} m " +
+            if (!WorkspaceDistanceLimits.SourceContains(env.source_position.x, env.source_position.y))
+                failures.Add($"step {env.step_id} source 中心半徑 {WorkspaceDistanceLimits.Radius(env.source_position.x, env.source_position.y):F3} m " +
                              $"超出實機安全範圍 {SOURCE_BASE_EXCLUSION_RADIUS_M:F2}..{MAX_SOURCE_REACH_RADIUS_M:F2} m");
-            if (InsideBaseExclusion(tx, ty) || OutsideReachEnvelope(tx, ty, MAX_TARGET_REACH_RADIUS_M))
-                failures.Add($"step {env.step_id} target @ UR({tx:F3},{ty:F3}) 半徑 {Mathf.Sqrt(tx * tx + ty * ty):F3} m " +
+            if (!WorkspaceDistanceLimits.TargetContains(env.target_position.x, env.target_position.y))
+                failures.Add($"step {env.step_id} target 中心半徑 {WorkspaceDistanceLimits.Radius(env.target_position.x, env.target_position.y):F3} m " +
                              $"超出實機安全範圍 {BASE_EXCLUSION_RADIUS_M:F2}..{MAX_TARGET_REACH_RADIUS_M:F2} m");
 
             foreach (var (label, pos, hover) in new[]
@@ -3137,8 +3145,33 @@ public class JsonExecutor : MonoBehaviour
         Debug.Log("嘗試連線至 UR：" + ip);
     }
 
+    static bool ValidateObjectCenterRegions(StepEnvelope env, out string error)
+    {
+        var source = env.source_position;
+        if (source != null && SupplyRegion.Contains(source.x, source.y))
+        {
+            var target = env.target_position;
+            if (!WorkspaceDistanceLimits.SourceContains(source.x, source.y) || target == null ||
+                !WorkspaceDistanceLimits.TargetContains(target.x, target.y))
+            {
+                error = $"step {env.step_id}: object center outside horizontal distance limits. " +
+                    WorkspaceDistanceLimits.Description;
+                return false;
+            }
+            error = null;
+            return true;
+        }
+        error = $"step {env.step_id}: source is missing or outside the supply region. " + SupplyRegion.Description;
+        return false;
+    }
+
     IEnumerator ExecuteStep(StepEnvelope env, long stepEpoch, bool managePerceptionMode = true)
     {
+        if (!ValidateObjectCenterRegions(env, out string regionError))
+        {
+            WriteStepDone(env.step_id, false, regionError, 0f);
+            yield break;
+        }
         Debug.Log($"═══ Step {env.step_id} ═══ {env.comment}");
 
         // 等待連線
@@ -3186,12 +3219,11 @@ public class JsonExecutor : MonoBehaviour
             $"pickOffset=({pickOffsetX:F4},{pickOffsetY:F4}); " +
             $"target UR=({tx:F4},{ty:F4},{tz:F4})");
 
-        if (InsideSourceBaseExclusion(ox, oy) || InsideBaseExclusion(tx, ty) ||
-            OutsideReachEnvelope(ox, oy, MAX_SOURCE_REACH_RADIUS_M) ||
-            OutsideReachEnvelope(tx, ty, MAX_TARGET_REACH_RADIUS_M))
+        if (!WorkspaceDistanceLimits.SourceContains(env.source_position.x, env.source_position.y) ||
+            !WorkspaceDistanceLimits.TargetContains(env.target_position.x, env.target_position.y))
         {
-            string error = $"目標超出安全範圍：來源半徑={Mathf.Sqrt(ox * ox + oy * oy):F3}m，" +
-                           $"目標半徑={Mathf.Sqrt(tx * tx + ty * ty):F3}m，" +
+            string error = $"目標超出安全範圍：來源中心半徑={WorkspaceDistanceLimits.Radius(env.source_position.x, env.source_position.y):F3}m，" +
+                           $"目標中心半徑={WorkspaceDistanceLimits.Radius(env.target_position.x, env.target_position.y):F3}m，" +
                            $"來源允許={SOURCE_BASE_EXCLUSION_RADIUS_M:F3}～{MAX_SOURCE_REACH_RADIUS_M:F3}m，" +
                            $"目標允許={BASE_EXCLUSION_RADIUS_M:F3}～{MAX_TARGET_REACH_RADIUS_M:F3}m";
             Debug.LogError("[Executor] " + error);

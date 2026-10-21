@@ -69,6 +69,12 @@ while (true)
         initial_scene_source = sim ? (mode.ResetEachTask ? "sim_scene_file" : "sim_continued")
             : fixedBaseline ? "fixed_baseline" : "table_at_command",
         run_mode = sim ? "sim" : "real", sim_scene = sim ? mode.Scene : null,
+        workspace_filters = new {
+            base_x_m = WorkspaceDistanceLimits.BaseX, base_y_m = WorkspaceDistanceLimits.BaseY,
+            source_min_m = WorkspaceDistanceLimits.SourceMinM, source_max_m = WorkspaceDistanceLimits.SourceMaxM,
+            target_min_m = WorkspaceDistanceLimits.TargetMinM, target_max_m = WorkspaceDistanceLimits.TargetMaxM,
+            supply_min_x_m = SupplyRegion.MinX, supply_max_x_m = SupplyRegion.MaxX,
+            supply_min_y_m = SupplyRegion.MinY, supply_max_y_m = SupplyRegion.MaxY },
         reset_within_task = false, reset_xy_m = ExperimentChecks.ResetXYToleranceM, reset_z_m = ExperimentChecks.ResetZToleranceM,
         rule_scope = "none", evaluation = "simulation_overlap_and_visual_model", camera_observations = "task_start_only",
         started_utc = DateTime.UtcNow });

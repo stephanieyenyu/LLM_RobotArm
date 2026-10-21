@@ -35,6 +35,15 @@ public static class MotionPlanValidator
 
         var source = assignment.Source;
         var target = assignment.Target;
+        if (!SupplyRegion.Contains(source.X, source.Y))
+            return Fail($"source ({source.X:F6},{source.Y:F6}) is outside the supply region. " +
+                SupplyRegion.Description, out error);
+        if (!WorkspaceDistanceLimits.SourceContains(source.X, source.Y) ||
+            !WorkspaceDistanceLimits.TargetContains(target.WorldX, target.WorldY))
+            return Fail($"object center outside horizontal distance limits: " +
+                $"source r={WorkspaceDistanceLimits.Radius(source.X, source.Y):F6} m, " +
+                $"target r={WorkspaceDistanceLimits.Radius(target.WorldX, target.WorldY):F6} m. " +
+                WorkspaceDistanceLimits.Description, out error);
         if (!InsideWorkspace(source.X, source.Y) || !InsideWorkspace(target.WorldX, target.WorldY))
             return Fail(
                 $"source or target is outside the validated QR workspace " +
