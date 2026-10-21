@@ -310,14 +310,15 @@ public class JsonExecutor : MonoBehaviour
     private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
     // Picking needs more clearance than placing because the source-side tool
     // orientation and attached gripper can fold the wrist/forearm toward the base.
-    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.20f;
+    // 2026-10-21 起跟 rulebased 相同（0.10～0.47 m）；之前是 0.20～0.42 m
+    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.10f;
     // High-plane lateral travel is routed around this radius when a direct
     // Cartesian chord would cut through the base exclusion cylinder.
     private const float BASE_DETOUR_RADIUS_M = 0.28f;
     private const float BASE_DETOUR_MAX_ANGLE_STEP_DEG = 25f;
     // Avoid poses that make the UR3e almost fully extend. Those IK solutions are
     // fragile and can trigger a protective stop before the TCP reaches the block.
-    private const float MAX_SOURCE_REACH_RADIUS_M = 0.42f;
+    private const float MAX_SOURCE_REACH_RADIUS_M = 0.47f;
     private const float MAX_TARGET_REACH_RADIUS_M = 0.47f;
     // Do not advance merely because a fixed delay elapsed.  Every motion is
     // confirmed against the UR secondary-interface feedback first.

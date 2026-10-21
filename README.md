@@ -222,7 +222,7 @@ URSim（只有 3D 會用到）在純模擬途中安全停止時，Unity 最多�
   目前是從 2026-09-30 實拍畫面的 QR1-4 估計的）。相機或 QR 貼紙移動過，接上相機後執行
   `python isaac_sim/save_sim_camera.py` 換成 RealSense 的真實參數。
 - `run_mode.json` 的 `reset_each_task` 改成 false，之後的任務就接續目前的模擬世界，不重建。
-- 內建兩個，三個版本（main、zero-constraint、rulebased）的檔案完全相同：`yellow_cubes_16`（預設；16 塊黃方塊 4 排 × 4 顆，排內間距 5.5 cm、排距 5.5 cm，每往後一排往 -X 移 3.5 cm，X 0.065～0.335、Y 0.035～0.200，都在 rulebased 的供料區內；依 2026-10-14 指尖實測的 QR1 每塊離手臂基座 0.23～0.39 m）、`domino_cube`（一塊橫放的黃 domino 在 (0.20, 0.10)、一塊黃方塊在 (0.12, 0.18)）。`run_mode.json` 指定的場景檔不存在時改用預設場景（2026-10-08 起；之前是 `two_cubes`、`letter_blocks`、`domino_cubes`）。2026-10-14 之前預設是三個版本相同的 `yellow_cubes_15`（5 欄 × 3 排）；QR1 改成指尖實測後，其中 (0.08, 0.06) 離基座 0.431 m、(0.32, 0.18) 只有 0.194 m，超出 Unity 的取料範圍 0.20～0.42 m，所以三個版本都改成 16 顆的排法。
+- 內建兩個，三個版本（main、zero-constraint、rulebased）的檔案完全相同：`yellow_cubes_16`（預設；16 塊黃方塊 4 排 × 4 顆，排內間距 5.5 cm、排距 5.5 cm，每往後一排往 -X 移 3.5 cm，X 0.065～0.335、Y 0.035～0.200，都在 rulebased 的供料區內；依 2026-10-14 指尖實測的 QR1 每塊離手臂基座 0.23～0.39 m）、`domino_cube`（一塊橫放的黃 domino 在 (0.20, 0.10)、一塊黃方塊在 (0.12, 0.18)）。`run_mode.json` 指定的場景檔不存在時改用預設場景（2026-10-08 起；之前是 `two_cubes`、`letter_blocks`、`domino_cubes`）。2026-10-14 之前預設是三個版本相同的 `yellow_cubes_15`（5 欄 × 3 排）；QR1 改成指尖實測後，其中 (0.08, 0.06) 離基座 0.431 m、(0.32, 0.18) 只有 0.194 m，超出當時 main／zero-constraint 的 Unity 取料範圍 0.20～0.42 m，所以三個版本都改成 16 顆的排法（2026-10-21 起 main 的取料範圍放寬成跟 rulebased 相同的 0.10～0.47 m）。
 
 限制：模擬回報的是 Isaac 的精確位置，沒有相機的偵測誤差、遮擋與高度偏差，結果會比實機樂觀；
 適合測 LLM 的規劃能力，不能取代實機成功率。

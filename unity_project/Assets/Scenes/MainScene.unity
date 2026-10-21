@@ -751,7 +751,6 @@ MonoBehaviour:
   simHomeWrist2: 0
   simHomeWrist3: 0
   previewBatchInUnityBeforeRobot: 1
-  freezeUnityRobotDuringRealBatch: 0
   placeDescendExtraZ: 0
   useSharedMovejTrajectory: 1
   previewOnlySharedTrajectory: 0
@@ -759,8 +758,13 @@ MonoBehaviour:
   sharedMovejAcceleration: 0.4
   sharedMovejVelocity: 0.55
   allowTopLeftCubeYaw180OnHardware: 1
+  contactStopOnPlace: 1
+  contactApproachM: 0.01
+  contactSpeedMps: 0.01
+  contactForceN: 8
   bitmapXYToleranceM: 0.02
   bitmapZToleranceM: 0.01
+  bitmapOverlapThreshold: 0.9
   simGraspToleranceM: 0.02
   pickOffsetX: 0.002
   pickOffsetY: 0.002
