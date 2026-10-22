@@ -70,6 +70,8 @@ while (true)
             : fixedBaseline ? "fixed_baseline" : "table_at_command",
         run_mode = sim ? "sim" : "real", sim_scene = sim ? mode.Scene : null,
         workspace_filters = new {
+            table_max_x_m = QrWorkspace.MaxX, table_max_y_m = QrWorkspace.MaxY,
+            table_measurement_tolerance_m = QrWorkspace.MeasurementToleranceM,
             base_x_m = WorkspaceDistanceLimits.BaseX, base_y_m = WorkspaceDistanceLimits.BaseY,
             source_min_m = WorkspaceDistanceLimits.SourceMinM, source_max_m = WorkspaceDistanceLimits.SourceMaxM,
             target_min_m = WorkspaceDistanceLimits.TargetMinM, target_max_m = WorkspaceDistanceLimits.TargetMaxM,

@@ -9,7 +9,7 @@ public static class TopViewRenderer
 {
     const double PxPerM = 1500;
     const double MarginM = 0.06;
-    const double WorkspaceX = 0.805, WorkspaceY = 0.371;
+    const double WorkspaceX = QrWorkspace.MaxX, WorkspaceY = QrWorkspace.MaxY;
     const double CubeM = 0.025;
 
     public static byte[] Render(IReadOnlyList<SceneObject> objects)

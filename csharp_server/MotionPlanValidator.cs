@@ -4,14 +4,14 @@
 /// </summary>
 public static class MotionPlanValidator
 {
-    private const double MinX = 0.00;
-    private const double MaxX = 0.72;
-    private const double MinY = 0.00;
-    private const double MaxY = 0.45;
+    private const double MinX = QrWorkspace.MinX;
+    private const double MaxX = QrWorkspace.MaxX;
+    private const double MinY = QrWorkspace.MinY;
+    private const double MaxY = QrWorkspace.MaxY;
     // QR pose and object centers can jitter by several millimetres near an edge.
     // Permit a small measurement tolerance without disabling the independent UR
     // base exclusion, transfer-distance, occupancy, and clearance checks.
-    private const double WorkspaceMeasurementToleranceM = 0.025;
+    private const double WorkspaceMeasurementToleranceM = QrWorkspace.MeasurementToleranceM;
     private const double MinTravelClearanceM = 0.08;
     private const double ObstacleClearanceM = 0.03;
     private const double MaxTransferDistanceM = 0.70;
@@ -157,11 +157,7 @@ public static class MotionPlanValidator
         return true;
     }
 
-    private static bool InsideWorkspace(double x, double y) =>
-        x >= MinX - WorkspaceMeasurementToleranceM &&
-        x <= MaxX + WorkspaceMeasurementToleranceM &&
-        y >= MinY - WorkspaceMeasurementToleranceM &&
-        y <= MaxY + WorkspaceMeasurementToleranceM;
+    private static bool InsideWorkspace(double x, double y) => QrWorkspace.Contains(x, y);
 
     private static double Distance2D(double x1, double y1, double x2, double y2)
     {

@@ -55,8 +55,8 @@ public class SceneSyncer : MonoBehaviour
 
     [Header("工作平面尺寸（公尺，對應真實工作台）")]
     // 真實值取自 perception_server /scene 的 workspace_info.width_m / depth_m（相機實測 QR 中心間距）
-    public float workspaceWidthM = 0.622f;       // QR1 → QR2 距離
-    public float workspaceDepthM = 0.281f;       // QR1 → QR3 距離
+    public float workspaceWidthM = (float)QrWorkspace.MaxX;       // QR1 → QR2 距離
+    public float workspaceDepthM = (float)QrWorkspace.MaxY;       // QR1 → QR3 距離
 
     [Header("手臂 base 在 QR frame 中的位置（把 workspace 對齊到手臂）")]
     // 預設值 = -JsonExecutor.QR1_X / -QR1_Y（Teach Pendant 實測值）

@@ -3151,6 +3151,13 @@ public class JsonExecutor : MonoBehaviour
         if (source != null && SupplyRegion.Contains(source.x, source.y))
         {
             var target = env.target_position;
+            if (target != null && (!QrWorkspace.Contains(source.x, source.y) ||
+                !QrWorkspace.Contains(target.x, target.y)))
+            {
+                error = $"step {env.step_id}: source or target is outside the validated QR workspace. " +
+                    QrWorkspace.Description;
+                return false;
+            }
             if (!WorkspaceDistanceLimits.SourceContains(source.x, source.y) || target == null ||
                 !WorkspaceDistanceLimits.TargetContains(target.x, target.y))
             {

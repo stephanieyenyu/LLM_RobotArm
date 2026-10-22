@@ -172,8 +172,8 @@ UR_HOME = np.array([-np.pi / 2, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0], dtype=np
 # 工具朝下的標準姿勢：FK 校正與量指尖距離用
 TOOL_DOWN_Q = np.array([0.0, -np.pi / 2, np.pi / 2, -np.pi / 2, -np.pi / 2, 0.0], dtype=np.float64)
 
-# QR1-4 中心在 QR 座標系的位置（目前實測 0.805 × 0.371 m）；收到 perception /camera 的 qr_markers 後以實測為準
-DEFAULT_QR_MARKERS = {"QR1": [0.0, 0.0], "QR2": [0.805, 0.0], "QR3": [0.0, 0.371], "QR4": [0.805, 0.371]}
+# Default experiment frame (0.720 x 0.350 m); live perception markers override it.
+DEFAULT_QR_MARKERS = {"QR1": [0.0, 0.0], "QR2": [0.720, 0.0], "QR3": [0.0, 0.350], "QR4": [0.720, 0.350]}
 DEFAULT_QR_SIZE_M = 0.073
 TABLE_THICKNESS_M = 0.04
 FLOOR_BELOW_TABLE_M = 0.75

@@ -22,6 +22,30 @@ int passed = 0;
 void Check(bool condition, string name) { if (!condition) throw new Exception(name); Console.WriteLine("PASS " + name); passed++; }
 SceneObject Piece(double x) => new() { Name = "yellow_cube", Shape = "cube", X = x, Y = 0.1, Z = 0.025 };
 var baseline = new List<SceneObject> { Piece(0.1), Piece(0.15) };
+foreach (var c in new (double X, double Y, bool Inside)[] {
+    (0, 0, true), (0.720, 0.350, true),
+    (-0.025, -0.025, true), (0.745, 0.375, true),
+    (-0.025001, 0.1, false), (0.745001, 0.1, false),
+    (0.2, -0.025001, false), (0.2, 0.375001, false),
+    (double.NaN, 0.1, false), (0.1, double.PositiveInfinity, false) })
+    Check(QrWorkspace.Contains(c.X, c.Y) == c.Inside &&
+        QrWorkspace.Contains((float)c.X, (float)c.Y) == c.Inside,
+        $"QR workspace ({c.X},{c.Y}) agrees at server/Unity precision");
+foreach (var c in new (double X, double Y, bool Inside)[] {
+    (0.780, 0.110, false), (0.790, 0.320, false), (0.800, 0.360, false),
+    (0.720, 0.350, true), (0.745, 0.320, true), (0.745001, 0.320, false),
+    (0.700, 0.375, true), (0.700, 0.375001, false) })
+{
+    var fixture = new Assignment {
+        Source = new SceneObject { Name = "yellow_cube", Shape = "cube", X = 0.225, Y = 0.035, Z = 0.025 },
+        Target = new TargetCell { WorldX = c.X, WorldY = c.Y, WorldZ = 0.025 }
+    };
+    bool accepted = MotionPlanValidator.TryValidate(
+        new MotionPlan { ActionSequence = new() { new() { Function = "grasp" } } },
+        fixture, new[] { fixture.Source }, out string fixtureError);
+    Check(accepted == c.Inside && (accepted || fixtureError.Contains("validated QR workspace")),
+        $"QR workspace regression: target ({c.X},{c.Y}) accepted={c.Inside}");
+}
 var supplyCases = new (double X, double Y, bool Inside)[]
 {
     (0.20, 0.10, true),

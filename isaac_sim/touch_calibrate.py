@@ -28,7 +28,7 @@ from sync_check import fk, read_robot_joints  # noqa: E402
 # 目前 Unity 的設定（JsonExecutor.cs QR1_X/Y/Z；3D 批次的桌面另加 LayeredGraspGeometry.TableZCorrectionM）
 QR1_X, QR1_Y, QR1_Z = -0.38824, -0.35473, 0.030
 TABLE_Z_CORRECTION_3D = -0.030
-DEFAULT_MARKERS = {"QR1": [0.0, 0.0], "QR2": [0.805, 0.0], "QR3": [0.0, 0.371], "QR4": [0.805, 0.371]}
+DEFAULT_MARKERS = {"QR1": [0.0, 0.0], "QR2": [0.720, 0.0], "QR3": [0.0, 0.350], "QR4": [0.720, 0.350]}
 
 
 def fingertip_base(q, tip):

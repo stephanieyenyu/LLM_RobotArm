@@ -286,8 +286,8 @@ MonoBehaviour:
   sceneUrl: http://localhost:5000/scene
   sceneModeUrl: http://localhost:5000/scene/mode
   pollIntervalSec: 0.3
-  workspaceWidthM: 0.85
-  workspaceDepthM: 0.375
+  workspaceWidthM: 0.72
+  workspaceDepthM: 0.35
   armBaseAtQrX: 0.38824
   armBaseAtQrY: 0.35473
   armBaseAtQrZ: -0.03

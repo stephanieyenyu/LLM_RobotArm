@@ -1,3 +1,20 @@
+public static class QrWorkspace
+{
+    public const double MinX = 0.0;
+    public const double MaxX = 0.72;
+    public const double MinY = 0.0;
+    public const double MaxY = 0.35;
+    public const double MeasurementToleranceM = 0.025;
+    public const string Description = "桌面工作區是 QR1～QR4 標記圍成的矩形 X=0.000..0.720 m、Y=0.000..0.350 m，相機在這個範圍內量得到物件位置。來源與放置目標的中心皆須通過桌面範圍檢查；檢查保留每邊 0.025 m 的量測容許誤差，實際接受 X=-0.025..0.745 m、Y=-0.025..0.375 m（含邊界），此誤差不是額外桌面。";
+
+    // The extra epsilon only accommodates float serialization at inclusive edges.
+    public static bool Contains(double x, double y) =>
+        x >= MinX - MeasurementToleranceM - 1e-7 &&
+        x <= MaxX + MeasurementToleranceM + 1e-7 &&
+        y >= MinY - MeasurementToleranceM - 1e-7 &&
+        y <= MaxY + MeasurementToleranceM + 1e-7;
+}
+
 // QR1-frame object-center bounds in metres. Shared by planning and execution.
 public static class SupplyRegion
 {
