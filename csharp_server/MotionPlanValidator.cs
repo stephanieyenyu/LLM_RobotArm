@@ -5,7 +5,9 @@
 public static class MotionPlanValidator
 {
     private const double MinX = 0.00;
-    private const double MaxX = 0.72;
+    // 2026-10-22：0.72 → 0.78，加上下面 2.5 cm 量測容許後實際上限 = 0.805（QR 工作區右緣，QR2/QR4 的 X）；
+    // 之前實際上限 0.745，LLM 常把字母最右欄排在 0.75～0.80 被擋。手臂搆不搆得到仍由 Unity 的放置半徑 0.47 m 檢查
+    private const double MaxX = 0.78;
     private const double MinY = 0.00;
     private const double MaxY = 0.45;
     // QR pose and object centers can jitter by several millimetres near an edge.

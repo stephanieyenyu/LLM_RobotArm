@@ -269,6 +269,25 @@ public class JsonExecutor : MonoBehaviour
     // 正在執行的整批是不是 3D 疊放（layered_grasp）；ExecuteBatch 每一步開始前設定
     bool executingLayeredBatch;
 
+    [Header("取料：碰到就停並自動修正（實機力感測，2D／3D 都用）")]
+    [Tooltip("實機取料往下的最後一段改成慢慢往下，手指碰到東西（多半是壓到方塊頂面）就停，不讓 UR 進入保護性停止；" +
+             "抬起後依手腕扭矩判斷是哪一根手指撞到，往那一側補位再往下。URSim、Isaac 驗證與 Unity 預覽不受影響。")]
+    public bool contactStopOnPick = true;
+    [Tooltip("從夾取高度上方多少公尺開始慢速下降。2D 指尖在方塊頂面下約 6～13 mm 夾、3D 在 12.5 mm，所以要比這個深度多一段")]
+    public float pickContactApproachM = 0.025f;
+    [Tooltip("慢速下降的速度（公尺/秒）")]
+    public float pickContactSpeedMps = 0.010f;
+    [Tooltip("Z 方向受力超過幾牛頓才算撞到；設大一點，輕微擦到不會觸發，但要比 UR 保護性停止低很多（2026-10-22 實測雜訊 0.05 N）")]
+    public float pickContactForceN = 15f;
+    [Tooltip("撞到後先往上抬多少公尺")]
+    public float pickRetreatM = 0.03f;
+    [Tooltip("每次往撞到的那一側補多少公尺")]
+    public float pickCorrectionStepM = 0.002f;
+    [Tooltip("最多補位重試幾次；用完仍撞到就停在上方、回報失敗（不會保護性停止）")]
+    public int pickMaxCorrections = 3;
+    [Tooltip("撞擊點離夾爪中心（沿閉合方向）至少多少公尺才判斷得出是哪一根手指；太小代表兩指都壓到或判斷不出，直接回報失敗")]
+    public float pickMinContactOffsetM = 0.005f;
+
     [Header("模擬結束比對 bitmap（屬於驗證，受一鍵驗證開關控制）")]
     // 落點中心離 bitmap 格子中心多遠以內算放對（公尺）。格距 4 cm、方塊 2.5 cm，間隙只有 1.5 cm；
     // 2 cm 是半個格距，再大就會跟相鄰格子重疊
@@ -310,8 +329,9 @@ public class JsonExecutor : MonoBehaviour
     private const float BASE_EXCLUSION_RADIUS_M = 0.16f;
     // Picking needs more clearance than placing because the source-side tool
     // orientation and attached gripper can fold the wrist/forearm toward the base.
-    // 2026-10-21 起跟 rulebased 相同（0.10～0.47 m）；之前是 0.20～0.42 m
-    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.10f;
+    // 2026-10-21 曾放寬成 0.10 m（跟 rulebased 相同），10-23 改回 0.20 m：離底座 0.19 m 的來源通過這裡後，
+    // Unity 往下夾時仍判定自身碰撞（H、I 各浪費數輪），而且訊息看不出是來源的問題。外圈維持 0.47 m
+    private const float SOURCE_BASE_EXCLUSION_RADIUS_M = 0.20f;
     // High-plane lateral travel is routed around this radius when a direct
     // Cartesian chord would cut through the base exclusion cylinder.
     private const float BASE_DETOUR_RADIUS_M = 0.28f;
@@ -1337,6 +1357,7 @@ public class JsonExecutor : MonoBehaviour
                 if (action.function == "move_above")
                 {
                     var current = UR3eKinematics.FKPose(reference);
+                    double[] beforeMove = (double[])reference.Clone();
                     if (!PlanMoveAbove(pa, ref reference, current, x, y, z + height,
                             orientation, out error))
                     {
@@ -1346,6 +1367,20 @@ public class JsonExecutor : MonoBehaviour
                             : "";
                         error = $"{TrajectoryStepPrefix(env.step_id)}{actionIndex + 1} 個動作：{error}{qrSource}";
                         return false;
+                    }
+                    // 下一個動作是在同一個位置往下：先試一次放不放得下去。放不下去（例如上方選到手肘偏低的解，
+                    // 往下時第 2 節撞桌）才換上方的其他 IK 解；原本放得下去時完全不變（2026-10-23）
+                    if (actionIndex + 1 < env.action_sequence.Count &&
+                        env.action_sequence[actionIndex + 1].function == "descend" &&
+                        env.action_sequence[actionIndex + 1].location == action.location)
+                    {
+                        float descendZ = batch.layered_grasp
+                            ? planningTableZ + (source ? env.source_top_m : env.target_top_m)
+                              - (float)LayeredGraspGeometry.GraspDepthBelowTopM
+                            : z;
+                        if (!source && holding) descendZ += Mathf.Max(0f, placeDescendExtraZ);
+                        if (!DescentFeasible(reference, x, y, descendZ, orientation))
+                            ReselectHoverForDescent(pa, beforeMove, ref reference, x, y, descendZ, orientation);
                     }
                 }
                 else if (action.function == "descend")
@@ -2266,10 +2301,11 @@ public class JsonExecutor : MonoBehaviour
     // All accepted joint targets are shared by preview and hardware, and every
     // segment still passes the existing joint, base-facing and collision gates.
     bool PlanValidatedDescent(PlannedJointAction action, ref double[] reference,
-        double x, double y, double z, string orientation, out string error)
+        double x, double y, double z, string orientation, out string error, bool log = true)
     {
         var start = UR3eKinematics.FKPose(reference);
-        Debug.Log($"[Executor-descent] TCP start={start}; target={SharedTargetPose(x, y, z, orientation)}; orientation={orientation}");
+        if (log)
+            Debug.Log($"[Executor-descent] TCP start={start}; target={SharedTargetPose(x, y, z, orientation)}; orientation={orientation}");
         var trial = new PlannedJointAction { function = action.function, seconds = action.seconds };
         double[] trialReference = (double[])reference.Clone();
         if (PlanJointPose(trial, ref trialReference, x, y, z, orientation, out error))
@@ -2303,11 +2339,58 @@ public class JsonExecutor : MonoBehaviour
             if (!accepted) continue;
             action.targets.AddRange(trial.targets);
             reference = trialReference;
-            Debug.Log($"[Executor-descent] Accepted {count} collision-checked descent segments (spacing <= {spacing:F3}m).");
+            if (log)
+                Debug.Log($"[Executor-descent] Accepted {count} collision-checked descent segments (spacing <= {spacing:F3}m).");
             error = null;
             return true;
         }
         error = $"direct descent rejected: {directError}; segmented descent also rejected: {error}";
+        return false;
+    }
+
+    // 從 from 這組關節角往下放到 (x, y, z) 是否可行（只試算，不改任何狀態、不印 log）
+    bool DescentFeasible(double[] from, double x, double y, double z, string orientation)
+    {
+        var probe = new PlannedJointAction { function = "descend" };
+        double[] r = (double[])from.Clone();
+        return PlanValidatedDescent(probe, ref r, x, y, z, orientation, out _, log: false);
+    }
+
+    // move_above 選到的上方姿勢往下放不下去時，從最後一個路徑點（上方）往前一點（同一 XY 的移動高度）
+    // 改試其他 IK 解：轉換要安全、底座要朝向目標，之後的點從新解接著求，而且從新的上方姿勢要放得下去。
+    // 找到就換掉 moveAbove 後段的關節目標；找不到就維持原樣（之後的 descend 照常回報原本的錯誤）。
+    bool ReselectHoverForDescent(PlannedJointAction moveAbove, double[] beforeMove, ref double[] reference,
+        double x, double y, double z, string orientation)
+    {
+        var targets = moveAbove.targets;
+        int n = targets.Count;
+        for (int k = n - 1; k >= System.Math.Max(0, n - 2); k--)
+        {
+            double[] prev = k > 0 ? targets[k - 1] : beforeMove;
+            var pose = UR3eKinematics.FKPose(targets[k]);
+            foreach (var alternative in UR3eKinematics.IKAlternatives(pose, prev))
+            {
+                if (!ValidateBaseFacing(alternative.q, pose.x, pose.y, out _)) continue;
+                if (!ValidateJointTransition(prev, alternative.q, out _, allowSingularEnd: false)) continue;
+                var rest = new List<double[]> { (double[])alternative.q.Clone() };
+                double[] r = (double[])alternative.q.Clone();
+                bool ok = true;
+                for (int j = k + 1; j < n && ok; j++)
+                {
+                    var pj = UR3eKinematics.FKPose(targets[j]);
+                    var step = new PlannedJointAction { function = moveAbove.function };
+                    ok = PlanJointPose(step, ref r, pj.x, pj.y, pj.z, orientation, out _);
+                    if (ok) rest.Add(step.targets[0]);
+                }
+                if (!ok || !DescentFeasible(r, x, y, z, orientation)) continue;
+                targets.RemoveRange(k, n - k);
+                targets.AddRange(rest);
+                reference = r;
+                Debug.Log($"[Executor-shared] 上方姿勢往下放會撞，改用第 {k + 1}/{n} 個路徑點起的另一組 IK 解，往下放得下去");
+                return true;
+            }
+        }
+        Debug.Log("[Executor-shared] 上方姿勢往下放會撞，其他 IK 解也找不到往下放得下去的，照原本的解（往下時會回報原因）");
         return false;
     }
 
@@ -3141,6 +3224,9 @@ public class JsonExecutor : MonoBehaviour
                 // 3D 疊放在實機放方塊：最後一段改成碰到就停（contactStopOnPlace），其餘照共用軌跡
                 if (action.function == "descend" && !source && holdingObject && UseContactStopOnPlace())
                     yield return ExecuteSharedPlaceWithContactStop(env.step_id, i, tag, stepEpoch);
+                // 實機取料：最後一段碰到就停，撞到時抬起、依扭矩判斷哪一根手指撞到、補位重試（contactStopOnPick）
+                else if (action.function == "descend" && source && !holdingObject && UseContactStopOnPick())
+                    yield return ExecuteSharedPickWithContactStop(env.step_id, i, tag, stepEpoch);
                 else
                     yield return ExecuteSharedJointAction(env.step_id, i, tag, stepEpoch);
             }
@@ -3368,6 +3454,184 @@ public class JsonExecutor : MonoBehaviour
             yield return new WaitForSeconds(0.05f);
         }
         lastMotionError = $"UR 執行「{tag}」慢速下降逾時";
+    }
+
+    // 取料碰到就停只用在實機（2D、3D 都用）；URSim 批次與純模擬照原本的共用軌跡
+    bool UseContactStopOnPick() =>
+        contactStopOnPick && !RunMode.IsSim &&
+        !(ursimListener != null && urListener == ursimListener);
+
+    // 實機取料的最後一段：共用軌跡照送到「夾取點上方 pickContactApproachM」，之後交給 SendContactPick
+    IEnumerator ExecuteSharedPickWithContactStop(int stepId, int actionIndex, string tag, long stepEpoch)
+    {
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+        if (!sharedTrajectory.TryGetValue(stepId, out var actions) ||
+            actionIndex < 0 || actionIndex >= actions.Count || actions[actionIndex].targets.Count == 0)
+        {
+            lastMotionError = $"第 {stepId} 步第 {actionIndex + 1} 個動作沒有共用軌跡";
+            yield break;
+        }
+        var targets = actions[actionIndex].targets;
+        double[] final = targets[targets.Count - 1];
+        if (!TryRaisedJointTarget(final, pickContactApproachM, out double[] approach, out double finalTipZ))
+        {
+            Debug.LogWarning($"[ContactPick] {tag}：算不出夾取點上方 {pickContactApproachM * 1000f:F0} mm 的關節角，改用原本的軌跡");
+            yield return ExecuteSharedJointAction(stepId, actionIndex, tag, stepEpoch);
+            yield break;
+        }
+        for (int i = 0; i < targets.Count - 1; i++)
+        {
+            if (FingertipZ(targets[i]) <= finalTipZ + pickContactApproachM + 0.001) continue;
+            yield return SendExplicitJointTarget(targets[i], $"{tag} 共用軌跡 {i + 1}/{targets.Count}", stepEpoch, stepId);
+            if (!lastMotionSucceeded) yield break;
+        }
+        yield return SendExplicitJointTarget(approach, $"{tag} 夾取點上方 {pickContactApproachM * 1000f:F0} mm", stepEpoch, stepId);
+        if (!lastMotionSucceeded) yield break;
+        yield return SendContactPick(tag, stepEpoch, stepId, final);
+    }
+
+    // 整段在控制器上跑（Unity 不必來回傳話）：慢慢往下，Z 受力超過 pickContactForceN 就停 → 往上抬 pickRetreatM →
+    // 用撞到那一刻的扭矩算撞擊點在夾爪中心哪一側（垂直力 Fz 作用在水平偏移 r：Tx = r_y·Fz、Ty = −r_x·Fz）→
+    // 沿閉合方向往那一側補 pickCorrectionStepM → 回到慢速下降的起點再往下。沒撞到就停在夾取高度，接著照原本 grasp。
+    // 2026-10-22 用 tools/ft_probe.py 實測：推左邊手指（−X，靠 QR1）Ty 為正、右邊為負，跟上面的公式一致。
+    // 補位重試用完或判斷不出哪一側時停在上方，Unity 依停下的高度回報失敗（不會進入保護性停止）。
+    IEnumerator SendContactPick(string tag, long stepEpoch, int stepId, double[] finalQ)
+    {
+        lastMotionSucceeded = false;
+        lastMotionError = null;
+        double[] plannedTip = FingertipXYZ(finalQ);
+        // 夾爪閉合方向 = 工具 X 軸（夾 cube 時兩指落在 ±X 兩側；夾 domino 時工具會跟著轉）；只取水平分量
+        double[,] T = UR3eKinematics.FK(finalQ);
+        double ax = T[0, 0], ay = T[1, 0], len = Math.Sqrt(ax * ax + ay * ay);
+        if (len < 1e-6) { ax = 1; ay = 0; } else { ax /= len; ay /= len; }
+
+        string program = string.Join("\n",
+            "def contact_pick():",
+            "  corrections = 0",
+            "  finished = False",
+            "  while not finished:",
+            "    zero_ftsensor()",
+            "    sleep(0.2)",
+            "    pose = get_actual_tcp_pose()",
+            "    start_z = pose[2]",
+            "    moved = 0.0",
+            "    contact = False",
+            "    fz = 0.0",
+            "    tx = 0.0",
+            "    ty = 0.0",
+            $"    while (not contact) and (moved < {pickContactApproachM:F4}):",
+            $"      speedl([0, 0, {-pickContactSpeedMps:F4}, 0, 0, 0], 0.5, 0.008)",
+            "      force = get_tcp_force()",
+            $"      if norm(force[2]) > {pickContactForceN:F1}:",
+            "        contact = True",
+            "        fz = force[2]",
+            "        tx = force[3]",
+            "        ty = force[4]",
+            "      end",
+            "      pose = get_actual_tcp_pose()",
+            "      moved = start_z - pose[2]",
+            "    end",
+            "    stopl(0.5)",
+            "    if not contact:",
+            "      finished = True",
+            "    else:",
+            $"      up = pose_add(get_actual_tcp_pose(), p[0, 0, {pickRetreatM:F4}, 0, 0, 0])",
+            "      movel(up, a=0.5, v=0.05)",
+            $"      side = (0.0 - ty / fz) * {ax:F4} + (tx / fz) * {ay:F4}",
+            $"      if (corrections >= {Mathf.Max(0, pickMaxCorrections)}) or (norm(side) < {pickMinContactOffsetM:F4}):",
+            "        finished = True",
+            "      else:",
+            "        corrections = corrections + 1",
+            $"        step = {pickCorrectionStepM:F4}",
+            "        if side < 0:",
+            "          step = 0.0 - step",
+            "        end",
+            $"        up = pose_add(up, p[step * {ax:F4}, step * {ay:F4}, 0, 0, 0, 0])",
+            "        movel(up, a=0.5, v=0.05)",
+            "        dz = start_z - up[2]",
+            "        up = pose_add(up, p[0, 0, dz, 0, 0, 0])",
+            "        movel(up, a=0.5, v=0.05)",
+            "      end",
+            "    end",
+            "  end",
+            "  sleep(0.3)",
+            "end");
+        Debug.Log($"  [{tag}] SEND CONTACT PICK：最後 {pickContactApproachM * 1000f:F0} mm 以 {pickContactSpeedMps * 1000f:F0} mm/s 往下，" +
+                  $"Z 受力 > {pickContactForceN:F1} N 就停、抬 {pickRetreatM * 1000f:F0} mm、往撞到的一側補 {pickCorrectionStepM * 1000f:F1} mm，" +
+                  $"最多 {pickMaxCorrections} 次（閉合方向 ({ax:F2}, {ay:F2})）");
+        float sentAt = Time.realtimeSinceStartup;
+        urListener.SendCommand(program);
+        yield return new WaitForSeconds(MOTION_START_GRACE_SEC);
+
+        float startedAt = Time.realtimeSinceStartup;
+        float perTry = pickContactApproachM / Mathf.Max(0.001f, pickContactSpeedMps) + 0.5f + 3f * pickRetreatM / 0.05f + 2f;
+        float limit = perTry * (Mathf.Max(0, pickMaxCorrections) + 1) + 10f;
+        bool seenRunning = false;
+        while (Time.realtimeSinceStartup - startedAt < limit)
+        {
+            if (!IsExecutionCurrent(stepEpoch, stepId))
+            {
+                lastMotionError = $"第 {stepId} 步已過期，在「{tag}」途中取消";
+                yield break;
+            }
+            if (!urListener.Connected)
+            {
+                lastMotionError = $"UR 在「{tag}」途中斷線";
+                yield break;
+            }
+            if (IsEmergencyStop() || IsRecoverableSafetyStop())
+            {
+                lastMotionError = $"UR 在「{tag}」取料慢速下降途中安全停止";
+                yield break;
+            }
+            bool running = urListener.RobotModeData.isProgramRunning;
+            if (running) seenRunning = true;
+            else if (!seenRunning && Time.realtimeSinceStartup - startedAt > 2f)
+            {
+                lastMotionError = $"UR 沒有執行「{tag}」的取料慢速下降程式（2 秒內沒開始跑，可能是控制器拒絕這段 URScript），停止取料";
+                yield break;
+            }
+            else if (seenRunning)
+            {
+                var joints = urListener.JointData.AsArray;
+                var q = new double[6];
+                for (int k = 0; k < 6; k++) q[k] = joints[k].q_actual;
+                double[] tip = FingertipXYZ(q);
+                double dx = (tip[0] - plannedTip[0]) * 1000.0, dy = (tip[1] - plannedTip[1]) * 1000.0;
+                double highMm = (tip[2] - plannedTip[2]) * 1000.0;
+                int corrections = (int)Math.Round(Math.Sqrt(dx * dx + dy * dy) / Math.Max(0.1, pickCorrectionStepM * 1000.0));
+                string took = $"（送出到程式結束 {Time.realtimeSinceStartup - sentAt:F1} s）";
+                if (highMm > 4.0)
+                {
+                    // 停在上方：補位用完或判斷不出哪一根手指撞到
+                    lastMotionError = $"取料時手指一直碰到東西（多半是壓到方塊頂面），補位 {corrections} 次後仍無法往下，" +
+                                      $"已停在夾取點上方 {highMm:F0} mm（沒有進入保護性停止）";
+                    Debug.LogWarning($"[ContactPick] {tag}：{lastMotionError}；總偏移 ({dx:+0.0;-0.0}, {dy:+0.0;-0.0}) mm {took}");
+                    yield break;
+                }
+                Debug.Log(corrections == 0
+                    ? $"[ContactPick] {tag}：沒有撞到，到夾取高度（差 {highMm:+0.0;-0.0} mm）{took}"
+                    : $"[ContactPick] {tag}：撞到後補位 {corrections} 次，偏移 ({dx:+0.0;-0.0}, {dy:+0.0;-0.0}) mm 後到夾取高度 {took}");
+                lastMotionSucceeded = true;
+                yield break;
+            }
+            yield return new WaitForSeconds(0.05f);
+        }
+        lastMotionError = $"UR 執行「{tag}」取料慢速下降逾時";
+    }
+
+    // 關節角 → 指尖位置 (x, y, z)（UR 基座座標，用實測指尖長度）
+    double[] FingertipXYZ(double[] q)
+    {
+        double saved = UR3eKinematics.toolOffsetZ;
+        UR3eKinematics.toolOffsetZ = LayeredGraspGeometry.FingertipLengthM;
+        try
+        {
+            var T = UR3eKinematics.FK(q);
+            return new[] { T[0, 3], T[1, 3], T[2, 3] };
+        }
+        finally { UR3eKinematics.toolOffsetZ = saved; }
     }
 
     // 關節角 → 指尖高度（UR 基座座標；3D 用實測指尖長度）

@@ -762,6 +762,14 @@ MonoBehaviour:
   contactApproachM: 0.01
   contactSpeedMps: 0.01
   contactForceN: 8
+  contactStopOnPick: 1
+  pickContactApproachM: 0.025
+  pickContactSpeedMps: 0.01
+  pickContactForceN: 15
+  pickRetreatM: 0.03
+  pickCorrectionStepM: 0.002
+  pickMaxCorrections: 7
+  pickMinContactOffsetM: 0.005
   bitmapXYToleranceM: 0.02
   bitmapZToleranceM: 0.01
   bitmapOverlapThreshold: 0.9

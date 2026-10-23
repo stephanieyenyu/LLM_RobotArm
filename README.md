@@ -143,6 +143,8 @@ URSim 驗證途中觸發安全停止時，Unity 最多等 300 秒讓人在 URSim
 
 **3D 放置：碰到就停（可開關，預設關，2026-10-10 加，三版相同）**：JsonExecutor 的 `contactStopOnPlace` 打開時，實機在 3D 批次放方塊（手上有方塊、descend 到目標）的最後一段，先停在計算高度上方 `contactApproachM`（10 mm），再以 `contactSpeedMps`（10 mm/s）往下，Z 方向受力超過 `contactForceN`（8 N）就停下放開，最多降到計算高度。用來吸收「下層實際比計算高」的誤差，避免擠壓下層造成保護性停止或推倒。URSim、Isaac 驗證與 Unity 預覽照原本的軌跡；Unity Console 會印出每次比計算高度提早幾 mm 碰到（`[ContactPlace]`）。門檻要先在空中慢速下降量力的雜訊再設。
 
+**取料：碰到就停並自動修正（main，預設開，2026-10-22 加）**：JsonExecutor 的 `contactStopOnPick` 打開時，實機取料（descend 到來源、手上沒東西）的最後 `pickContactApproachM`（25 mm）以 `pickContactSpeedMps`（10 mm/s）往下，Z 受力超過 `pickContactForceN`（15 N）就停、往上抬 `pickRetreatM`（30 mm），依手腕扭矩判斷是哪一根手指撞到，往那一側補 `pickCorrectionStepM`（2 mm）再往下，最多 `pickMaxCorrections`（3）次；仍撞到就停在上方回報失敗，不會保護性停止。Unity Console 會印 `[ContactPick]`：沒撞到、補位幾次偏移多少、或失敗。扭矩方向可以用 `tools/ft_probe.py` 確認（只讀，手臂不動）。
+
 這時 Unity 的碰撞模型只在 3D 批次把手指段改成「指尖在桌面上方 3 mm」的檢查，前提是實體手指至少 30 mm 長。
 **手臂自撞（2026-10-07 起，只有 3D）**：Unity 規劃 3D 批次時，自撞改用畫面上手臂模型（含夾爪）的 mesh 檢查
 （`ArmMeshSelfCollision.cs`：底座與 6 個關節各帶動的一段各取凸包，相鄰兩段與手臂直立時就重疊的組合不檢查，
@@ -222,7 +224,7 @@ URSim（只有 3D 會用到）在純模擬途中安全停止時，Unity 最多�
   目前是從 2026-09-30 實拍畫面的 QR1-4 估計的）。相機或 QR 貼紙移動過，接上相機後執行
   `python isaac_sim/save_sim_camera.py` 換成 RealSense 的真實參數。
 - `run_mode.json` 的 `reset_each_task` 改成 false，之後的任務就接續目前的模擬世界，不重建。
-- 內建兩個，三個版本（main、zero-constraint、rulebased）的檔案完全相同：`yellow_cubes_16`（預設；16 塊黃方塊 4 排 × 4 顆，排內間距 5.5 cm、排距 5.5 cm，每往後一排往 -X 移 3.5 cm，X 0.065～0.335、Y 0.035～0.200，都在 rulebased 的供料區內；依 2026-10-14 指尖實測的 QR1 每塊離手臂基座 0.23～0.39 m）、`domino_cube`（一塊橫放的黃 domino 在 (0.20, 0.10)、一塊黃方塊在 (0.12, 0.18)）。`run_mode.json` 指定的場景檔不存在時改用預設場景（2026-10-08 起；之前是 `two_cubes`、`letter_blocks`、`domino_cubes`）。2026-10-14 之前預設是三個版本相同的 `yellow_cubes_15`（5 欄 × 3 排）；QR1 改成指尖實測後，其中 (0.08, 0.06) 離基座 0.431 m、(0.32, 0.18) 只有 0.194 m，超出當時 main／zero-constraint 的 Unity 取料範圍 0.20～0.42 m，所以三個版本都改成 16 顆的排法（2026-10-21 起 main 的取料範圍放寬成跟 rulebased 相同的 0.10～0.47 m）。
+- 內建兩個，三個版本（main、zero-constraint、rulebased）的檔案完全相同：`yellow_cubes_16`（預設；16 塊黃方塊 4 排 × 4 顆，排內間距 5.5 cm、排距 5.5 cm，每往後一排往 -X 移 3.5 cm，X 0.065～0.335、Y 0.035～0.200，都在 rulebased 的供料區內；依 2026-10-14 指尖實測的 QR1 每塊離手臂基座 0.23～0.39 m）、`domino_cube`（一塊橫放的黃 domino 在 (0.20, 0.10)、一塊黃方塊在 (0.12, 0.18)）。`run_mode.json` 指定的場景檔不存在時改用預設場景（2026-10-08 起；之前是 `two_cubes`、`letter_blocks`、`domino_cubes`）。2026-10-14 之前預設是三個版本相同的 `yellow_cubes_15`（5 欄 × 3 排）；QR1 改成指尖實測後，其中 (0.08, 0.06) 離基座 0.431 m、(0.32, 0.18) 只有 0.194 m，超出當時 main／zero-constraint 的 Unity 取料範圍 0.20～0.42 m，所以三個版本都改成 16 顆的排法（2026-10-21 起 main 的取料範圍曾放寬成跟 rulebased 相同的 0.10～0.47 m，10-23 內圈改回 0.20 m，外圈維持 0.47 m）。
 
 限制：模擬回報的是 Isaac 的精確位置，沒有相機的偵測誤差、遮擋與高度偏差，結果會比實機樂觀；
 適合測 LLM 的規劃能力，不能取代實機成功率。

@@ -56,6 +56,8 @@ while (true)
     if (!File.Exists(input) || string.IsNullOrWhiteSpace(File.ReadAllText(input))) { await Task.Delay(500); continue; }
     var goal = File.ReadAllText(input).Trim();
     File.WriteAllText(input, "");
+    // 計時：從讀到 Unity 送來的指令開始，到印出任務結果為止（每輪另外計時）
+    var taskTimer = System.Diagnostics.Stopwatch.StartNew();
     RunModeConfig mode;
     try { mode = RunModeConfig.Load(assets); }
     catch (InvalidDataException ex)
@@ -200,6 +202,7 @@ while (true)
         {
             var dir = Path.Combine(run, $"attempt_{attempt:00}");
             Directory.CreateDirectory(dir);
+            var attemptTimer = System.Diagnostics.Stopwatch.StartNew();
             Console.WriteLine($"[實驗] 第 {attempt}/10 次規劃，保留目前場景。");
             attempts = attempt;
             string failure = "", failureKind = "", plan = "", translationText = "（沒有產生轉譯結果）";
@@ -566,6 +569,7 @@ while (true)
             // 執行完不再用相機驗證：模擬驗證都通過、手臂（純模擬：模擬）做完就算成功
             feedback = $"實際流程（系統紀錄）：{string.Join(" → ", trace)}\n模擬驗證或執行的問題：{(string.IsNullOrEmpty(failure) ? "無" : failure)}";
             File.WriteAllText(Path.Combine(dir, "feedback.txt"), feedback);
+            Console.WriteLine($"[計時] 第 {attempt} 輪用了 {Elapsed(attemptTimer.Elapsed)}（從送出指令累計 {Elapsed(taskTimer.Elapsed)}）");
             success = string.IsNullOrEmpty(failure);
             attemptOutcomes.Add(success ? "success" : failureKind);
             Save(dir, "attempt_result.json", new { attempt, success, failure_kind = success ? null : failureKind,
@@ -600,7 +604,8 @@ while (true)
     Save(run, "result.json", new { success, status, attempts, attempt_outcomes = attemptOutcomes,
         counts_toward_success_rate = status is "success" or "failed",
         design, design_error = designError,
-        final_rules = rules, finished_utc = DateTime.UtcNow });
+        final_rules = rules, finished_utc = DateTime.UtcNow, elapsed_seconds = Math.Round(taskTimer.Elapsed.TotalSeconds, 1) });
+    Console.WriteLine($"[計時] 從送出指令到回報完成共 {Elapsed(taskTimer.Elapsed)}（{status}，{attempts} 輪）");
     ExperimentMetrics.Write(root);
     if (status == "execution_unknown") { Console.WriteLine("執行狀態未知，服務停止。確認手臂停止後再重新啟動。"); break; }
     AtomicWrite(Path.Combine(assets, "current_step.json"), new StepEnvelope { StepId = ++stepId, Done = true });
@@ -609,6 +614,10 @@ while (true)
              : fixedBaseline ? "下個任務需恢復初始桌面。" : "下個任務以當時的桌面為起點。"));
 }
 void Save(string dir, string name, object? value) => File.WriteAllText(Path.Combine(dir, name), JsonSerializer.Serialize(value, json));
+// 計時顯示：1 小時以上寫「時:分:秒」，否則「X 分 YY 秒」
+static string Elapsed(TimeSpan t) => t.TotalHours >= 1
+    ? $"{(int)t.TotalHours}:{t.Minutes:00}:{t.Seconds:00}"
+    : $"{(int)t.TotalMinutes} 分 {t.Seconds:00} 秒";
 void AtomicWrite(string path, object value)
 {
     File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(value, json));
