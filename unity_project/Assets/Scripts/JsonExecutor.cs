@@ -37,6 +37,8 @@ public class NamedPosition
 [System.Serializable]
 public class StepEnvelope
 {
+    public string control_event;
+    public int related_batch_id;
     public int step_id;
     public bool done;
     public NamedPosition source_position;
@@ -58,13 +60,15 @@ public class RobotFunctionCall
 [System.Serializable]
 public class StepDoneReport
 {
+    public string status;
     public int step_id;
     public bool completed;
     public string error;
     public float duration_sec;
+    public bool execution_unknown;
 }
 
-public class JsonExecutor : MonoBehaviour
+public partial class JsonExecutor : MonoBehaviour
 {
     private static JsonExecutor activeInstance;
     [Header("設定")]
@@ -107,7 +111,7 @@ public class JsonExecutor : MonoBehaviour
 
     // Home 關節角度，單位為 rad：[base, shoulder, elbow, wrist1, wrist2, wrist3]
     // 若實機姿勢不符，請由 Teach Pendant 讀取 home 姿勢後更新此值。
-    private const string HOME_MOVEJ_CMD = "movej([-1.5708, -1.5708, 0, -1.5708, 0, 0], a=1.2, v=0.8)";
+    private const string HOME_MOVEJ_CMD = LegacyDemoMotion.HomeLine;
 
     private URPackageListener urListener;
     private int lastExecutedStepId = -1;
@@ -141,6 +145,13 @@ public class JsonExecutor : MonoBehaviour
     void Start()
     {
         if (!enabled) return;
+        try { InitializeDemoReporting(); }
+        catch (Exception ex)
+        {
+            Debug.LogError("[Demo] Reporting initialization failed; executor disabled: " + ex.Message);
+            enabled = false;
+            return;
+        }
         urListener = new URPackageListener();
         urListener.Connect(urIP);
         Debug.Log("嘗試連線至 UR：" + urIP);
@@ -188,6 +199,11 @@ public class JsonExecutor : MonoBehaviour
 
     public void GoHome()
     {
+        if (HardwareMotionBlocked)
+        {
+            Debug.LogError("[Executor] Home blocked after self-collision. Use a validated manual recovery procedure.");
+            return;
+        }
         if (urListener == null || !urListener.Connected)
         {
             Debug.LogWarning("[Executor] UR 未連線，home 失敗");
@@ -202,7 +218,12 @@ public class JsonExecutor : MonoBehaviour
             StopCoroutine(currentStepCoroutine);
             currentStepCoroutine = null;
             currentStepId = -1;
-            WriteStepDone(abortedStepId, false, "aborted by user (GoHome)", 0f);
+            if (activeDemoReceipt != null && activeDemoReceipt.status == "executing")
+            {
+                demoJournal.Interrupt(activeDemoReceipt, "Manual Home requested; batch cancelled, Home not yet confirmed");
+                ReportDemoReceipt(activeDemoReceipt);
+            }
+            else WriteStepDone(abortedStepId, false, "aborted by user (GoHome)", 0f);
             Debug.LogWarning($"[Executor] 已中止 step {abortedStepId}，改為返回 Home");
 
             // 將 perception 切回 idle，讓 SceneSyncer 恢復更新。
@@ -226,6 +247,7 @@ public class JsonExecutor : MonoBehaviour
             if (!File.Exists(path)) continue;
 
             StepEnvelope env;
+            DemoBatchEnvelope demoBatch = null;
             string stepJson;
             DateTime stepWriteTimeUtc;
             try
@@ -235,6 +257,8 @@ public class JsonExecutor : MonoBehaviour
                 if (stepJson == lastProcessedStepJson &&
                     stepWriteTimeUtc <= lastProcessedStepWriteTimeUtc) continue;
                 env = JsonUtility.FromJson<StepEnvelope>(stepJson);
+                var candidate = JsonUtility.FromJson<DemoBatchEnvelope>(stepJson);
+                if (candidate != null && candidate.demo_fixed12) demoBatch = candidate;
             }
             catch (Exception ex)
             {
@@ -245,6 +269,18 @@ public class JsonExecutor : MonoBehaviour
             if (env == null) continue;
             lastProcessedStepJson = stepJson;
             lastProcessedStepWriteTimeUtc = stepWriteTimeUtc;
+
+            if (demoBatch != null)
+            {
+                if (!ClaimDemoBatch(demoBatch.batch_id)) continue;
+                currentStepId = demoBatch.batch_id;
+                long batchEpoch = ++executionEpoch;
+                currentStepCoroutine = StartCoroutine(ExecuteDemoBatch(demoBatch, batchEpoch));
+                yield return currentStepCoroutine;
+                currentStepCoroutine = null;
+                currentStepId = -1;
+                continue;
+            }
 
             if (env.done)
             {
@@ -257,7 +293,21 @@ public class JsonExecutor : MonoBehaviour
                     currentStepCoroutine = null;
                     currentStepId = -1;
                 }
-                Debug.Log($"[Executor] 收到 done 訊號 (step {env.step_id})，等待下一批任務");
+                switch (env.control_event)
+                {
+                    case "startup_reset":
+                        Debug.Log("[Executor] 服務初始化／清理舊任務（不是執行完成）。等待新指令。");
+                        break;
+                    case "batch_completed":
+                        Debug.Log($"[Executor] Batch {env.related_batch_id} 完成回報已被服務確認。");
+                        break;
+                    case "batch_failed":
+                        Debug.LogWarning($"[Executor] Batch {env.related_batch_id} 失敗／中止，沒有完成任務。");
+                        break;
+                    default:
+                        Debug.Log("[Executor] 收到舊版結束／重設通知，不能據此判定任務成功。");
+                        break;
+                }
                 lastExecutedStepId = env.step_id;
                 continue;
             }
@@ -281,6 +331,11 @@ public class JsonExecutor : MonoBehaviour
     // --- 執行單一步驟：依序解讀 LLM Motion Planner 的 robot functions ---
     IEnumerator ExecuteStep(StepEnvelope env, long stepEpoch)
     {
+        if (HardwareMotionBlocked)
+        {
+            WriteStepDone(env.step_id, false, "Hardware motion lock active after self-collision", 0f, true);
+            yield break;
+        }
         Debug.Log($"═══ Step {env.step_id} ═══ {env.comment}");
 
         // 等待連線
@@ -708,19 +763,7 @@ public class JsonExecutor : MonoBehaviour
 
     string BuildMovelLine(float x, float y, float z, string orientation, float skewDeg)
     {
-        // Keep horizontal/vertical grasp support, but ignore the detected skewDeg.
-        // Cubes have no orientation (null/empty) and are square, so use the same
-        // known-safe 90-degree wrist direction as vertical dominos. Only an
-        // explicitly horizontal domino uses 0 degrees.
-        // bool rotate = orientation != "horizontal";
-        // float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
-        bool rotate = orientation != "horizontal";
-        float totalDeg = rotate ? 90f : 0f;
-        float totalRad = totalDeg * Mathf.Deg2Rad;
-        string pose = Mathf.Abs(totalDeg) > 0.01f
-            ? $"pose_trans(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], p[0, 0, 0, 0, 0, {totalRad:F4}])"
-            : $"p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0]";
-        return $"movel({pose}, a=0.3, v=0.10)";
+        return LegacyDemoMotion.Movel(x, y, z, orientation);
     }
 
     IEnumerator SendGrasp(long stepEpoch, int stepId)
@@ -741,26 +784,7 @@ public class JsonExecutor : MonoBehaviour
 
     string BuildMovejLine(float x, float y, float z, string orientation, float skewDeg)
     {
-        // Keep horizontal/vertical grasp support, but ignore the detected skewDeg.
-        // Cubes have no orientation (null/empty) and are square, so use the same
-        // known-safe 90-degree wrist direction as vertical dominos. Only an
-        // explicitly horizontal domino uses 0 degrees.
-        // bool rotate = orientation != "horizontal";
-        // float totalDeg = rotate ? 90f + (SKEW_SIGN * skewDeg) : (SKEW_SIGN * skewDeg);
-        bool rotate = orientation != "horizontal";
-        float totalDeg = rotate ? 90f : 0f;
-        float totalRad = totalDeg * Mathf.Deg2Rad;
-
-        // Keep the current elbow/wrist configuration as the IK seed. A fixed qnear
-        // can select the folded-back branch and make the forearm collide with the
-        // upper arm even though the requested TCP pose itself is reachable.
-        const string qnear = "get_actual_joint_positions()";
-
-        if (Mathf.Abs(totalDeg) > 0.01f)
-        {
-            return $"movej(get_inverse_kin(pose_trans(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], p[0, 0, 0, 0, 0, {totalRad:F4}]), qnear={qnear}), a=1.2, v=0.8)";
-        }
-        return $"movej(get_inverse_kin(p[{x:F4}, {y:F4}, {z:F4}, 0, 3.14, 0], qnear={qnear}), a=1.2, v=0.8)";
+        return LegacyDemoMotion.Movej(x, y, z, orientation);
     }
 
     IEnumerator SetPerceptionMode(string mode)
@@ -779,18 +803,20 @@ public class JsonExecutor : MonoBehaviour
         }
     }
 
-    void WriteStepDone(int stepId, bool completed, string error, float duration)
+    void WriteStepDone(int stepId, bool completed, string error, float duration, bool executionUnknown = false, string status = null)
     {
         var report = new StepDoneReport
         {
+            status = status ?? (completed ? "completed" : executionUnknown ? "execution_unknown" : "failed"),
             step_id = stepId,
             completed = completed,
             error = error ?? "",
             duration_sec = duration,
+            execution_unknown = executionUnknown,
         };
         string json = JsonUtility.ToJson(report, prettyPrint: true);
         string path = Path.Combine(Application.streamingAssetsPath, stepDoneFile);
-        File.WriteAllText(path, json);
+        DemoExecutionJournal.AtomicWrite(path, json);
     }
 }
 

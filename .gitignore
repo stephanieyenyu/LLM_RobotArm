@@ -49,6 +49,7 @@ Thumbs.db
 
 csharp_server/bin/
 csharp_server/obj/
+tests/**/bin/
 csharp_server/.codex-build*/
 csharp_server/yolo_env/
 csharp_server/outputs/
@@ -61,6 +62,8 @@ sample_json/detected_objects.json
 sample_json/objects_world.json
 sample_json/visual_result.jpg
 unity_project/Assets/StreamingAssets/robot_plan.json
+unity_project/Assets/StreamingAssets/demo_urscript.log
+unity_project/Assets/StreamingAssets/demo_urscript.log.meta
 csharp_server/open_vocab/outputs/objects_open.json
 csharp_server/images/test_scene.jpg
 csharp_server/images/0test_scene.jpg

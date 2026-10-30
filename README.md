@@ -2,7 +2,15 @@
 
 以中文自然語言指令控制 UR3e 機械手臂的框架。RealSense D435i 即時偵測工作台物件 → OpenAI gpt-5 解析指令 → Unity 送 URScript 到手臂。
 
-## 系統流程
+## 目前版本：短版 demo
+
+**2026-10-30 已恢復原版控制器 qnear 求解與 movej/movel：實機不再使用 C# 自算／替代 IK 或新的 clearance 路徑。固定 L、單次快照、12 段及接觸補位保留。新版尚未實機驗證；保停後不自動 Home／續跑。** 詳見 [demo 與事故說明](docs/demo.md)。
+
+固定 `3×3 L`（`100 / 100 / 111`，5 顆 cube），初始快照一次、整批固定 12 段 URScript／顆；LLM 只做 CommandRouter 任務分類。啟動方式沿用原本 Python、dotnet、Unity，demo 只需 OPENAI_API_KEY、不需要 Gemini。參數、計時與失敗處理請看 [demo 說明](docs/demo.md)。
+
+離線驗證：`dotnet run --project tests/DemoChecks/DemoChecks.csproj`、`dotnet build tests/UnityCompile/UnityCompile.csproj`、`python tests/test_demo_snapshot.py`。以下其餘內容保留為原版參考；舊閉環與 LLM 圖案／動作規劃已不由目前 Program.cs 呼叫。
+
+## 原版系統流程（歷史參考）
 
 ```
 Unity UI（輸入指令）

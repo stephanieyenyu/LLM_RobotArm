@@ -1058,6 +1058,22 @@ def endpoint_get_mode():
         return jsonify({"mode": _execution_mode})
 
 
+@app.route("/demo/snapshot", methods=["POST"])
+def endpoint_demo_snapshot():
+    """One frame and its detections from the same update; no later rescan."""
+    import base64
+    with state_lock:
+        snapshot = dict(latest_state)
+        frame = latest_frame.copy() if latest_frame is not None else None
+    if frame is None or time.time() - snapshot["timestamp"] > 3.0:
+        return jsonify({"error": "No fresh camera frame (maximum age: 3 seconds)"}), 503
+    ok, encoded = cv2.imencode(".jpg", frame)
+    if not ok:
+        return jsonify({"error": "Snapshot JPEG encoding failed"}), 500
+    snapshot["frame_jpeg_base64"] = base64.b64encode(encoded).decode("ascii")
+    return jsonify(snapshot)
+
+
 @app.route("/scene/mode", methods=["POST"])
 def endpoint_set_mode():
     global _execution_mode

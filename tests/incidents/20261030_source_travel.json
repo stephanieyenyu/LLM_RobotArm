@@ -1,0 +1,30 @@
+{
+  "batch_id": 1793330941,
+  "step_id": 1793330942,
+  "command_index": 2,
+  "command": "source_travel",
+  "reported_event": "Physical self-collision and protective stop",
+  "commanded_waypoints_rad": [
+    [1.172200, -1.480958, 1.477767, -1.567605, -1.570796, 1.172200],
+    [-1.691140, -2.986597, 1.148887, 0.266914, -1.570796, -1.691140]
+  ],
+  "pendant_joints_deg": [-45.14, -143.91, 71.74, -18.66, -89.88, 314.83],
+  "pendant_pose_display": {
+    "xyz_mm": [-54.73, 127.27, -114.91],
+    "rotation_vector_rad": [2.963, -1.076, 0.014],
+    "coordinate_frame": "unknown; not assumed to be robot base"
+  },
+  "measurement_source": "User-supplied teach-pendant photo S__29564932.jpg after the collision report",
+  "offline_diagnosis": {
+    "assumed_axial_tcp_m": 0.170,
+    "joint_segment_fraction": 0.6835,
+    "max_joint_fit_residual_deg": 0.68,
+    "nominal_base_frame_tcp_m": [-0.0634, -0.1229, 0.2374],
+    "nominal_tcp_base_radius_m": 0.1383,
+    "existing_base_exclusion_m": 0.160,
+    "original_capsules_allow_pose": true,
+    "limitations": "Nominal UR3e FK and assumed TCP, not a physical geometry measurement. Exact contacting components and screenshot feature frame remain unconfirmed."
+  },
+  "actual_contact_joints_rad": null,
+  "note": "The supplied pendant angles are not a timestamp-synchronized contact log. Wrist 3 reads +314.83 degrees (geometrically equivalent to -45.17 degrees), and its raw multi-turn value must be preserved. Compare periodic joint differences for diagnosis only; do not silently wrap motion commands. Original capsule checks accepted the commanded program; this does not establish physical collision clearance."
+}

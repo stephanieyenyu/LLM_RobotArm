@@ -95,6 +95,10 @@ public class Assignment
 /// </summary>
 public class ExecutionResult
 {
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "";
+    [JsonPropertyName("execution_unknown")]
+    public bool ExecutionUnknown { get; set; }
     [JsonPropertyName("step_id")]
     public int StepId { get; set; }
     [JsonPropertyName("completed")]

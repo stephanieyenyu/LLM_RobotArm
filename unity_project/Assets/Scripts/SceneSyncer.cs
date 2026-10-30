@@ -33,11 +33,11 @@ public class SceneSyncer : MonoBehaviour
 
     [Header("補貨區 / 擺放區邊界（跟 PlacementPlanner 常數對齊）")]
     public float supplyZoneXMax = 0.30f;
-    public float targetZoneOriginX = 0.35f;
-    public float targetZoneOriginY = 0.02f;       // 往 QR1-QR2／畫面下方移 3 cm
-    public float cellSize = 0.035f;              // 2.5cm 立方體 + 1cm 間隙
-    public int gridRows = 5;
-    public int gridCols = 5;
+    public float targetZoneOriginX = 0.49f;
+    public float targetZoneOriginY = 0.00f;
+    public float cellSize = 0.055f;              // Match demo WorkspaceBounds
+    public int gridRows = 3;
+    public int gridCols = 3;
 
     [Header("積木顯示")]
     public float cubeSizeM = 0.025f;             // 2.5 cm 立方體
@@ -92,7 +92,7 @@ public class SceneSyncer : MonoBehaviour
         supply.transform.localScale = new Vector3(supplyZoneXMax, 0.001f, workspaceDepthM);
         SetColor(supply, new Color(0.4f, 0.7f, 1f, 0.5f));
 
-        // 擺放區（黃色半透明，5×5 grid 實體邊界）
+        // 擺放區（黃色半透明，3×3 demo grid 實體邊界）
         float targetW = gridCols * cellSize;
         float targetD = gridRows * cellSize;
         GameObject target = GameObject.CreatePrimitive(PrimitiveType.Cube);

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="../unity_project/Assets/Scripts/DemoExecutionJournal.cs" Link="DemoExecutionJournal.cs" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.27.0" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.Managed" Version="1.27.0" />
     <PackageReference Include="OpenAI" Version="2.11.0" />

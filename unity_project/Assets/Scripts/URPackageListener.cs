@@ -28,6 +28,22 @@ namespace Assets.Scripts
 
         public bool Connected => client != null && client.Connected;
         public bool IsRealtime { get; private set; }
+        long lastStateUtcTicks;
+        long masterboardRevision;
+        public long MasterboardRevision => Interlocked.Read(ref masterboardRevision);
+        public bool HasFreshState => DateTime.UtcNow.Ticks - Interlocked.Read(ref lastStateUtcTicks)
+            < TimeSpan.FromSeconds(2).Ticks;
+
+        void ReadExact(byte[] buffer, int count)
+        {
+            int offset = 0;
+            while (offset < count)
+            {
+                int received = stream!.Read(buffer, offset, count - offset);
+                if (received == 0) throw new System.IO.EndOfStreamException("UR closed connection");
+                offset += received;
+            }
+        }
 
         public void Connect(string address, bool realtime = false)
         {
@@ -64,20 +80,24 @@ namespace Assets.Scripts
                 {
                     if (IsRealtime)
                     {
-                        stream.Read(packageHeadBuffer, 0, 4);
+                        ReadExact(packageHeadBuffer, 4);
                         int packageLength = URUtil.ArrayToInt32(packageHeadBuffer, 0);
+                        if (packageLength < 4 || packageLength > 1048576)
+                            throw new System.IO.InvalidDataException("Invalid UR realtime packet length");
                         byte[] packageBuffer = new byte[packageLength - 4];
-                        stream.Read(packageBuffer, 0, packageBuffer.Length);
+                        ReadExact(packageBuffer, packageBuffer.Length);
                         RealtimePackage = URUtil.ArrayToStruct<RealtimePackage>(packageBuffer, 0);
                     }
                     else
                     {
-                        stream.Read(packageHeadBuffer, 0, 5);
+                        ReadExact(packageHeadBuffer, 5);
                         int packageLength = URUtil.ArrayToInt32(packageHeadBuffer, 0);
+                        if (packageLength < 5 || packageLength > 1048576)
+                            throw new System.IO.InvalidDataException("Invalid UR packet length");
                         byte robotMessageType = packageHeadBuffer[4];
 
                         byte[] packageBuffer = new byte[packageLength - 5];
-                        stream.Read(packageBuffer, 0, packageBuffer.Length);
+                        ReadExact(packageBuffer, packageBuffer.Length);
 
                         int pointer = 0;
                         // MESSAGE_TYPE_ROBOT_STATE
@@ -85,7 +105,11 @@ namespace Assets.Scripts
                         {
                             while (pointer < packageBuffer.Length)
                             {
+                                if (packageBuffer.Length - pointer < 5)
+                                    throw new System.IO.InvalidDataException("Truncated UR sub-packet");
                                 int subPackageLength = URUtil.ArrayToInt32(packageBuffer, pointer);
+                                if (subPackageLength < 5 || pointer + subPackageLength > packageBuffer.Length)
+                                    throw new System.IO.InvalidDataException("Invalid UR sub-packet length");
                                 byte subPackageType = packageBuffer[pointer + 4];
                                 switch (subPackageType)
                                 {
@@ -107,15 +131,19 @@ namespace Assets.Scripts
                                         MasterboardData =
                                             URUtil.ArrayToStruct<RobotStatePackage_MasterboardData>(packageBuffer,
                                                 pointer + 5);
+                                        Interlocked.Increment(ref masterboardRevision);
                                         break;
                                 }
 
                                 pointer += subPackageLength;
                             }
+                            Interlocked.Exchange(ref lastStateUtcTicks, DateTime.UtcNow.Ticks);
                         }
                     }
                 }
-                catch (System.IO.IOException) { }
+                catch (Exception ex) when (ex is System.IO.IOException ||
+                    ex is System.IO.InvalidDataException || ex is ObjectDisposedException)
+                { client.Close(); break; }
             }
         }
 

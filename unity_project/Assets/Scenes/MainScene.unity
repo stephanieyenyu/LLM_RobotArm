@@ -188,11 +188,11 @@ MonoBehaviour:
   workspaceWidthM: 0.622
   workspaceDepthM: 0.281
   supplyZoneXMax: 0.3
-  targetZoneOriginX: 0.35
-  targetZoneOriginY: 0.02
-  cellSize: 0.035
-  gridRows: 5
-  gridCols: 5
+  targetZoneOriginX: 0.49
+  targetZoneOriginY: 0
+  cellSize: 0.055
+  gridRows: 3
+  gridCols: 3
   cubeSizeM: 0.025
   autoCreateWorkspace: 1
 --- !u!4 &447807164
@@ -304,6 +304,14 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   jsonFileName: robot_plan.json
   urIP: 192.168.50.204
+  contactStopOnPick: 1
+  pickContactApproachM: 0.025
+  pickContactSpeedMps: 0.01
+  pickContactForceN: 15
+  pickRetreatM: 0.03
+  pickCorrectionStepM: 0.002
+  pickMaxCorrections: 7
+  pickMinContactOffsetM: 0.005
   perceptionModeUrl: http://localhost:5000/scene/mode
   uiManager: {fileID: 0}
 --- !u!1001 &1427722103
